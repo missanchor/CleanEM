@@ -505,18 +505,32 @@ def run_real_data_comparison(dataset_name="beers"):
         has_cross_attn = False
         all_cross_attn_preds = None
 
+    # 仅对真实错误样本进行评估
+    error_mask = all_labels == 1
+    error_sample_count = int(error_mask.sum())
+
+    if error_sample_count == 0:
+        LOGGER.error("❌ No error samples found in aggregated labels. Unable to compute error-only metrics.")
+        return None
+
+    error_labels = all_labels[error_mask]
+    error_mlp_preds = all_mlp_preds[error_mask]
+    if has_cross_attn:
+        error_cross_attn_preds = all_cross_attn_preds[error_mask]
+
     # 5. 对比结果
     LOGGER.info("\n" + "="*80)
     LOGGER.info("COMPARISON RESULTS (Aggregated)")
     LOGGER.info("="*80)
+    LOGGER.info(f"Evaluating on error samples only ({error_sample_count} cases)")
 
-    overall_mlp_acc = accuracy_score(all_labels, all_mlp_preds)
-    # 错误检测任务：只对识别为错误的样本计算precision/recall/F1
-    mlp_precision = precision_score(all_labels, all_mlp_preds, pos_label=1, zero_division=0)
-    mlp_recall = recall_score(all_labels, all_mlp_preds, pos_label=1, zero_division=0)
-    mlp_f1 = f1_score(all_labels, all_mlp_preds, pos_label=1, zero_division=0)
+    overall_mlp_acc = accuracy_score(error_labels, error_mlp_preds)
+    # 错误检测任务：只对真实错误样本计算precision/recall/F1
+    mlp_precision = precision_score(error_labels, error_mlp_preds, pos_label=1, zero_division=0)
+    mlp_recall = recall_score(error_labels, error_mlp_preds, pos_label=1, zero_division=0)
+    mlp_f1 = f1_score(error_labels, error_mlp_preds, pos_label=1, zero_division=0)
 
-    LOGGER.info(f"\nOverall MLP Classifier (Baseline):")
+    LOGGER.info(f"\nError-only MLP Classifier (Baseline):")
     LOGGER.info(f"  Accuracy:  {overall_mlp_acc:.4f}")
     LOGGER.info(f"  Precision (on detected errors): {mlp_precision:.4f}")
     LOGGER.info(f"  Recall (of all errors):         {mlp_recall:.4f}")
@@ -524,13 +538,13 @@ def run_real_data_comparison(dataset_name="beers"):
     LOGGER.info(f"  Per-attribute accuracy: {mlp_accuracies}")
 
     if has_cross_attn:
-        overall_cross_attn_acc = accuracy_score(all_labels, all_cross_attn_preds)
-        # 错误检测任务：只对识别为错误的样本计算precision/recall/F1
-        cross_attn_precision = precision_score(all_labels, all_cross_attn_preds, pos_label=1, zero_division=0)
-        cross_attn_recall = recall_score(all_labels, all_cross_attn_preds, pos_label=1, zero_division=0)
-        cross_attn_f1 = f1_score(all_labels, all_cross_attn_preds, pos_label=1, zero_division=0)
+        overall_cross_attn_acc = accuracy_score(error_labels, error_cross_attn_preds)
+        # 错误检测任务：只对真实错误样本计算precision/recall/F1
+        cross_attn_precision = precision_score(error_labels, error_cross_attn_preds, pos_label=1, zero_division=0)
+        cross_attn_recall = recall_score(error_labels, error_cross_attn_preds, pos_label=1, zero_division=0)
+        cross_attn_f1 = f1_score(error_labels, error_cross_attn_preds, pos_label=1, zero_division=0)
 
-        LOGGER.info(f"\nOverall Cross Attention Detector:")
+        LOGGER.info(f"\nError-only Cross Attention Detector:")
         LOGGER.info(f"  Accuracy:  {overall_cross_attn_acc:.4f}")
         LOGGER.info(f"  Precision (on detected errors): {cross_attn_precision:.4f}")
         LOGGER.info(f"  Recall (of all errors):         {cross_attn_recall:.4f}")
@@ -557,6 +571,7 @@ def run_real_data_comparison(dataset_name="beers"):
             'overall_cross_attention_f1': float(cross_attn_f1),
             'improvement': float(improvement),
             'total_samples': len(all_labels),
+            'error_samples': error_sample_count,
             'attributes_count': len(attr_groups),
             'mlp_per_attribute': mlp_accuracies,
             'cross_attention_per_attribute': cross_attn_accuracies,
@@ -574,6 +589,7 @@ def run_real_data_comparison(dataset_name="beers"):
             'overall_cross_attention_recall': None,
             'overall_cross_attention_f1': None,
             'total_samples': len(all_labels),
+            'error_samples': error_sample_count,
             'attributes_count': len(attr_groups),
             'mlp_per_attribute': mlp_accuracies,
             'note': 'Cross Attention training failed'

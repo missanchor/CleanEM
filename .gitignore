@@ -2,11 +2,11 @@ ZeroED/
 UnIMP-master/
 result/
 tmp/
+docs/
 
 __pycache__/
 .vscode/
 .claude/
 
 cc.en.300.bin
-*.json
 *.log

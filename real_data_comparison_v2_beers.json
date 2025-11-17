@@ -1,0 +1,30 @@
+{
+  "dataset": "beers",
+  "overall_mlp_accuracy": 0.9941804073714839,
+  "overall_mlp_precision": 1.0,
+  "overall_mlp_recall": 0.9941804073714839,
+  "overall_mlp_f1": 0.9970817120622568,
+  "overall_cross_attention_accuracy": 1.0,
+  "overall_cross_attention_precision": 1.0,
+  "overall_cross_attention_recall": 1.0,
+  "overall_cross_attention_f1": 1.0,
+  "improvement": 0.005819592628516057,
+  "total_samples": 6581,
+  "error_samples": 1031,
+  "attributes_count": 6,
+  "mlp_per_attribute": {
+    "src": 0.9974059662775616,
+    "sched_dep_time": 0.9987608426270136,
+    "act_dep_time": 1.0,
+    "sched_arr_time": 0.9926108374384236,
+    "act_arr_time": 0.9834183673469388
+  },
+  "cross_attention_per_attribute": {
+    "src": 1.0,
+    "sched_dep_time": 0.9987608426270136,
+    "act_dep_time": 1.0,
+    "sched_arr_time": 1.0,
+    "act_arr_time": 1.0
+  },
+  "data_source": "zeroed"
+}
