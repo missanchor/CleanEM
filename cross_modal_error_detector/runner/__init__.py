@@ -12,8 +12,7 @@ This submodule provides a thin layer that decouples the oversized
 
 from .configuration import load_config, set_seed
 from .experiments import (
-    run_ablation_experiment,
-    run_contrastive_experiment,
+    run_contrastive_two_stage_experiment,
     run_corruption_experiment,
 )
 
@@ -21,8 +20,7 @@ __all__ = [
     "load_config",
     "set_seed",
     "run_corruption_experiment",
-    "run_contrastive_experiment",
-    "run_ablation_experiment",
+    "run_contrastive_two_stage_experiment",
 ]
 
 

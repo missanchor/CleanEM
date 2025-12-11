@@ -2,8 +2,7 @@
   "experiment": "corruption",
   "device": "cuda:0",
   "device_map": {
-    "default": "cuda:0",
-    "text_encoder": "cuda:1"
+    "default": "cuda:0"
   },
   "seed": 42,
   "dataset": "beers_error-01",
@@ -20,7 +19,7 @@
   },
   "text_processor": {
     "max_seq_len": 256,
-    "tokenizer_name_or_path": "/data/nw/modelscope_models/Qwen2.5-1.5B-Instruct",
+    "tokenizer_name_or_path": "/mnt/data/welkinni/Qwen2.5-3B/qwen/Qwen2.5-3B",
     "tokenizer_kwargs": {
       "trust_remote_code": true
     }
@@ -44,12 +43,10 @@
       "num_layers": 2,
       "max_seq_len": 256,
       "dropout": 0.1,
-      "model_name_or_path": "/data/nw/modelscope_models/Qwen2.5-1.5B-Instruct",
+      "model_name_or_path": "/mnt/data/welkinni/Qwen2.5-3B/qwen/Qwen2.5-3B",
       "trust_remote_code": true,
       "output_proj_dim": 256,
-      "freeze_base_model": true,
-      "adapter_hidden_dim": 128,
-      "adapter_dropout": 0.1
+      "freeze_pretrained": true
     }
   },
   "fusion_module": {

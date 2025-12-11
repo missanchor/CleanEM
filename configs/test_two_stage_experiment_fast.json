@@ -1,0 +1,85 @@
+{
+  "experiment": "contrastive_two_stage",
+  "device_map": {
+    "default": "cuda:0"
+  },
+  "num_workers": 0,
+  "pin_memory": false,
+  "persistent_workers": false,
+  "seed": 42,
+  "dataset": "hospital_error-01",
+  "data_path": "data/hospital_error-01.csv",
+  "stage_a": {
+    "num_epochs": 2,
+    "batch_size": 64,
+    "temperature": 0.07,
+    "tabular_encoder": {
+      "type": "StructureAwareTransformer",
+      "params": {
+        "d_cell": 32,
+        "d_model": 64,
+        "nhead": 2,
+        "num_layers": 1,
+        "dim_feedforward": 128,
+        "dropout": 0.1
+      }
+    },
+    "text_encoder": {
+      "type": "PretrainedTextEncoder",
+      "params": {
+        "d_model": 64,
+        "model_name_or_path": "/data/nw/modelscope_models/Qwen2.5-0.5B-Instruct",
+        "trust_remote_code": true,
+        "output_proj_dim": 64,
+        "freeze_base_model": true,
+        "adapter_hidden_dim": 32,
+        "adapter_dropout": 0.1
+      }
+    },
+    "optimizer": {
+      "type": "Adam",
+      "params": {"lr": 1e-4}
+    }
+  },
+  "stage_b": {
+    "num_epochs": 1,
+    "batch_size": 64,
+    "negative_ratio": 0.5,
+    "negative_strategy": "random",
+    "fusion_module": {
+      "type": "CrossAttentionFusion",
+      "params": {
+        "d_model": 64,
+        "nhead": 2,
+        "dropout": 0.1
+      }
+    },
+    "detection_head": {
+      "type": "MLPDetectionHead",
+      "params": {
+        "d_input": 64,
+        "hidden_dim": 64,
+        "output_dim": 1
+      }
+    },
+    "optimizer": {
+      "type": "Adam",
+      "params": {"lr": 1e-3}
+    }
+  },
+  "tabular_processor": {
+    "d_cell": 32
+  },
+  "text_processor": {
+    "max_seq_len": 512,
+    "tokenizer_name_or_path": "/mnt/data/welkinni/Qwen2.5-3B/qwen/Qwen2.5-3B",
+    "tokenizer_kwargs": {
+      "trust_remote_code": true
+    }
+  },
+  "evaluation": {
+    "dataset_name": "hospital_error_eval",
+    "clean_data_path": "data/hospital_clean.csv",
+    "dirty_data_path": "data/hospital_error-01.csv"
+  }
+}

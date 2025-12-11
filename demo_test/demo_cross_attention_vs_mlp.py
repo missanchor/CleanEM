@@ -13,6 +13,7 @@ from sklearn.neural_network import MLPClassifier
 import torch
 import torch.nn.functional as F
 from cross_attention_detector import LLMBasedCrossAttentionDetector, prepare_text_representation
+from cross_modal_error_detector.utils.device import resolve_runtime_device
 import matplotlib.pyplot as plt
 import seaborn as sns
 import logging
@@ -136,7 +137,7 @@ class SimplifiedCrossAttentionClassifier(torch.nn.Module):
             torch.nn.Linear(hidden_dim // 2, 2)
         )
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device(resolve_runtime_device("cuda"))
 
     def text_to_embedding(self, text):
         """简单的文本嵌入（演示用）"""

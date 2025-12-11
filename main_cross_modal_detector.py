@@ -5,12 +5,14 @@ Cross-Modal Error Detector - Main Runner
 该脚本使用配置文件驱动，每个配置文件对应一个独立实验：
 1. 破坏-重建（corruption-based）训练
 2. 对比学习（contrastive）训练
-3. 消融实验（ablation study）
+3. 两阶段对比学习（contrastive_two_stage）训练
+4. 消融实验（ablation study）
 
 使用方式：
-    python main_cross_modal_detector.py --config configs/beers_corruption_experiment.json
-    python main_cross_modal_detector.py --config configs/beers_contrastive_experiment.json
-    python main_cross_modal_detector.py --config configs/beers_ablation_experiment.json
+    python main_cross_modal_detector.py --config configs/hospital_corruption_experiment.json
+    python main_cross_modal_detector.py --config configs/hospital_contrastive_experiment.json
+    python main_cross_modal_detector.py --config configs/hospital_two_stage_experiment.json
+    python main_cross_modal_detector.py --config configs/hospital_ablation_experiment.json
 
 Mock 实验：
     python main_cross_modal_detector.py --config configs/mock_corruption_experiment.json
@@ -24,19 +26,27 @@ from typing import Dict, Optional
 
 from cross_modal_error_detector.runner import (
     load_config,
-    run_ablation_experiment,
-    run_contrastive_experiment,
+    run_contrastive_two_stage_experiment,
     run_corruption_experiment,
     set_seed,
+)
+from cross_modal_error_detector.utils.device import (
+    canonicalize_device_map,
+    resolve_runtime_device,
 )
 
 
 def _normalize_device_map(raw_device_map: Optional[Dict[str, str]], default_device: str) -> Optional[Dict[str, str]]:
     if raw_device_map is None:
         return None
-    device_map = {key: str(value) for key, value in raw_device_map.items()}
-    device_map.setdefault("default", default_device)
-    return device_map
+    normalized_map = canonicalize_device_map(raw_device_map)
+    resolved_default = resolve_runtime_device(default_device)
+    resolved_map = {
+        key: resolve_runtime_device(value, fallback_device=resolved_default)
+        for key, value in normalized_map.items()
+    }
+    resolved_map.setdefault("default", resolved_default)
+    return resolved_map
 
 
 def _print_header(device: str, seed: int, experiment: str) -> None:
@@ -60,7 +70,7 @@ def _print_summary(title: str, lines: Dict[str, str]) -> None:
 
 def main(config_path: Path) -> None:
     config = load_config(config_path)
-    device = config.get("device", "gpu")
+    device = resolve_runtime_device(config.get("device"))
     device_map = _normalize_device_map(config.get("device_map"), device)
     seed = config.get("seed", 42)
     experiment = config.get("experiment")
@@ -85,12 +95,15 @@ def main(config_path: Path) -> None:
         )
         train_losses = results.get("train_losses") or []
         metrics = results.get("metrics") or {}
-        accuracy = metrics.get("accuracy", results.get("accuracy", 0.0))
+        dirty_accuracy = metrics.get("dirty_accuracy", metrics.get("accuracy", results.get("accuracy", 0.0)))
+        overall_accuracy = metrics.get("overall_accuracy", results.get("overall_accuracy", 0.0))
         summary = {
             "数据集": str(results.get("dataset")),
             "最终Loss": f"{train_losses[-1]:.4f}" if train_losses else "未计算",
-            "准确率": f"{accuracy:.2%}",
+            "脏值准确率": f"{dirty_accuracy:.2%}",
         }
+        if overall_accuracy:
+            summary["整体准确率"] = f"{overall_accuracy:.2%}"
         if metrics:
             summary["Precision(脏值)"] = f"{metrics.get('precision', 0.0):.2%}"
             summary["Recall(脏值)"] = f"{metrics.get('recall', 0.0):.2%}"
@@ -98,8 +111,8 @@ def main(config_path: Path) -> None:
         if "num_samples" in results:
             summary["样本数"] = str(results["num_samples"])
         _print_summary("Corruption-based", summary)
-    elif experiment_key == "contrastive":
-        results = run_contrastive_experiment(
+    elif experiment_key == "contrastive_two_stage":
+        results = run_contrastive_two_stage_experiment(
             config,
             device,
             device_map,
@@ -107,45 +120,26 @@ def main(config_path: Path) -> None:
             config_dir=config_dir,
             project_root=project_root,
         )
-        train_losses = results.get("train_losses") or []
+        stage_a_losses = results.get("stage_a_losses", [])
+        stage_b_losses = results.get("stage_b_losses", [])
         summary = {
             "数据集": str(results.get("dataset")),
-            "最终Loss": f"{train_losses[-1]:.4f}" if train_losses else "未计算",
-            "匹配准确率": f"{results.get('accuracy', 0.0):.2%}",
+            "阶段A最终Loss": f"{stage_a_losses[-1]:.4f}" if stage_a_losses else "未计算",
+            "阶段B最终Loss": f"{stage_b_losses[-1]:.4f}" if stage_b_losses else "未计算",
         }
-        _print_summary("Contrastive", summary)
-    elif experiment_key == "ablation":
-        results = run_ablation_experiment(
-            config,
-            device,
-            device_map,
-            seed=seed,
-            config_dir=config_dir,
-            project_root=project_root,
-        )
-        variant_results = results.get("results") or {}
-        if variant_results:
-            print("\n" + "=" * 80)
-            print("🎉 实验完成 - 总结")
-            print("=" * 80)
-            print("\n[Ablation]")
-            print(f"  - 数据集: {results.get('dataset')}")
-            for name, result in variant_results.items():
-                metrics = result.get("metrics") or {}
-                accuracy = metrics.get("accuracy", result.get("accuracy", 0.0))
-                precision = metrics.get("precision", 0.0)
-                recall = metrics.get("recall", 0.0)
-                f1 = metrics.get("f1", 0.0)
-                print(
-                    f"    • {name}: Acc {accuracy:.2%} | "
-                    f"P/R/F1 {precision:.2%}/{recall:.2%}/{f1:.2%}"
-                )
-        else:
-            _print_summary("Ablation", {"数据集": str(results.get("dataset")), "结果": "未生成有效变体结果"})
+        if results.get("best_threshold_stage_a") is not None:
+            summary["阶段A最佳阈值"] = f"{results['best_threshold_stage_a']:.4f}"
+        if results.get("error_precision", 0.0) > 0:
+            summary["阶段B错误检测Precision"] = f"{results.get('error_precision', 0.0):.2%}"
+            summary["阶段B错误检测Recall"] = f"{results.get('error_recall', 0.0):.2%}"
+            summary["阶段B错误检测F1"] = f"{results.get('error_f1', 0.0):.2%}"
+            summary["包含错误的行数"] = str(results.get("num_error_rows", 0))
+
+        _print_summary("Contrastive Two-Stage", summary)
     else:
         raise ValueError(
             f"不支持的实验类型：{experiment}. "
-            "请使用 'corruption'、'contrastive' 或 'ablation'。"
+            "请使用 'corruption'、'contrastive'、'contrastive_two_stage' 或 'ablation'。"
         )
 
     print("\n提示：可通过修改配置文件快速调整组件与超参数。")
@@ -156,7 +150,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/beers_corruption_experiment.json"),
+        default=Path("configs/hospital_two_stage_experiment.json"),
         help="配置文件路径（每个配置对应一个实验）",
     )
     args = parser.parse_args()

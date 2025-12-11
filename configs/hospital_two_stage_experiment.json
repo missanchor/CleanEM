@@ -1,0 +1,82 @@
+{
+  "experiment": "contrastive_two_stage",
+  "device_map": {
+    "default": "cuda:0"
+  },
+  "seed": 42,
+  "dataset": "hospital_error-01",
+  "data_path": "data/hospital_error-01.csv",
+  "stage_a": {
+    "num_epochs": 80,
+    "batch_size": 32,
+    "temperature": 0.07,
+    "tabular_encoder": {
+      "type": "StructureAwareTransformer",
+      "params": {
+        "d_cell": 4,
+        "d_model": 32,
+        "nhead": 2,
+        "num_layers": 1,
+        "dim_feedforward": 128,
+        "dropout": 0.1
+      }
+    },
+    "text_encoder": {
+      "type": "PretrainedTextEncoder",
+      "params": {
+        "d_model": 32,
+        "model_name_or_path": "/mnt/data/welkinni/Qwen2.5-0.5B-Instruct/qwen/Qwen2.5-0.5B-Instruct",
+        "trust_remote_code": true,
+        "output_proj_dim": 32,
+        "freeze_base_model": true,
+        "adapter_hidden_dim": 32,
+        "adapter_dropout": 0.1
+      }
+    },
+    "optimizer": {
+      "type": "Adam",
+      "params": {"lr": 1e-3}
+    }
+  },
+  "stage_b": {
+    "num_epochs": 200,
+    "batch_size": 64,
+    "negative_ratio": 1.0,
+    "negative_strategy": "random",
+    "fusion_module": {
+      "type": "CrossAttentionFusion",
+      "params": {
+        "d_model": 32,
+        "nhead": 2,
+        "dropout": 0.1
+      }
+    },
+    "detection_head": {
+      "type": "MLPDetectionHead",
+      "params": {
+        "d_input": 32,
+        "hidden_dim": 64,
+        "output_dim": 1
+      }
+    },
+    "optimizer": {
+      "type": "Adam",
+      "params": {"lr": 1e-3}
+    }
+  },
+  "tabular_processor": {
+    "d_cell": 4
+  },
+  "text_processor": {
+    "max_seq_len": 512,
+    "tokenizer_name_or_path": "/mnt/data/welkinni/Qwen2.5-0.5B-Instruct/qwen/Qwen2.5-0.5B-Instruct",
+    "tokenizer_kwargs": {
+      "trust_remote_code": true
+    }
+  },
+  "evaluation": {
+    "dataset_name": "hospital_error_eval",
+    "clean_data_path": "data/hospital_clean.csv",
+    "dirty_data_path": "data/hospital_error-01.csv"
+  }
+}

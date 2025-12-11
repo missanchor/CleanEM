@@ -7,6 +7,8 @@ Cross Attention Detection Model
 """
 
 import os
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,6 +19,8 @@ from sklearn.metrics import classification_report, accuracy_score
 import numpy as np
 from tqdm import tqdm
 import logging
+
+from cross_modal_error_detector.utils.device import resolve_runtime_device
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -118,8 +122,9 @@ class LLMBasedCrossAttentionDetector:
     """
     基于LLM cross attention的检测器
     """
-    def __init__(self, model_name="Qwen/Qwen2.5-0.5B-Instruct", device="cuda" if torch.cuda.is_available() else "cpu"):
-        self.device = torch.device(device)
+    def __init__(self, model_name="Qwen/Qwen2.5-0.5B-Instruct", device: Optional[str] = None):
+        resolved_device = resolve_runtime_device(device)
+        self.device = torch.device(resolved_device)
         self.model_name = model_name
         self.tokenizer = None
         self.llm_model = None
@@ -363,9 +368,16 @@ def prepare_text_representation(features, labels, raw_values=None):
     return texts
 
 
-def compare_mlp_vs_cross_attention(train_features, train_labels, test_features, test_labels,
-                                   train_raw_values=None, test_raw_values=None,
-                                   model_name="Qwen/Qwen2.5-0.5B-Instruct", device="cuda"):
+def compare_mlp_vs_cross_attention(
+    train_features,
+    train_labels,
+    test_features,
+    test_labels,
+    train_raw_values=None,
+    test_raw_values=None,
+    model_name="Qwen/Qwen2.5-0.5B-Instruct",
+    device: Optional[str] = None,
+):
     """
     对比MLP和Cross Attention两种方法
 
@@ -392,7 +404,8 @@ def compare_mlp_vs_cross_attention(train_features, train_labels, test_features, 
 
     # 2. 训练Cross Attention检测器
     LOGGER.info("Training Cross Attention detector...")
-    detector = LLMBasedCrossAttentionDetector(model_name=model_name, device=device)
+    runtime_device = resolve_runtime_device(device)
+    detector = LLMBasedCrossAttentionDetector(model_name=model_name, device=runtime_device)
     detector.load_llm()
 
     # 准备文本描述

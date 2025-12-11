@@ -109,12 +109,10 @@
       "num_layers": 2,
       "max_seq_len": 256,
       "dropout": 0.1,
-      "model_name_or_path": "/data/nw/modelscope_models/Qwen2.5-1.5B-Instruct",
+      "model_name_or_path": "/mnt/data/welkinni/Qwen2.5-3B/qwen/Qwen2.5-3B",
       "trust_remote_code": true,
       "output_proj_dim": 256,
-      "freeze_base_model": true,
-      "adapter_hidden_dim": 128,
-      "adapter_dropout": 0.1
+      "freeze_pretrained": true
     }
   },
   "detection_head": {

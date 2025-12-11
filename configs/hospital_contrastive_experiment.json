@@ -4,8 +4,8 @@
     "default": "cuda:0"
   },
   "seed": 42,
-  "dataset": "beers_error-01",
-  "data_path": "data/beers_error-01.csv",
+  "dataset": "hospital_error-01",
+  "data_path": "data/hospital_error-01.csv",
   "num_epochs": 50,
   "batch_size": 16,
   "temperature": 0.07,
@@ -67,9 +67,9 @@
     }
   },
   "evaluation": {
-    "dataset_name": "beers_error_eval",
-    "clean_data_path": "data/beers_clean.csv",
-    "dirty_data_path": "data/beers_error-01.csv"
+    "dataset_name": "hospital_error_eval",
+    "clean_data_path": "data/hospital_clean.csv",
+    "dirty_data_path": "data/hospital_error-01.csv"
   }
 }
 

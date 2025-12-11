@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -64,9 +65,21 @@ def _instantiate_processors(
     return tabular_processor, text_processor
 
 
+def _strip_json_comments(text: str) -> str:
+    """移除 JSONC 格式的注释（// 和 /* */）"""
+    # 移除单行注释 //
+    text = re.sub(r'//.*?$', '', text, flags=re.MULTILINE)
+    # 移除多行注释 /* */
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+    return text
+
+
 def load_config(config_path: Path) -> Dict[str, Any]:
     with config_path.open("r", encoding="utf-8") as fp:
-        return json.load(fp)
+        content = fp.read()
+    # 支持 JSONC 格式（带注释的 JSON）
+    content = _strip_json_comments(content)
+    return json.loads(content)
 
 
 def set_seed(seed: int) -> None:

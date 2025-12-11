@@ -20,6 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import accuracy_score, classification_report
 from cross_attention_detector import LLMBasedCrossAttentionDetector
+from cross_modal_error_detector.utils.device import resolve_runtime_device
 import logging
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -252,7 +253,7 @@ def build_training_data_zeroed(det_right_list, det_wrong_list, feature_all_dict,
     return features, labels, texts, raw_values
 
 
-def run_zeroed_cross_attention_comparison(resp_path, llm_model_path="/data/nw/modelscope_models/Qwen2.5-1.5B-Instruct"):
+def run_zeroed_cross_attention_comparison(resp_path, llm_model_path="/mnt/data/welkinni/Qwen2.5-3B/qwen/Qwen2.5-3B"):
     """
     运行基于ZeroED结果的Cross Attention对比实验
     """
@@ -329,7 +330,7 @@ def run_zeroed_cross_attention_comparison(resp_path, llm_model_path="/data/nw/mo
     LOGGER.info("\n6. Training Cross Attention detector...")
     detector = LLMBasedCrossAttentionDetector(
         model_name=llm_model_path,
-        device="cuda" if torch.cuda.is_available() else "cpu"
+        device=resolve_runtime_device("cuda")
     )
 
     detector.load_llm()
@@ -388,7 +389,7 @@ if __name__ == "__main__":
     parser.add_argument('--resp_path', type=str, required=True,
                         help='Path to ZeroED results directory')
     parser.add_argument('--llm_model', type=str,
-                        default="/data/nw/modelscope_models/Qwen2.5-1.5B-Instruct",
+                        default="/mnt/data/welkinni/Qwen2.5-3B/qwen/Qwen2.5-3B",
                         help='Path to LLM model')
 
     args = parser.parse_args()

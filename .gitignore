@@ -7,6 +7,9 @@ docs/
 __pycache__/
 .vscode/
 .claude/
+.conda/
+.DS_Store
 
 cc.en.300.bin
+cc.en.300.bin.gz
 *.log

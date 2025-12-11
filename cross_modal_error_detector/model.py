@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from .base import BaseDetectionHead, BaseEncoder, BaseFusion
+from .utils.device import canonicalize_device_map, resolve_runtime_device
 
 
 class CrossModalErrorDetector(nn.Module):
@@ -31,8 +32,13 @@ class CrossModalErrorDetector(nn.Module):
         self.text_encoder = text_encoder
         self.fusion_module = fusion_module
         self.detection_head = detection_head
-        self.device_map = device_map or {}
-        self.default_device = default_device
+        self.default_device = resolve_runtime_device(default_device)
+        raw_device_map = canonicalize_device_map(device_map) if device_map else {}
+        self.device_map = {
+            key: resolve_runtime_device(value, fallback_device=self.default_device)
+            for key, value in raw_device_map.items()
+        }
+        self.device_map.setdefault("default", self.default_device)
         self.module_devices: Dict[str, torch.device] = {}
         self._apply_device_allocation()
 
@@ -93,7 +99,11 @@ class CrossModalErrorDetector(nn.Module):
         text_inputs = self._move_inputs_to_device(text_inputs, text_device)
 
         H_table = self.tabular_encoder(tabular_inputs)
-        H_text = self.text_encoder(text_inputs)
+        
+        if "cached_embedding" in text_inputs:
+            H_text = text_inputs["cached_embedding"]
+        else:
+            H_text = self.text_encoder(text_inputs)
 
         H_table = self._maybe_to(H_table, fusion_device)
         H_text = self._maybe_to(H_text, fusion_device)

@@ -44,6 +44,12 @@ class StructureAwareTransformer(BaseEncoder):
         row_indices: torch.Tensor,
         col_indices: torch.Tensor,
     ) -> torch.Tensor:
+        # Handle both batch and single-row cases
+        if row_indices.dim() == 1:
+            # Single row case - add batch dimension
+            row_indices = row_indices.unsqueeze(0)
+            col_indices = col_indices.unsqueeze(0)
+
         batch_size, num_cols = row_indices.shape
         row_i = row_indices.unsqueeze(2)
         row_j = row_indices.unsqueeze(1)
@@ -78,8 +84,9 @@ class StructureAwareTransformer(BaseEncoder):
 
 class PretrainedTextEncoder(BaseEncoder):
     """
-    Lightweight Transformer text encoder that can optionally wrap pretrained
-    HuggingFace/ModelScope models stored on disk.
+    Text encoder that either:
+    1. Wraps a pretrained HF/ModelScope model (kept frozen by default); or
+    2. Falls back to a lightweight Transformer when no checkpoint is provided.
     """
 
     def __init__(
@@ -95,44 +102,47 @@ class PretrainedTextEncoder(BaseEncoder):
         trust_remote_code: bool = True,
         pretrained_model_kwargs: Optional[Dict[str, Any]] = None,
         output_proj_dim: Optional[int] = None,
-        freeze_base_model: bool = True,
+        freeze_pretrained: bool = True,
+        freeze_base_model: Optional[bool] = None,
         adapter_hidden_dim: Optional[int] = None,
-        adapter_dropout: float = 0.1,
+        adapter_dropout: float = 0.0,
     ):
         """
         Args:
             vocab_size: Size of the synthetic vocabulary (ignored when loading a
                 pretrained model).
-            d_model: Hidden size of the lightweight encoder or projection
-                dimension when wrapping a pretrained model.
+            d_model: Hidden size of the lightweight encoder.
             nhead: Number of attention heads for the lightweight encoder.
             num_layers: Number of transformer layers for the lightweight encoder.
             max_seq_len: Maximum sequence length supported by the lightweight encoder.
             dropout: Dropout probability applied before the transformer or on top
                 of the pretrained model outputs.
             model_name_or_path: Local path or identifier of a pretrained model.
-                When provided, the encoder will load the model via
-                `transformers.AutoModel.from_pretrained`.
-            trust_remote_code: Whether to allow custom model code when loading
-                from `transformers`. Defaults to True to support ModelScope
-                checkpoints.
-            pretrained_model_kwargs: Additional keyword arguments forwarded to
-                `AutoModel.from_pretrained`.
-            output_proj_dim: Optional dimension to project the pretrained model
-                hidden states to. If None, the original hidden size is used.
-            freeze_base_model: Whether to freeze the pretrained encoder weights.
-                Set to True to keep the backbone fixed and only train the adapter.
-            adapter_hidden_dim: Size of the adapter bottleneck. Defaults to the
-                output projection dimension when not specified.
-            adapter_dropout: Dropout probability applied inside the adapter.
+            trust_remote_code: Passed to HuggingFace `from_pretrained`.
+            pretrained_model_kwargs: Extra keyword arguments for `from_pretrained`.
+            output_proj_dim: Optional projection dimension; leave as None to use
+                the raw pretrained hidden size directly (no adapter).
+            freeze_pretrained: Whether to freeze the backbone weights when loading
+                a pretrained checkpoint.
+            freeze_base_model: Deprecated alias for `freeze_pretrained`.
+            adapter_hidden_dim: Size of the optional lightweight adapter. When
+                provided, a small two-layer MLP is added on top of the encoder
+                outputs (trainable even if the base model is frozen).
+            adapter_dropout: Dropout rate applied inside the adapter module.
         """
         super().__init__()
         self.dropout = nn.Dropout(dropout)
-        self.adapter: Optional[nn.Module] = None
         self.use_transformers_model = model_name_or_path is not None
-        self.freeze_base_model = freeze_base_model
-        self.adapter_hidden_dim = adapter_hidden_dim
-        self.adapter_dropout = adapter_dropout
+        if freeze_base_model is not None and freeze_base_model != freeze_pretrained:
+            raise ValueError(
+                "Received both `freeze_pretrained` and legacy `freeze_base_model` "
+                "with conflicting values. Please keep them consistent."
+            )
+        if freeze_base_model is not None:
+            freeze_pretrained = freeze_base_model
+        self.freeze_pretrained = freeze_pretrained
+        self.output_projection: Optional[nn.Linear] = None
+        self.adapter: Optional[nn.Module] = None
 
         # Placeholders to keep attribute access consistent.
         self.model: Optional[nn.Module] = None
@@ -161,10 +171,6 @@ class PretrainedTextEncoder(BaseEncoder):
                 **load_kwargs,
             )
 
-            if self.freeze_base_model:
-                for param in self.model.parameters():
-                    param.requires_grad = False
-
             hidden_size = getattr(self.model.config, "hidden_size", None)
             if hidden_size is None:
                 hidden_size = getattr(self.model.config, "d_model", None)
@@ -174,9 +180,18 @@ class PretrainedTextEncoder(BaseEncoder):
                     "Please ensure the config exposes `hidden_size` or `d_model`."
                 )
 
-            adapter_out_dim = output_proj_dim or hidden_size
-            self.adapter = self._build_adapter(hidden_size, adapter_out_dim)
-            self.d_model = adapter_out_dim
+            target_dim = output_proj_dim or hidden_size
+            if output_proj_dim is not None and output_proj_dim != hidden_size:
+                self.output_projection = nn.Linear(hidden_size, target_dim)
+                if self.freeze_pretrained:
+                    for param in self.output_projection.parameters():
+                        param.requires_grad = False
+            self.d_model = target_dim
+
+            if self.freeze_pretrained and self.model is not None:
+                for param in self.model.parameters():
+                    param.requires_grad = False
+                self.model.eval()
         else:
             self.token_embedding = nn.Embedding(vocab_size, d_model)
             self.position_embedding = nn.Embedding(max_seq_len, d_model)
@@ -192,6 +207,16 @@ class PretrainedTextEncoder(BaseEncoder):
                 num_layers=num_layers,
             )
             self.d_model = d_model
+
+        if adapter_hidden_dim is not None:
+            if adapter_hidden_dim <= 0:
+                raise ValueError("`adapter_hidden_dim` must be a positive integer.")
+            self.adapter = nn.Sequential(
+                nn.Linear(self.d_model, adapter_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(adapter_dropout),
+                nn.Linear(adapter_hidden_dim, self.d_model),
+            )
 
     def forward(self, text_inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
         if self.use_transformers_model:
@@ -209,8 +234,7 @@ class PretrainedTextEncoder(BaseEncoder):
                 if key in text_inputs:
                     model_kwargs[key] = text_inputs[key]
 
-            if self.freeze_base_model:
-                self.model.eval()
+            if self.freeze_pretrained:
                 with torch.no_grad():
                     outputs = self.model(**model_kwargs)
             else:
@@ -221,8 +245,10 @@ class PretrainedTextEncoder(BaseEncoder):
                 hidden_states = outputs[0]
 
             hidden_states = self.dropout(hidden_states)
+            if self.output_projection is not None:
+                hidden_states = self.output_projection(hidden_states)
             if self.adapter is not None:
-                hidden_states = self.adapter(hidden_states)
+                hidden_states = hidden_states + self.adapter(hidden_states)
             return hidden_states
 
         if self.token_embedding is None or self.position_embedding is None or self.transformer is None:
@@ -247,17 +273,19 @@ class PretrainedTextEncoder(BaseEncoder):
             embeddings,
             src_key_padding_mask=src_key_padding_mask,
         )
+        if self.adapter is not None:
+            H_text = H_text + self.adapter(H_text)
         return H_text
 
-    def _build_adapter(self, input_dim: int, output_dim: int) -> nn.Module:
-        bottleneck_dim = self.adapter_hidden_dim or output_dim
-        layers = [
-            nn.Linear(input_dim, bottleneck_dim),
-            nn.ReLU(),
-            nn.Dropout(self.adapter_dropout),
-            nn.Linear(bottleneck_dim, output_dim),
-        ]
-        return nn.Sequential(*layers)
+    def train(self, mode: bool = True):
+        if self.use_transformers_model and self.freeze_pretrained:
+            super().train(False)
+            if self.model is not None:
+                self.model.eval()
+            if self.output_projection is not None and all(not p.requires_grad for p in self.output_projection.parameters()):
+                self.output_projection.eval()
+            return self
+        return super().train(mode)
 
 
 class SimpleMLPEncoder(BaseEncoder):

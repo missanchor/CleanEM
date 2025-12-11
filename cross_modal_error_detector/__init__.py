@@ -44,15 +44,18 @@ from .processors import (
 from .datasets import (
     CorruptionBasedDataset,
     ContrastiveDataset,
-    CleanDirtyEvaluationDataset
+    CleanDirtyEvaluationDataset,
+    PerColumnBinaryDataset
 )
 
 # Training utilities
 from .training import (
     collate_fn_corruption,
     collate_fn_contrastive,
+    collate_fn_contrastive_cell_level,
     train_step_corruption,
-    train_step_contrastive
+    compute_embedding_similarity,
+    train_step_contrastive_pretrain
 )
 
 __all__ = [
@@ -60,37 +63,40 @@ __all__ = [
     'BaseEncoder',
     'BaseFusion',
     'BaseDetectionHead',
-    
+
     # Core model
     'CrossModalErrorDetector',
-    
+
     # Encoders
     'StructureAwareTransformer',
     'PretrainedTextEncoder',
     'SimpleMLPEncoder',
-    
+
     # Fusion modules
     'CrossAttentionFusion',
     'SimpleConcatFusion',
-    
+
     # Detection heads
     'MLPDetectionHead',
     'ContrastiveDetectionHead',
-    
+
     # Data processing
     'TabularProcessor',
     'TextProcessor',
-    
+
     # Datasets
     'CorruptionBasedDataset',
     'ContrastiveDataset',
     'CleanDirtyEvaluationDataset',
-    
+    'PerColumnBinaryDataset',
+
     # Training utilities
     'collate_fn_corruption',
     'collate_fn_contrastive',
+    'collate_fn_contrastive_cell_level',
     'train_step_corruption',
-    'train_step_contrastive',
+    'compute_embedding_similarity',
+    'train_step_contrastive_pretrain',
 ]
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ import sys
 import json
 import pickle
 import argparse
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 from sklearn.neural_network import MLPClassifier
@@ -18,6 +20,8 @@ from cross_attention_detector import LLMBasedCrossAttentionDetector, prepare_tex
 import torch
 from tqdm import tqdm
 import logging
+
+from cross_modal_error_detector.utils.device import resolve_runtime_device
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 LOGGER = logging.getLogger(__name__)
@@ -210,13 +214,20 @@ def train_mlp_classifier(train_features, train_labels):
     return model
 
 
-def train_cross_attention_detector(train_features, train_labels, train_raw_values, model_name, device):
+def train_cross_attention_detector(
+    train_features,
+    train_labels,
+    train_raw_values,
+    model_name,
+    device: Optional[str],
+):
     """训练Cross Attention检测器"""
     LOGGER.info("Initializing Cross Attention detector...")
 
+    runtime_device = resolve_runtime_device(device)
     detector = LLMBasedCrossAttentionDetector(
         model_name=model_name,
-        device=device
+        device=runtime_device
     )
 
     # 加载LLM
@@ -331,14 +342,21 @@ def main():
                         help='Path to ZeroED results directory')
     parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-0.5B-Instruct',
                         help='Model name for LLM')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
-                        help='Device to use')
+    parser.add_argument(
+        '--device',
+        type=str,
+        default=None,
+        help='Device to use (default: auto-select emptiest GPU or CPU)',
+    )
     parser.add_argument('--output_dir', type=str, default='./comparison_results',
                         help='Output directory for results')
     parser.add_argument('--test_size', type=float, default=0.2,
                         help='Test set size (0.0-1.0)')
 
     args = parser.parse_args()
+
+    runtime_device = resolve_runtime_device(args.device)
+    LOGGER.info(f"Using device: {runtime_device}")
 
     # 加载数据
     LOGGER.info(f"Loading data from {args.resp_path}")
@@ -386,7 +404,7 @@ def main():
         train_labels_split,
         train_raw_values_split,
         args.model_name,
-        args.device
+        runtime_device,
     )
 
     # 评估

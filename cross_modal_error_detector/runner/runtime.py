@@ -4,6 +4,8 @@ from typing import Dict, Optional
 
 import torch
 
+from ..utils.device import resolve_runtime_device
+
 
 def _resolve_runtime_device(
     default_device: str,
@@ -12,10 +14,10 @@ def _resolve_runtime_device(
 ) -> str:
     if device_map:
         if key in device_map:
-            return device_map[key]
+            return resolve_runtime_device(device_map[key], fallback_device=default_device)
         if "default" in device_map:
-            return device_map["default"]
-    return default_device
+            return resolve_runtime_device(device_map["default"], fallback_device=default_device)
+    return resolve_runtime_device(default_device)
 
 
 def _move_batch_to_device(inputs: Dict[str, torch.Tensor], device: str) -> Dict[str, torch.Tensor]:

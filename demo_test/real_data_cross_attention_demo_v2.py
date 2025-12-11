@@ -25,17 +25,26 @@ import numpy as np
 import pandas as pd
 import torch
 import argparse
-from sklearn.model_selection import train_test_split
+from pathlib import Path
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.neural_network import MLPClassifier
 import json
 import pickle
 import re
 import logging
-from cross_attention_detector import LLMBasedCrossAttentionDetector
+
+# Ensure project root is available for local package imports
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 # 添加ZeroED目录到路径以加载相关模块
-sys.path.insert(0, '/data/nw/Cleaning_LLM/ZeroED')
+ZEROED_DIR = PROJECT_ROOT / 'ZeroED'
+if str(ZEROED_DIR) not in sys.path:
+    sys.path.insert(0, str(ZEROED_DIR))
+
+from cross_attention_detector import LLMBasedCrossAttentionDetector
+from cross_modal_error_detector.utils.device import resolve_runtime_device
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 LOGGER = logging.getLogger(__name__)
@@ -83,6 +92,92 @@ def load_dataset(dataset_name="beers", data_dir="/data/nw/Cleaning_LLM/data"):
     LOGGER.info(f"  - Columns: {list(clean_df.columns)}")
 
     return clean_df, dirty_df
+
+
+FEATURE_KEYS = ['occur_cnt_feat', 'pat_stats_feat', 'fasttext_feat', 'pre_funcs_feat']
+
+
+def _flatten_feature_values(values):
+    """
+    将ZeroED生成的特征值展平为一维浮点列表
+    """
+    if isinstance(values, np.ndarray):
+        values = values.tolist()
+
+    if isinstance(values, (list, tuple)):
+        flattened = []
+        for item in values:
+            flattened.extend(_flatten_feature_values(item))
+        return flattened
+
+    try:
+        return [float(values)]
+    except (TypeError, ValueError):
+        return []
+
+
+def build_feature_vector(feat_dict, feature_keys=None):
+    """
+    根据ZeroED的特征字典构造统一的一维特征向量
+    """
+    feature_keys = feature_keys or FEATURE_KEYS
+    feature_parts = []
+
+    for key in feature_keys:
+        if key in feat_dict and isinstance(feat_dict[key], (list, tuple, np.ndarray)):
+            flattened = _flatten_feature_values(feat_dict[key])
+            if flattened:
+                feature_parts.extend(flattened)
+
+    if not feature_parts:
+        return None
+
+    return np.array(feature_parts, dtype=np.float32)
+
+
+def prepare_attribute_eval_dataset(attr_name, column_idx, dirty_df, clean_df, feature_all_dict):
+    """
+    构造某一列在整个脏数据集上的特征、文本和ground truth标签
+    """
+    feature_list = []
+    label_list = []
+    text_list = []
+    missing_count = 0
+
+    for row_idx in range(len(dirty_df)):
+        key = (row_idx, column_idx)
+        if key not in feature_all_dict:
+            missing_count += 1
+            continue
+
+        feature_vec = build_feature_vector(feature_all_dict[key])
+        if feature_vec is None:
+            missing_count += 1
+            continue
+
+        feature_list.append(feature_vec)
+        raw_val = str(dirty_df.iloc[row_idx, column_idx])
+        text_list.append(f"The value '{raw_val}' in column '{attr_name}'.")
+
+        clean_val = str(clean_df.iloc[row_idx, column_idx])
+        label_list.append(int(raw_val != clean_val))
+
+    if not feature_list:
+        LOGGER.warning(f"    Unable to build evaluation data for {attr_name}: no usable features (missing {missing_count} entries).")
+        return None
+
+    try:
+        features = np.stack(feature_list)
+    except ValueError as exc:
+        LOGGER.error(f"    Feature dimension mismatch for {attr_name}: {exc}")
+        return None
+
+    labels = np.array(label_list, dtype=np.int64)
+    return {
+        'features': features,
+        'labels': labels,
+        'texts': text_list
+    }
 
 
 def try_load_zeroed_results(resp_path, dataset_name):
@@ -279,22 +374,8 @@ def try_load_zeroed_results(resp_path, dataset_name):
             if (row_idx, col_idx) in feature_all_dict:
                 feat_dict = feature_all_dict[(row_idx, col_idx)]
 
-                # 组合所有特征（使用ZeroED设计的专业特征）
-                feature_parts = []
-                # 只使用固定存在的特征类型
-                for key in ['occur_cnt_feat', 'pat_stats_feat', 'fasttext_feat', 'pre_funcs_feat']:
-                    if key in feat_dict and isinstance(feat_dict[key], (list, np.ndarray)) and len(feat_dict[key]) > 0:
-                        # 确保特征是平坦的数值列表
-                        if isinstance(feat_dict[key][0], (list, np.ndarray)):
-                            # 如果是嵌套的，平坦化
-                            flat = [item for sublist in feat_dict[key] for item in (sublist if isinstance(sublist, list) else [sublist])]
-                            feature_parts.extend(flat)
-                        else:
-                            # 直接添加
-                            feature_parts.extend(feat_dict[key])
-
-                # 跳过无效特征
-                if len(feature_parts) < 10:  # 最小特征长度阈值
+                feature_vec = build_feature_vector(feat_dict)
+                if feature_vec is None:
                     continue
 
                 # 生成文本描述
@@ -303,7 +384,7 @@ def try_load_zeroed_results(resp_path, dataset_name):
                 text += "incorrect" if label == 1 else "correct"
 
                 # 添加到对应属性的组
-                attr_groups[attr]['features'].append(np.array(feature_parts))
+                attr_groups[attr]['features'].append(feature_vec)
                 attr_groups[attr]['labels'].append(label)
                 attr_groups[attr]['texts'].append(text)
                 attr_groups[attr]['raw_values'].append(raw_val)
@@ -322,6 +403,8 @@ def try_load_zeroed_results(resp_path, dataset_name):
 
         return {
             'attr_groups': attr_groups,
+            'feature_all_dict': feature_all_dict,
+            'all_attrs': all_attrs,
             'source': 'zeroed'
         }
 
@@ -330,8 +413,6 @@ def try_load_zeroed_results(resp_path, dataset_name):
         import traceback
         traceback.print_exc()
         return None
-
-
 
 
 def run_real_data_comparison(dataset_name="beers"):
@@ -357,29 +438,14 @@ def run_real_data_comparison(dataset_name="beers"):
         return None
 
     # 手动指定数据集特定的目录
-    if dataset_name == "hospital":
-        # 查找hospital目录
-        import glob
-        pattern = os.path.join(base_result_dir, "*hospital01-5%-set1")
-        all_dirs = glob.glob(pattern)
-        if not all_dirs:
-            LOGGER.error(f"❌ No Hospital ZeroED results found matching pattern: {pattern}")
-            return None
-        resp_path = all_dirs[0]
-        LOGGER.info(f"✓ Using Hospital ZeroED results from: {resp_path}")
-    else:
-        # 查找最新结果目录
-        import glob
-        pattern = os.path.join(base_result_dir, f"*-*-* *s01-5%-set1")
-        all_dirs = glob.glob(pattern)
-        all_dirs.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-
-        if not all_dirs:
-            LOGGER.error(f"❌ No ZeroED results found matching pattern: {pattern}")
-            return None
-
-        resp_path = all_dirs[0]
-        LOGGER.info(f"✓ Using ZeroED results from: {resp_path}")
+    import glob
+    pattern = os.path.join(base_result_dir, f"*{dataset_name}01-5%-set1")
+    all_dirs = glob.glob(pattern)
+    if not all_dirs:
+        LOGGER.error(f"❌ No Hospital ZeroED results found matching pattern: {pattern}")
+        return None
+    resp_path = all_dirs[0]
+    LOGGER.info(f"✓ Using Hospital ZeroED results from: {resp_path}")
 
     if not os.path.exists(resp_path):
         LOGGER.error(f"❌ ZeroED results directory not found: {resp_path}")
@@ -401,13 +467,29 @@ def run_real_data_comparison(dataset_name="beers"):
         LOGGER.error("Need to modify try_load_zeroed_results to return attribute groups")
         return None
 
+    feature_all_dict = zeroed_results.get('feature_all_dict')
+    if feature_all_dict is None:
+        LOGGER.error("❌ feature_all_dict missing from ZeroED results. Cannot build evaluation dataset.")
+        return None
+
+    try:
+        clean_df, dirty_df = load_dataset(dataset_name)
+    except FileNotFoundError as exc:
+        LOGGER.error(f"❌ {exc}")
+        return None
+
+    column_index_map = {col: idx for idx, col in enumerate(dirty_df.columns)}
+    attr_eval_cache = {}
+
     LOGGER.info(f"Found {len(attr_groups)} attributes: {list(attr_groups.keys())}")
 
     # 3. 为每个属性训练模型并汇总结果
     LOGGER.info("\n3. Training models for each attribute...")
     all_mlp_preds = []
     all_cross_attn_preds = []
-    all_labels = []
+    mlp_eval_labels = []
+    cross_attn_eval_labels = []
+    mlp_preds_for_cross_subset = []
 
     mlp_accuracies = {}
     cross_attn_accuracies = {}
@@ -418,28 +500,43 @@ def run_real_data_comparison(dataset_name="beers"):
         LOGGER.info(f"    Features shape: {attr_data['features'].shape}")
         LOGGER.info(f"    Error rate: {attr_data['labels'].mean()*100:.1f}%")
 
+        if attr_name not in column_index_map:
+            LOGGER.warning(f"    Column {attr_name} not present in dirty dataset. Skipping.")
+            continue
+
+        col_idx = column_index_map[attr_name]
+        eval_data = attr_eval_cache.get(attr_name)
+        if eval_data is None:
+            eval_data = prepare_attribute_eval_dataset(attr_name, col_idx, dirty_df, clean_df, feature_all_dict)
+            if eval_data is None:
+                LOGGER.warning(f"    Skipping {attr_name}: unable to prepare evaluation data.")
+                continue
+            attr_eval_cache[attr_name] = eval_data
+
+        eval_features = eval_data['features']
+        eval_labels = eval_data['labels']
+        eval_texts = eval_data['texts']
+
+        if eval_features.shape[1] != attr_data['features'].shape[1]:
+            LOGGER.error(
+                f"    Feature dimension mismatch for {attr_name}: "
+                f"train_dim={attr_data['features'].shape[1]}, eval_dim={eval_features.shape[1]}"
+            )
+            continue
+
         # 跳过错误率为0%的列（所有样本都是正确的）
         if attr_data['labels'].mean() == 0:
             LOGGER.info(f"    Skipping {attr_name}: no errors in this column (all samples correct)")
-            all_mlp_preds.extend(attr_data['labels'])  # 所有预测都是正确的
-            all_labels.extend(attr_data['labels'])
-            all_cross_attn_preds.extend(attr_data['labels'])  # Cross Attention也用正确的预测
+            zero_preds = np.zeros_like(eval_labels)
+            mlp_eval_labels.extend(eval_labels)
+            all_mlp_preds.extend(zero_preds)
+            mlp_accuracies[attr_name] = accuracy_score(eval_labels, zero_preds)
             continue
 
-        if len(attr_data['features']) < 50:  # 跳过样本太少的属性
-            LOGGER.warning(f"    Skipping {attr_name}: too few samples")
-            all_mlp_preds.extend(attr_data['labels'])
-            all_labels.extend(attr_data['labels'])
-            all_cross_attn_preds.extend(attr_data['labels'])
-            continue
-
-        # 分割数据
-        X_train, X_test, y_train, y_test, texts_train, texts_test = train_test_split(
-            attr_data['features'], attr_data['labels'], attr_data['texts'],
-            test_size=0.3,
-            random_state=42,
-            stratify=attr_data['labels']
-        )
+        # 不再拆分训练/测试集，全部样本用于训练
+        X_train = attr_data['features']
+        y_train = attr_data['labels']
+        texts_train = attr_data['texts']
 
         # 训练MLP
         LOGGER.info(f"    Training MLP...")
@@ -452,10 +549,11 @@ def run_real_data_comparison(dataset_name="beers"):
             early_stopping=True
         )
         mlp.fit(X_train, y_train)
-        mlp_preds = mlp.predict(X_test)
-        mlp_acc = accuracy_score(y_test, mlp_preds)
+        mlp_preds = mlp.predict(eval_features)
+        mlp_acc = accuracy_score(eval_labels, mlp_preds)
         mlp_accuracies[attr_name] = mlp_acc
         all_mlp_preds.extend(mlp_preds)
+        mlp_eval_labels.extend(eval_labels)
 
         LOGGER.info(f"    MLP Accuracy: {mlp_acc:.4f}")
 
@@ -463,8 +561,8 @@ def run_real_data_comparison(dataset_name="beers"):
         try:
             LOGGER.info(f"    Training Cross Attention (using GPU)...")
             detector = LLMBasedCrossAttentionDetector(
-                model_name="/data/nw/modelscope_models/Qwen2.5-1.5B-Instruct",
-                device="cuda"  # 使用GPU
+                model_name="/mnt/data/welkinni/Qwen2.5-3B/qwen/Qwen2.5-3B",
+                device=resolve_runtime_device("cuda"),  # 使用最空GPU
             )
 
             detector.load_llm(cache_dir="/data/nw/modelscope_cache")
@@ -479,10 +577,12 @@ def run_real_data_comparison(dataset_name="beers"):
                 lr=1e-4
             )
 
-            cross_attn_preds = detector.predict(X_test, texts_test)
-            cross_attn_acc = accuracy_score(y_test, cross_attn_preds)
+            cross_attn_preds = detector.predict(eval_features, eval_texts)
+            cross_attn_acc = accuracy_score(eval_labels, cross_attn_preds)
             cross_attn_accuracies[attr_name] = cross_attn_acc
             all_cross_attn_preds.extend(cross_attn_preds)
+            cross_attn_eval_labels.extend(eval_labels)
+            mlp_preds_for_cross_subset.extend(mlp_preds)
 
             LOGGER.info(f"    Cross Attention Accuracy: {cross_attn_acc:.4f}")
 
@@ -490,74 +590,67 @@ def run_real_data_comparison(dataset_name="beers"):
             LOGGER.warning(f"    Cross Attention training failed: {e}")
             # Cross Attention失败时，用MLP预测代替（或者其他默认策略）
             all_cross_attn_preds.extend(mlp_preds)
+            cross_attn_eval_labels.extend(eval_labels)
+            mlp_preds_for_cross_subset.extend(mlp_preds)
 
-        all_labels.extend(y_test)
-
-    # 4. 汇总结果
-    all_labels = np.array(all_labels)
-    all_mlp_preds = np.array(all_mlp_preds)
-
-    # 只有当有Cross Attention结果时才计算
-    if len(all_cross_attn_preds) > 0:
-        all_cross_attn_preds = np.array(all_cross_attn_preds)
-        has_cross_attn = True
-    else:
-        has_cross_attn = False
-        all_cross_attn_preds = None
-
-    # 仅对真实错误样本进行评估
-    error_mask = all_labels == 1
-    error_sample_count = int(error_mask.sum())
-
-    if error_sample_count == 0:
-        LOGGER.error("❌ No error samples found in aggregated labels. Unable to compute error-only metrics.")
+    # 4. 汇总结果（使用clean vs dirty获得的真实ground truth）
+    if not mlp_eval_labels:
+        LOGGER.error("❌ No evaluation samples collected for MLP. Cannot compute metrics.")
         return None
 
-    error_labels = all_labels[error_mask]
-    error_mlp_preds = all_mlp_preds[error_mask]
-    if has_cross_attn:
-        error_cross_attn_preds = all_cross_attn_preds[error_mask]
+    mlp_eval_labels = np.array(mlp_eval_labels)
+    all_mlp_preds = np.array(all_mlp_preds)
 
-    # 5. 对比结果
+    total_eval_samples = len(mlp_eval_labels)
+    error_sample_count = int((mlp_eval_labels == 1).sum())
+
     LOGGER.info("\n" + "="*80)
-    LOGGER.info("COMPARISON RESULTS (Aggregated)")
+    LOGGER.info("COMPARISON RESULTS (Ground truth from clean vs dirty)")
     LOGGER.info("="*80)
-    LOGGER.info(f"Evaluating on error samples only ({error_sample_count} cases)")
+    LOGGER.info(f"Total evaluated samples: {total_eval_samples}")
+    LOGGER.info(f"Total true error samples: {error_sample_count}")
 
-    overall_mlp_acc = accuracy_score(error_labels, error_mlp_preds)
-    # 错误检测任务：只对真实错误样本计算precision/recall/F1
-    mlp_precision = precision_score(error_labels, error_mlp_preds, pos_label=1, zero_division=0)
-    mlp_recall = recall_score(error_labels, error_mlp_preds, pos_label=1, zero_division=0)
-    mlp_f1 = f1_score(error_labels, error_mlp_preds, pos_label=1, zero_division=0)
+    overall_mlp_acc = accuracy_score(mlp_eval_labels, all_mlp_preds)
+    mlp_precision = precision_score(mlp_eval_labels, all_mlp_preds, pos_label=1, zero_division=0)
+    mlp_recall = recall_score(mlp_eval_labels, all_mlp_preds, pos_label=1, zero_division=0)
+    mlp_f1 = f1_score(mlp_eval_labels, all_mlp_preds, pos_label=1, zero_division=0)
 
-    LOGGER.info(f"\nError-only MLP Classifier (Baseline):")
+    LOGGER.info(f"\nMLP Classifier (full dirty dataset vs clean GT):")
     LOGGER.info(f"  Accuracy:  {overall_mlp_acc:.4f}")
-    LOGGER.info(f"  Precision (on detected errors): {mlp_precision:.4f}")
-    LOGGER.info(f"  Recall (of all errors):         {mlp_recall:.4f}")
-    LOGGER.info(f"  F1-Score (on detected errors):  {mlp_f1:.4f}")
+    LOGGER.info(f"  Precision (error class): {mlp_precision:.4f}")
+    LOGGER.info(f"  Recall    (error class): {mlp_recall:.4f}")
+    LOGGER.info(f"  F1-Score  (error class): {mlp_f1:.4f}")
     LOGGER.info(f"  Per-attribute accuracy: {mlp_accuracies}")
 
+    has_cross_attn = len(all_cross_attn_preds) > 0
     if has_cross_attn:
-        overall_cross_attn_acc = accuracy_score(error_labels, error_cross_attn_preds)
-        # 错误检测任务：只对真实错误样本计算precision/recall/F1
-        cross_attn_precision = precision_score(error_labels, error_cross_attn_preds, pos_label=1, zero_division=0)
-        cross_attn_recall = recall_score(error_labels, error_cross_attn_preds, pos_label=1, zero_division=0)
-        cross_attn_f1 = f1_score(error_labels, error_cross_attn_preds, pos_label=1, zero_division=0)
+        cross_attn_eval_labels = np.array(cross_attn_eval_labels)
+        all_cross_attn_preds = np.array(all_cross_attn_preds)
+        mlp_preds_for_cross_subset = np.array(mlp_preds_for_cross_subset)
 
-        LOGGER.info(f"\nError-only Cross Attention Detector:")
+        cross_attn_total_samples = len(cross_attn_eval_labels)
+        cross_attn_error_samples = int((cross_attn_eval_labels == 1).sum())
+
+        overall_cross_attn_acc = accuracy_score(cross_attn_eval_labels, all_cross_attn_preds)
+        cross_attn_precision = precision_score(cross_attn_eval_labels, all_cross_attn_preds, pos_label=1, zero_division=0)
+        cross_attn_recall = recall_score(cross_attn_eval_labels, all_cross_attn_preds, pos_label=1, zero_division=0)
+        cross_attn_f1 = f1_score(cross_attn_eval_labels, all_cross_attn_preds, pos_label=1, zero_division=0)
+
+        subset_mlp_acc = accuracy_score(cross_attn_eval_labels, mlp_preds_for_cross_subset)
+        improvement = overall_cross_attn_acc - subset_mlp_acc
+
+        LOGGER.info(f"\nCross Attention Detector (evaluated on {cross_attn_total_samples} samples | {cross_attn_error_samples} errors):")
         LOGGER.info(f"  Accuracy:  {overall_cross_attn_acc:.4f}")
-        LOGGER.info(f"  Precision (on detected errors): {cross_attn_precision:.4f}")
-        LOGGER.info(f"  Recall (of all errors):         {cross_attn_recall:.4f}")
-        LOGGER.info(f"  F1-Score (on detected errors):  {cross_attn_f1:.4f}")
+        LOGGER.info(f"  Precision (error class): {cross_attn_precision:.4f}")
+        LOGGER.info(f"  Recall    (error class): {cross_attn_recall:.4f}")
+        LOGGER.info(f"  F1-Score  (error class): {cross_attn_f1:.4f}")
         LOGGER.info(f"  Per-attribute accuracy: {cross_attn_accuracies}")
+        LOGGER.info(f"  Accuracy improvement vs MLP on same subset: {improvement*100:.2f}%")
 
-        improvement = overall_cross_attn_acc - overall_mlp_acc
-        LOGGER.info(f"\nPerformance Improvement: {improvement*100:.2f}%")
-
-        if overall_cross_attn_acc > overall_mlp_acc:
-            LOGGER.info("✓ Cross Attention detector performs BETTER than MLP!")
+        if overall_cross_attn_acc > subset_mlp_acc:
+            LOGGER.info("✓ Cross Attention detector performs BETTER than MLP on its evaluation subset!")
         else:
-            LOGGER.info("✗ MLP classifier performs better or equal.")
+            LOGGER.info("✗ MLP classifier performs better or equal on the same subset.")
 
         results = {
             'dataset': dataset_name,
@@ -569,15 +662,19 @@ def run_real_data_comparison(dataset_name="beers"):
             'overall_cross_attention_precision': float(cross_attn_precision),
             'overall_cross_attention_recall': float(cross_attn_recall),
             'overall_cross_attention_f1': float(cross_attn_f1),
+            'mlp_accuracy_on_cross_subset': float(subset_mlp_acc),
             'improvement': float(improvement),
-            'total_samples': len(all_labels),
+            'total_samples': total_eval_samples,
             'error_samples': error_sample_count,
+            'cross_attn_samples': cross_attn_total_samples,
+            'cross_attn_error_samples': cross_attn_error_samples,
             'attributes_count': len(attr_groups),
             'mlp_per_attribute': mlp_accuracies,
             'cross_attention_per_attribute': cross_attn_accuracies,
             'data_source': zeroed_results['source']
         }
     else:
+        LOGGER.warning("Cross Attention results unavailable; reporting MLP metrics only.")
         results = {
             'dataset': dataset_name,
             'overall_mlp_accuracy': float(overall_mlp_acc),
@@ -588,11 +685,11 @@ def run_real_data_comparison(dataset_name="beers"):
             'overall_cross_attention_precision': None,
             'overall_cross_attention_recall': None,
             'overall_cross_attention_f1': None,
-            'total_samples': len(all_labels),
+            'total_samples': total_eval_samples,
             'error_samples': error_sample_count,
             'attributes_count': len(attr_groups),
             'mlp_per_attribute': mlp_accuracies,
-            'note': 'Cross Attention training failed'
+            'note': 'Cross Attention training failed or skipped'
         }
 
     # 6. 保存结果

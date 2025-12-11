@@ -11,6 +11,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.neural_network import MLPClassifier
 from cross_attention_detector import LLMBasedCrossAttentionDetector
+from cross_modal_error_detector.utils.device import resolve_runtime_device
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -71,8 +72,8 @@ def quick_test():
     texts_test = [f"Row {i}: {dirty_df.iloc[idx].to_dict()}" for i, idx in enumerate(X_test)]
 
     detector = LLMBasedCrossAttentionDetector(
-        model_name="/data/nw/modelscope_models/Qwen2.5-1.5B-Instruct",
-        device="cuda"
+        model_name="/mnt/data/welkinni/Qwen2.5-3B/qwen/Qwen2.5-3B",
+        device=resolve_runtime_device("cuda")
     )
     detector.load_llm()
     detector.initialize_detection_head(feature_dim=X_train.shape[1])

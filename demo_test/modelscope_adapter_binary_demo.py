@@ -22,6 +22,7 @@ from modelscope.hub.snapshot_download import snapshot_download
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from cross_modal_error_detector.utils.device import resolve_runtime_device
 
 LOG_FORMAT = "[%(levelname)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -121,7 +122,8 @@ class FrozenBackboneBinaryClassifier(nn.Module):
 
 def prepare_device(force_cpu: bool = False) -> torch.device:
     if not force_cpu and torch.cuda.is_available():
-        return torch.device("cuda")
+        runtime_device = resolve_runtime_device("cuda")
+        return torch.device(runtime_device)
     if not force_cpu and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():  # type: ignore[attr-defined]
         return torch.device("mps")
     return torch.device("cpu")

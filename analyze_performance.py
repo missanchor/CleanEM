@@ -1,0 +1,28 @@
+print("性能分析:")
+print("-" * 50)
+
+print("\n原始配置:")
+print("  batch_size: 4")
+print("  batches/epoch: 1000/4 = 250")
+print("  计算量/batch: 4×4 = 16")
+print("  总计算量/epoch: 250 × 16 = 4,000")
+print("  实际速度: ~0.6s/it")
+print("  预计时间: 250 × 0.6s = 150s/epoch")
+
+print("\n当前配置:")
+print("  batch_size: 16") 
+print("  batches/epoch: 1000/16 = 63")
+print("  计算量/batch: 16×16 = 256")
+print("  总计算量/epoch: 63 × 256 = 16,128")
+print("  实际速度: ~10s/it")
+print("  预计时间: 63 × 10s = 630s/epoch")
+
+print("\n问题:")
+print("  计算量增加: 16,128 / 4,000 = 4.03倍")
+print("  速度降低: 10 / 0.6 = 16.7倍")
+print("  总体变慢: 630s / 150s = 4.2倍")
+
+print("\n解决方案:")
+print("  1. 保持batch_size=4，但使用梯度累积")
+print("  2. 优化similarity计算（向量化）")
+print("  3. 减少num_epochs进行快速测试")

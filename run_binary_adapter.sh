@@ -43,7 +43,7 @@ else
 fi
 
 # Run the training script
-/home/dell/anaconda3/envs/cleaningllm/bin/python /data/nw/Cleaning_LLM/modelscope_adapter_binary_demo.py \
+/mnt/data/welkinni/anaconda3/envs/cleaningllm/bin/python /data/nw/Cleaning_LLM/modelscope_adapter_binary_demo.py \
     --model-id Qwen/Qwen2.5-0.5B-Instruct \
     --cache-dir "$CACHE_DIR" \
     ${LOCAL_DIR:+--local-dir "$LOCAL_DIR"} \

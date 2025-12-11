@@ -12,7 +12,7 @@ class TabularProcessor:
     Converts raw table rows into tensor inputs.
     """
 
-    def __init__(self, num_numeric_bins: int = 100, d_cell: int = 64):
+    def __init__(self, num_numeric_bins: int = 100, d_cell: int = 8):
         self.num_numeric_bins = num_numeric_bins
         self.d_cell = d_cell
 
@@ -89,9 +89,10 @@ class TextProcessor:
                 return_tensors="pt",
             )
 
-            output: Dict[str, torch.Tensor] = {
+            output: Dict[str, Any] = {
                 "input_ids": encoded["input_ids"].squeeze(0),
                 "attention_mask": encoded["attention_mask"].squeeze(0),
+                "raw_text": text,
             }
 
             if "token_type_ids" in encoded:
