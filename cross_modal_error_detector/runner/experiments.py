@@ -19,6 +19,7 @@ from ..datasets import (
 from ..fusion import CrossAttentionFusion, SimpleConcatFusion, SingleColumnFusion
 from ..model import CrossModalErrorDetector
 from ..training import (
+    build_tabular_inputs_from_rows,
     collate_fn_contrastive,
     collate_fn_corruption,
     train_step_contrastive_pretrain,
@@ -53,11 +54,19 @@ def _derive_loader_runtime(exp_cfg: Dict[str, Any]) -> Tuple[int, bool, bool]:
     return num_workers, pin_memory, persistent_workers
 
 
+def _attach_processor_params(optimizer: torch.optim.Optimizer, tabular_processor: nn.Module) -> None:
+    """Add tabular processor parameters to optimizer if they require gradients."""
+    if tabular_processor is None:
+        return
+    processor_params = [p for p in tabular_processor.parameters() if p.requires_grad]
+    if processor_params:
+        optimizer.add_param_group({"params": processor_params})
+
+
 def _prepare_eval_loader(
     dataset: Dataset,
     batch_size: int,
     *,
-    num_workers: int,
     pin_memory: bool,
     persistent_workers: bool,
 ) -> DataLoader:
@@ -66,9 +75,9 @@ def _prepare_eval_loader(
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_fn_corruption,
-        num_workers=num_workers,
+        num_workers=0,  # Set to 0 to avoid multiprocessing serialization issues
         pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
+        persistent_workers=False,
     )
 
 
@@ -94,12 +103,15 @@ def _build_eval_dataset_from_config(
     max_rows = eval_cfg.get("max_rows")
     dataset_name = eval_cfg.get("dataset_name")
 
-    clean_rows, _, _ = load_csv_dataset(clean_path, dataset_name=dataset_name, max_rows=max_rows)
-    dirty_rows, dirty_texts, dirty_dataset_name = load_csv_dataset(
+    clean_rows, _, _, clean_column_names = load_csv_dataset(clean_path, dataset_name=dataset_name, max_rows=max_rows)
+    dirty_rows, dirty_texts, dirty_dataset_name, dirty_column_names = load_csv_dataset(
         dirty_path,
         dataset_name=dataset_name,
         max_rows=max_rows,
     )
+    
+    # Use column names from dirty data (or clean if dirty doesn't have them)
+    column_names = dirty_column_names or clean_column_names
 
     eval_dataset = CleanDirtyEvaluationDataset(
         clean_rows=clean_rows,
@@ -107,6 +119,7 @@ def _build_eval_dataset_from_config(
         text_descriptions=dirty_texts,
         tabular_processor=tabular_processor,
         text_processor=text_processor,
+        column_names=column_names,
     )
 
     reported_name = dataset_name or dirty_dataset_name
@@ -159,7 +172,6 @@ def _evaluate_corruption_model(
     eval_loader = _prepare_eval_loader(
         dataset,
         batch_size,
-        num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
     )
@@ -169,12 +181,17 @@ def _evaluate_corruption_model(
 
     model.eval()
     with torch.no_grad():
-        for tabular_inputs, text_inputs, labels in eval_loader:
+        for row_samples, text_inputs, labels in eval_loader:
             tabular_device = _resolve_runtime_device(device, device_map, "tabular_encoder")
             text_device = _resolve_runtime_device(device, device_map, "text_encoder")
             label_device = _resolve_runtime_device(device, device_map, "detection_head")
 
-            tabular_inputs = _move_batch_to_device(tabular_inputs, tabular_device)
+            tabular_processor = dataset.tabular_processor.to(tabular_device)
+            tabular_inputs = build_tabular_inputs_from_rows(
+                row_samples,
+                tabular_processor,
+                getattr(dataset, "column_names", None),
+            )
             text_inputs = _move_batch_to_device(text_inputs, text_device)
             labels = labels.to(label_device)
 
@@ -286,7 +303,7 @@ def run_corruption_experiment(
     print("实验：Corruption-based 训练（破坏-重建）")
     print("=" * 80)
 
-    clean_rows, text_descriptions, dataset_name = load_data_from_config(
+    clean_rows, text_descriptions, dataset_name, column_names = load_data_from_config(
         exp_cfg,
         default_seed=seed,
         config_dir=config_dir,
@@ -341,6 +358,7 @@ def run_corruption_experiment(
     print(f"  ✓ 模型参数量: {num_params:,}")
 
     optimizer = build_optimizer(model, exp_cfg.get("optimizer", {}))
+    _attach_processor_params(optimizer, tabular_processor)
 
     train_dataset = CorruptionBasedDataset(
         clean_rows=clean_rows,
@@ -349,6 +367,7 @@ def run_corruption_experiment(
         tabular_processor=tabular_processor,
         text_processor=text_processor,
         cached_text_embeddings=cached_embeddings,
+        column_names=column_names,
     )
     num_workers, pin_memory, persistent_workers = _derive_loader_runtime(exp_cfg)
     dataloader = DataLoader(
@@ -356,9 +375,9 @@ def run_corruption_experiment(
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn_corruption,
-        num_workers=num_workers,
+        num_workers=0,  # Set to 0 to avoid multiprocessing serialization issues
         pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
+        persistent_workers=False,
     )
 
     eval_dataset, eval_dataset_name = _build_eval_dataset_from_config(
@@ -377,8 +396,10 @@ def run_corruption_experiment(
                 model,
                 batch,
                 optimizer,
+                tabular_processor,
                 device,
                 device_map=device_map,
+                column_names=column_names,
             )
             epoch_losses.append(loss)
         avg_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
@@ -441,6 +462,111 @@ def compute_error_mask(
     return error_masks
 
 
+def print_detailed_error_analysis(
+    detailed_predictions: List[Dict],
+    column_names: Optional[List[str]] = None,
+) -> None:
+    """
+    Print detailed error analysis including TP, FP, and FN cases.
+
+    Args:
+        detailed_predictions: List of prediction details with keys:
+            - row_idx: row index
+            - col_idx: column index
+            - col_name: column name
+            - dirty_value: value from dirty data
+            - clean_value: value from clean data
+            - probability: prediction probability
+            - pred: predicted label (0 or 1)
+            - label: true label (0 or 1)
+        column_names: Optional list of column names for display
+    """
+    # Organize cases by type and column
+    tp_cases = {}  # True Positives
+    fp_cases = {}  # False Positives
+    fn_cases = {}  # False Negatives
+
+    for pred_info in detailed_predictions:
+        col_idx = pred_info['col_idx']
+        col_name = pred_info['col_name']
+        dirty_value = pred_info['dirty_value']
+        clean_value = pred_info['clean_value']
+        probability = pred_info['probability']
+        pred = pred_info['pred']
+        label = pred_info['label']
+
+        # Determine case type
+        if pred == 1 and label == 1:  # TP: Predicted error and truly an error
+            if col_name not in tp_cases:
+                tp_cases[col_name] = []
+            tp_cases[col_name].append({
+                'dirty_value': dirty_value,
+                'clean_value': clean_value,
+                'probability': probability,
+            })
+        elif pred == 1 and label == 0:  # FP: Predicted error but actually correct
+            if col_name not in fp_cases:
+                fp_cases[col_name] = []
+            fp_cases[col_name].append({
+                'clean_value': clean_value,
+                'probability': probability,
+            })
+        elif pred == 0 and label == 1:  # FN: Predicted correct but actually an error
+            if col_name not in fn_cases:
+                fn_cases[col_name] = []
+            fn_cases[col_name].append({
+                'dirty_value': dirty_value,
+                'clean_value': clean_value,
+                'probability': probability,
+            })
+
+    # Get all unique column names and sort them
+    all_columns = set()
+    if column_names:
+        all_columns.update(column_names)
+    else:
+        all_columns.update([pred_info['col_name'] for pred_info in detailed_predictions])
+
+    sorted_columns = sorted(all_columns)
+
+    # Print True Positives
+    print("\n=== 详细错误分析 ===")
+    print("\n正确识别的错误 (TP):")
+    has_tp = False
+    for col_name in sorted_columns:
+        if col_name in tp_cases:
+            has_tp = True
+            for case in tp_cases[col_name]:
+                print(f"  {col_name}: {case['dirty_value']} -> {case['clean_value']} "
+                      f"(概率: {case['probability']:.4f})")
+    if not has_tp:
+        print("  无")
+
+    # Print False Positives
+    print("\n误判为错误的正确值 (FP):")
+    has_fp = False
+    for col_name in sorted_columns:
+        if col_name in fp_cases:
+            has_fp = True
+            for case in fp_cases[col_name]:
+                print(f"  {col_name}: {case['clean_value']} (被误判为错误) "
+                      f"(概率: {case['probability']:.4f})")
+    if not has_fp:
+        print("  无")
+
+    # Print False Negatives
+    print("\n漏掉的错误 (FN):")
+    has_fn = False
+    for col_name in sorted_columns:
+        if col_name in fn_cases:
+            has_fn = True
+            for case in fn_cases[col_name]:
+                print(f"  {col_name}: {case['dirty_value']} (应为{case['clean_value']}，但未检测到) "
+                      f"(概率: {case['probability']:.4f})")
+    if not has_fn:
+        print("  无")
+
+
 def evaluate_per_column_model(
     tabular_encoder: nn.Module,
     text_encoder: nn.Module,
@@ -472,10 +598,15 @@ def evaluate_per_column_model(
     # Predict on dirty data using per-column MLPs
     all_predictions = []
     all_labels = []
+    # Collect detailed predictions for error analysis
+    detailed_predictions = []
 
     for row_idx, (dirty_row, text) in enumerate(zip(eval_dataset.dirty_rows, eval_dataset.text_descriptions)):
-        tabular_inputs = eval_dataset.tabular_processor.process(dirty_row, row_idx=0)
-        text_inputs = eval_dataset.text_processor.process(text)
+        with torch.no_grad():
+            tabular_inputs = eval_dataset.tabular_processor.process(
+                dirty_row, row_idx=0, column_names=eval_dataset.column_names
+            )
+            text_inputs = eval_dataset.text_processor.process(text)
 
         # Add batch dimension (filter out non-tensor values like 'raw_text')
         tabular_inputs = {k: v.unsqueeze(0).to(device) for k, v in tabular_inputs.items() if isinstance(v, torch.Tensor)}
@@ -514,6 +645,31 @@ def evaluate_per_column_model(
                 pred = 1 if prob.item() < 0.5 else 0
                 row_preds.append(pred)
 
+                # Collect detailed prediction information for error analysis
+                # Get column name (use provided name or generate default)
+                if eval_dataset.column_names and col_idx < len(eval_dataset.column_names):
+                    col_name = eval_dataset.column_names[col_idx]
+                else:
+                    col_name = f"Column {col_idx}"
+
+                # Get clean and dirty values
+                clean_value = eval_dataset.clean_rows[row_idx][col_idx] if row_idx < len(eval_dataset.clean_rows) else None
+                dirty_value = eval_dataset.dirty_rows[row_idx][col_idx] if row_idx < len(eval_dataset.dirty_rows) else None
+
+                # Get true label
+                true_label = error_masks[row_idx][col_idx] if row_idx < len(error_masks) and col_idx < len(error_masks[row_idx]) else 0
+
+                detailed_predictions.append({
+                    'row_idx': row_idx,
+                    'col_idx': col_idx,
+                    'col_name': col_name,
+                    'dirty_value': dirty_value,
+                    'clean_value': clean_value,
+                    'probability': prob.item(),
+                    'pred': pred,
+                    'label': true_label,
+                })
+
             all_predictions.append(row_preds)
             all_labels.append(error_masks[row_idx])
 
@@ -534,6 +690,9 @@ def evaluate_per_column_model(
 
     print(f"阶段B评估结果 - Error Precision: {precision:.4f}, "
           f"Error Recall: {recall:.4f}, Error F1: {f1:.4f}")
+
+    # Print detailed error analysis
+    print_detailed_error_analysis(detailed_predictions, eval_dataset.column_names)
 
     return {
         "error_precision": precision,
@@ -569,7 +728,7 @@ def run_contrastive_two_stage_experiment(
     print("=" * 80)
 
     # Load data
-    clean_rows, text_descriptions, dataset_name = load_data_from_config(
+    clean_rows, text_descriptions, dataset_name, column_names = load_data_from_config(
         exp_cfg,
         default_seed=seed,
         config_dir=config_dir,
@@ -628,6 +787,7 @@ def run_contrastive_two_stage_experiment(
         tabular_processor=tabular_processor,
         text_processor=text_processor,
         cached_text_embeddings=cached_text_embeddings,
+        column_names=column_names,
     )
 
     batch_size_a = stage_a_cfg.get("batch_size", 16)
@@ -636,9 +796,9 @@ def run_contrastive_two_stage_experiment(
         batch_size=batch_size_a,
         shuffle=True,
         collate_fn=collate_fn_contrastive,
-        num_workers=_resolve_num_workers(exp_cfg),
+        num_workers=0,  # Set to 0 to avoid multiprocessing serialization issues
         pin_memory=bool(exp_cfg.get("pin_memory", True)),
-        persistent_workers=bool(exp_cfg.get("persistent_workers", True)),
+        persistent_workers=False,
     )
     # Build optimizer for Stage A (only encoders)
     # Use nn.Module to wrap encoders for optimizer
@@ -653,10 +813,13 @@ def run_contrastive_two_stage_experiment(
         encoder_wrapper,
         stage_a_cfg.get("optimizer", {"type": "Adam", "params": {"lr": 1e-4}})
     )
+    _attach_processor_params(optimizer_a, tabular_processor)
 
     # Move encoders to device before Stage A training
     tabular_encoder = tabular_encoder.to(runtime_device)
     text_encoder = text_encoder.to(runtime_device)
+    tabular_processor = tabular_processor.to(runtime_device)
+    tabular_processor.train()
 
     # Train Stage A
     num_epochs_a = stage_a_cfg.get("num_epochs", 30)
@@ -671,9 +834,11 @@ def run_contrastive_two_stage_experiment(
                 text_encoder,
                 batch,
                 optimizer_a,
+                tabular_processor,
                 device=device,
                 temperature=temperature,
                 device_map=device_map,
+                column_names=column_names,
             )
             epoch_losses.append(loss)
         avg_loss = np.mean(epoch_losses)
@@ -755,6 +920,8 @@ def run_contrastive_two_stage_experiment(
     text_encoder.eval()
     tabular_encoder.requires_grad_(False)
     text_encoder.requires_grad_(False)
+    tabular_processor.eval()
+    tabular_processor.requires_grad_(False)
 
     batch_size_b = stage_b_cfg.get("batch_size", 32)
     num_epochs_b = stage_b_cfg.get("num_epochs", 20)
@@ -787,24 +954,18 @@ def run_contrastive_two_stage_experiment(
     for batch_start in tqdm(range(0, num_rows, cache_batch_size), ncols=120, desc="缓存编码器输出"):
         batch_end = min(batch_start + cache_batch_size, num_rows)
 
-        # Prepare batch data
-        batch_tabular_inputs = []
+        # Prepare batch data (batched tabular processor)
         batch_text_inputs = []
-        for row_idx in range(batch_start, batch_end):
-            tabular_inputs = tabular_processor.process(clean_rows[row_idx], row_idx=0)
-            text_inputs = text_processor.process(text_descriptions[row_idx])
-            batch_tabular_inputs.append(tabular_inputs)
-            batch_text_inputs.append(text_inputs)
-
-        # Stack to create batch tensors
-        if "cell_embeddings" in batch_tabular_inputs[0]:
-            tabular_batch = {
-                "cell_embeddings": torch.stack([x["cell_embeddings"] for x in batch_tabular_inputs]),
-                "row_indices": torch.stack([x["row_indices"] for x in batch_tabular_inputs]),
-                "col_indices": torch.stack([x["col_indices"] for x in batch_tabular_inputs]),
-            }
-        else:
-            tabular_batch = batch_tabular_inputs[0]
+        batch_rows = [clean_rows[row_idx] for row_idx in range(batch_start, batch_end)]
+        with torch.no_grad():
+            tabular_batch = tabular_processor.process_batch(
+                batch_rows,
+                row_indices=[0] * len(batch_rows),
+                column_names=column_names,
+            )
+            for row_idx in range(batch_start, batch_end):
+                text_inputs = text_processor.process(text_descriptions[row_idx])
+                batch_text_inputs.append(text_inputs)
 
         if "cached_embedding" in batch_text_inputs[0]:
             text_batch = {"cached_embedding": torch.stack([x["cached_embedding"] for x in batch_text_inputs])}
@@ -988,10 +1149,19 @@ def _build_eval_dataset(exp_cfg: Dict[str, Any], config_dir: Path, project_root:
 
                 dirty_rows.append(dirty_row)
 
+            # Generate default column names for mock data
+            if dataset_type == "employee":
+                column_names = ["employee_id", "name", "age", "department", "salary", "city"]
+            elif dataset_type == "sales":
+                column_names = ["order_id", "product", "quantity", "price", "region", "date"]
+            else:
+                column_names = [f"col_{i}" for i in range(len(clean_rows[0]) if clean_rows else 0)]
+            
             return CleanDirtyEvaluationDataset(
                 clean_rows=clean_rows,
                 dirty_rows=dirty_rows,
                 text_descriptions=text_descriptions,
+                column_names=column_names,
             )
         return None
 
@@ -999,16 +1169,19 @@ def _build_eval_dataset(exp_cfg: Dict[str, Any], config_dir: Path, project_root:
         clean_data_path = _resolve_path_like(eval_cfg["clean_data_path"], config_dir, project_root)
         dirty_data_path = _resolve_path_like(eval_cfg["dirty_data_path"], config_dir, project_root)
 
-        clean_rows, clean_text_descriptions, _ = load_csv_dataset(clean_data_path)
-        dirty_rows, dirty_text_descriptions, _ = load_csv_dataset(dirty_data_path)
+        clean_rows, clean_text_descriptions, _, clean_column_names = load_csv_dataset(clean_data_path)
+        dirty_rows, dirty_text_descriptions, _, dirty_column_names = load_csv_dataset(dirty_data_path)
 
         # Use text descriptions from clean data
         text_descriptions = clean_text_descriptions
+        # Use column names from dirty data (or clean if dirty doesn't have them)
+        column_names = dirty_column_names or clean_column_names
 
         return CleanDirtyEvaluationDataset(
             clean_rows=clean_rows,
             dirty_rows=dirty_rows,
             text_descriptions=text_descriptions,
+            column_names=column_names,
         )
     except Exception as e:
         print(f"警告: 无法构建评估数据集: {e}")

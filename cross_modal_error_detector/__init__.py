@@ -53,6 +53,7 @@ from .training import (
     collate_fn_corruption,
     collate_fn_contrastive,
     collate_fn_contrastive_cell_level,
+    build_tabular_inputs_from_rows,
     train_step_corruption,
     compute_embedding_similarity,
     train_step_contrastive_pretrain
@@ -94,6 +95,7 @@ __all__ = [
     'collate_fn_corruption',
     'collate_fn_contrastive',
     'collate_fn_contrastive_cell_level',
+    'build_tabular_inputs_from_rows',
     'train_step_corruption',
     'compute_embedding_similarity',
     'train_step_contrastive_pretrain',

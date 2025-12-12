@@ -25,6 +25,7 @@ class CorruptionBasedDataset(Dataset):
         tabular_processor: Optional[TabularProcessor] = None,
         text_processor: Optional[TextProcessor] = None,
         cached_text_embeddings: Optional[Dict[int, torch.Tensor]] = None,
+        column_names: Optional[List[str]] = None,
     ):
         self.clean_rows = clean_rows
         self.text_descriptions = text_descriptions
@@ -32,6 +33,7 @@ class CorruptionBasedDataset(Dataset):
         self.tabular_processor = tabular_processor or TabularProcessor()
         self.text_processor = text_processor or TextProcessor()
         self.cached_text_embeddings = cached_text_embeddings
+        self.column_names = column_names
 
     def __len__(self) -> int:
         return len(self.clean_rows)
@@ -41,8 +43,13 @@ class CorruptionBasedDataset(Dataset):
         text = self.text_descriptions[idx]
         corrupted_row, labels = self._corrupt_row(clean_row)
         # TODO: 这里corruption最好可以同时考虑text和row
-        tabular_inputs = self.tabular_processor.process(corrupted_row, row_idx=0)
-        
+        row_payload = {
+            "row_data": corrupted_row,
+            "row_idx": 0,
+        }
+        if self.column_names is not None:
+            row_payload["column_names"] = self.column_names
+
         if self.cached_text_embeddings is not None and idx in self.cached_text_embeddings:
             # Use cached embedding if available
             # Wrap in a dict to match expected text_inputs format for model forwarding
@@ -54,7 +61,7 @@ class CorruptionBasedDataset(Dataset):
             text_inputs = self.text_processor.process(text)
             
         labels_tensor = torch.tensor(labels, dtype=torch.float32)
-        return tabular_inputs, text_inputs, labels_tensor
+        return row_payload, text_inputs, labels_tensor
 
     def _corrupt_row(self, clean_row: List[Any]) -> Tuple[List[Any], List[int]]:
         corrupted_row = []
@@ -90,12 +97,14 @@ class ContrastiveDataset(Dataset):
         tabular_processor: Optional[TabularProcessor] = None,
         text_processor: Optional[TextProcessor] = None,
         cached_text_embeddings: Optional[Dict[int, torch.Tensor]] = None,
+        column_names: Optional[List[str]] = None,
     ):
         self.clean_rows = clean_rows
         self.text_descriptions = text_descriptions
         self.tabular_processor = tabular_processor or TabularProcessor()
         self.text_processor = text_processor or TextProcessor()
         self.cached_text_embeddings = cached_text_embeddings
+        self.column_names = column_names
 
     def __len__(self) -> int:
         return len(self.clean_rows)
@@ -103,14 +112,19 @@ class ContrastiveDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[Dict, Dict]:
         clean_row = self.clean_rows[idx]
         text = self.text_descriptions[idx]
-        tabular_inputs = self.tabular_processor.process(clean_row, row_idx=0)
-        
+        row_payload = {
+            "row_data": clean_row,
+            "row_idx": 0,
+        }
+        if self.column_names is not None:
+            row_payload["column_names"] = self.column_names
+
         if self.cached_text_embeddings is not None and idx in self.cached_text_embeddings:
             text_inputs = {"cached_embedding": self.cached_text_embeddings[idx]}
         else:
             text_inputs = self.text_processor.process(text)
             
-        return tabular_inputs, text_inputs
+        return row_payload, text_inputs
 
 
 class CleanDirtyEvaluationDataset(Dataset):
@@ -125,6 +139,7 @@ class CleanDirtyEvaluationDataset(Dataset):
         text_descriptions: List[str],
         tabular_processor: Optional[TabularProcessor] = None,
         text_processor: Optional[TextProcessor] = None,
+        column_names: Optional[List[str]] = None,
     ):
         if len(clean_rows) != len(dirty_rows):
             raise ValueError("clean_rows 与 dirty_rows 的长度不一致，无法对齐监督标签。")
@@ -136,6 +151,7 @@ class CleanDirtyEvaluationDataset(Dataset):
         self.text_descriptions = text_descriptions
         self.tabular_processor = tabular_processor or TabularProcessor()
         self.text_processor = text_processor or TextProcessor()
+        self.column_names = column_names
         self.labels = self._build_labels()
 
     def _build_labels(self) -> List[List[int]]:
@@ -155,10 +171,16 @@ class CleanDirtyEvaluationDataset(Dataset):
         text = self.text_descriptions[idx]
         labels = self.labels[idx]
 
-        tabular_inputs = self.tabular_processor.process(dirty_row, row_idx=idx)
+        row_payload = {
+            "row_data": dirty_row,
+            "row_idx": idx,
+        }
+        if self.column_names is not None:
+            row_payload["column_names"] = self.column_names
+
         text_inputs = self.text_processor.process(text)
         labels_tensor = torch.tensor(labels, dtype=torch.float32)
-        return tabular_inputs, text_inputs, labels_tensor
+        return row_payload, text_inputs, labels_tensor
 
 
 class PerColumnBinaryDataset(Dataset):
@@ -182,6 +204,7 @@ class PerColumnBinaryDataset(Dataset):
         tabular_processor: Optional[TabularProcessor] = None,
         text_processor: Optional[TextProcessor] = None,
         seed: Optional[int] = None,
+        column_names: Optional[List[str]] = None,
     ):
         self.clean_rows = clean_rows
         self.text_descriptions = text_descriptions
@@ -190,6 +213,7 @@ class PerColumnBinaryDataset(Dataset):
         self.negative_strategy = negative_strategy
         self.tabular_processor = tabular_processor or TabularProcessor()
         self.text_processor = text_processor or TextProcessor()
+        self.column_names = column_names
         self.num_cols = len(clean_rows[0]) if clean_rows else 0
 
         if seed is not None:
@@ -250,12 +274,18 @@ class PerColumnBinaryDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[Dict, Dict, torch.Tensor, int]:
         row_data, text, col_idx, label = self.samples[idx]
 
-        tabular_inputs = self.tabular_processor.process(row_data, row_idx=0)
+        row_payload = {
+            "row_data": row_data,
+            "row_idx": 0,
+        }
+        if self.column_names is not None:
+            row_payload["column_names"] = self.column_names
+
         text_inputs = self.text_processor.process(text)
 
         label_tensor = torch.tensor([label], dtype=torch.float32)
         col_idx_tensor = torch.tensor(col_idx, dtype=torch.long)
-        return tabular_inputs, text_inputs, label_tensor, col_idx_tensor
+        return row_payload, text_inputs, label_tensor, col_idx_tensor
 
 
 __all__ = [

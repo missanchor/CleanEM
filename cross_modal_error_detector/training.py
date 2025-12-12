@@ -2,7 +2,7 @@
 Collate utilities and training steps for different strategies.
 """
 
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -11,22 +11,66 @@ from .model import CrossModalErrorDetector
 from .utils.device import resolve_runtime_device
 
 
+def build_tabular_inputs_from_rows(
+    row_samples: Sequence[Any],
+    tabular_processor,
+    default_column_names: Optional[Sequence[str]] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Build a batched tabular_inputs dict from raw row samples.
+
+    This should be called in the main process / training step so that:
+    - autograd graphs stay local to the training process (no multiprocessing serialization)
+    - tabular_processor can live on GPU and be trained
+    """
+    if tabular_processor is None:
+        raise ValueError("tabular_processor must be provided.")
+
+    batch_rows: List[List[Any]] = []
+    batch_row_indices: List[int] = []
+    resolved_column_names: Optional[Sequence[str]] = None
+
+    for sample in row_samples:
+        if isinstance(sample, dict):
+            row_data = sample.get("row_data")
+            row_idx = sample.get("row_idx", 0)
+            column_names = sample.get("column_names", default_column_names)
+        elif isinstance(sample, (list, tuple)):
+            if not sample:
+                raise ValueError("Row sample tuple cannot be empty.")
+            row_data = sample[0]
+            row_idx = sample[1] if len(sample) > 1 else 0
+            column_names = sample[2] if len(sample) > 2 else default_column_names
+        else:
+            raise TypeError(f"Unsupported row sample type: {type(sample)}")
+
+        if row_data is None:
+            raise ValueError("row_data is required to build tabular inputs.")
+
+        if resolved_column_names is None:
+            resolved_column_names = column_names
+        else:
+            # Ensure consistent column_names within a batch
+            if column_names is not None and list(column_names) != list(resolved_column_names):
+                raise ValueError("Inconsistent column_names within the same batch.")
+
+        batch_rows.append(list(row_data))
+        batch_row_indices.append(int(row_idx))
+
+    return tabular_processor.process_batch(
+        batch_rows,
+        row_indices=batch_row_indices,
+        column_names=list(resolved_column_names) if resolved_column_names is not None else None,
+    )
+
+
 def collate_fn_corruption(batch):
     """
     Collate function for corruption-based training.
     """
 
-    tabular_inputs_list, text_inputs_list, labels_list = zip(*batch)
-
-    cell_embeddings = torch.stack([x["cell_embeddings"] for x in tabular_inputs_list])
-    row_indices = torch.stack([x["row_indices"] for x in tabular_inputs_list])
-    col_indices = torch.stack([x["col_indices"] for x in tabular_inputs_list])
-
-    tabular_inputs = {
-        "cell_embeddings": cell_embeddings,
-        "row_indices": row_indices,
-        "col_indices": col_indices,
-    }
+    row_samples, text_inputs_list, labels_list = zip(*batch)
+    row_samples = list(row_samples)
 
     input_ids_list = []
     attention_mask_list = []
@@ -54,7 +98,7 @@ def collate_fn_corruption(batch):
         }
 
     labels = torch.stack(labels_list)
-    return tabular_inputs, text_inputs, labels
+    return row_samples, text_inputs, labels
 
 
 def collate_fn_contrastive(batch):
@@ -62,17 +106,8 @@ def collate_fn_contrastive(batch):
     Collate function for contrastive training.
     """
 
-    tabular_inputs_list, text_inputs_list = zip(*batch)
-
-    cell_embeddings = torch.stack([x["cell_embeddings"] for x in tabular_inputs_list])
-    row_indices = torch.stack([x["row_indices"] for x in tabular_inputs_list])
-    col_indices = torch.stack([x["col_indices"] for x in tabular_inputs_list])
-
-    tabular_inputs = {
-        "cell_embeddings": cell_embeddings,
-        "row_indices": row_indices,
-        "col_indices": col_indices,
-    }
+    row_samples, text_inputs_list = zip(*batch)
+    row_samples = list(row_samples)
 
     input_ids_list = []
     attention_mask_list = []
@@ -99,7 +134,7 @@ def collate_fn_contrastive(batch):
             "attention_mask": attention_mask,
         }
 
-    return tabular_inputs, text_inputs
+    return row_samples, text_inputs
 
 
 def collate_fn_contrastive_cell_level(batch):
@@ -108,17 +143,8 @@ def collate_fn_contrastive_cell_level(batch):
     Expects batch items with 4 values: (tabular_inputs, text_inputs, labels, cell_idx)
     """
 
-    tabular_inputs_list, text_inputs_list, labels_list, cell_indices = zip(*batch)
-
-    cell_embeddings = torch.stack([x["cell_embeddings"] for x in tabular_inputs_list])
-    row_indices = torch.stack([x["row_indices"] for x in tabular_inputs_list])
-    col_indices = torch.stack([x["col_indices"] for x in tabular_inputs_list])
-
-    tabular_inputs = {
-        "cell_embeddings": cell_embeddings,
-        "row_indices": row_indices,
-        "col_indices": col_indices,
-    }
+    row_samples, text_inputs_list, labels_list, cell_indices = zip(*batch)
+    row_samples = list(row_samples)
 
     input_ids_list = []
     attention_mask_list = []
@@ -147,7 +173,7 @@ def collate_fn_contrastive_cell_level(batch):
 
     labels = torch.stack(labels_list)
     cell_indices = torch.stack(cell_indices)
-    return tabular_inputs, text_inputs, labels, cell_indices
+    return row_samples, text_inputs, labels, cell_indices
 
 
 def _resolve_device(default_device: str, device_map: Optional[Dict[str, str]], key: str) -> str:
@@ -168,23 +194,28 @@ def train_step_corruption(
     model: CrossModalErrorDetector,
     batch: Tuple,
     optimizer: torch.optim.Optimizer,
+    tabular_processor,
     device: Optional[str] = None,
     *,
     device_map: Optional[Dict[str, str]] = None,
+    column_names: Optional[Sequence[str]] = None,
 ) -> float:
     """
     Single training step for corruption-based strategy.
     """
 
     model.train()
-    tabular_inputs, text_inputs, labels = batch
+    row_samples, text_inputs, labels = batch
 
     runtime_device = resolve_runtime_device(device)
     tabular_device = _resolve_device(runtime_device, device_map, "tabular_encoder")
     text_device = _resolve_device(runtime_device, device_map, "text_encoder")
     label_device = _resolve_device(runtime_device, device_map, "detection_head")
 
-    tabular_inputs = _move_to_device(tabular_inputs, tabular_device)
+    if tabular_processor is None:
+        raise ValueError("tabular_processor is required for train_step_corruption.")
+    tabular_processor = tabular_processor.to(tabular_device)
+    tabular_inputs = build_tabular_inputs_from_rows(row_samples, tabular_processor, column_names)
     text_inputs = _move_to_device(text_inputs, text_device)
     labels = labels.to(label_device)
 
@@ -302,10 +333,12 @@ def train_step_contrastive_pretrain(
     text_encoder,
     batch: Tuple,
     optimizer: torch.optim.Optimizer,
+    tabular_processor,
     device: Optional[str] = None,
     temperature: float = 0.07,
     *,
     device_map: Optional[Dict[str, str]] = None,
+    column_names: Optional[Sequence[str]] = None,
 ) -> float:
     """
     Single training step for Stage A pretraining using direct embedding similarity.
@@ -324,13 +357,18 @@ def train_step_contrastive_pretrain(
     tabular_encoder.train()
     text_encoder.eval()
 
-    tabular_inputs, text_inputs = batch
-    batch_size = tabular_inputs["cell_embeddings"].shape[0]
+    row_samples, text_inputs = batch
 
     # Move encoders to their respective devices
     tabular_encoder = tabular_encoder.to(default_device)
     if "cached_embedding" not in text_inputs:
         text_encoder = text_encoder.to(text_encoder_device)
+
+    if tabular_processor is None:
+        raise ValueError("tabular_processor is required for train_step_contrastive_pretrain.")
+    tabular_processor = tabular_processor.to(default_device)
+    tabular_inputs = build_tabular_inputs_from_rows(row_samples, tabular_processor, column_names)
+    batch_size = tabular_inputs["cell_embeddings"].shape[0]
 
     # Move inputs to their respective devices
     tabular_inputs = {k: v.to(default_device) for k, v in tabular_inputs.items()}
@@ -399,6 +437,7 @@ __all__ = [
     "collate_fn_corruption",
     "collate_fn_contrastive",
     "collate_fn_contrastive_cell_level",
+    "build_tabular_inputs_from_rows",
     "train_step_corruption",
     "compute_embedding_similarity",
     "train_step_contrastive_pretrain",
