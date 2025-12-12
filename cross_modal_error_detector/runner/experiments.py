@@ -13,16 +13,14 @@ from tqdm import tqdm
 
 from ..datasets import (
     CleanDirtyEvaluationDataset,
-    PerColumnBinaryDataset,
     ContrastiveDataset,
     CorruptionBasedDataset,
 )
+from ..fusion import CrossAttentionFusion, SimpleConcatFusion, SingleColumnFusion
 from ..model import CrossModalErrorDetector
 from ..training import (
     collate_fn_contrastive,
-    collate_fn_contrastive_cell_level,
     collate_fn_corruption,
-    compute_embedding_similarity,
     train_step_contrastive_pretrain,
     train_step_corruption,
 )
@@ -227,156 +225,6 @@ def _evaluate_threshold_with_scores(
     metrics = _compute_classification_metrics(preds_dirty, targets)
     metrics["threshold"] = threshold
     return metrics
-
-
-def _search_best_score_threshold(scores: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
-    """
-    Find the threshold on raw logits that maximizes F1 for detecting dirty pairs.
-    """
-
-    if scores.numel() == 0:
-        return {
-            "threshold": 0.0,
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1": 0.0,
-            "accuracy": 0.0,
-            "dirty_accuracy": 0.0,
-            "clean_accuracy": 0.0,
-            "overall_accuracy": 0.0,
-            "tp": 0,
-            "tn": 0,
-            "fp": 0,
-            "fn": 0,
-        }
-
-    sorted_scores = torch.sort(torch.unique(scores)).values
-    if sorted_scores.numel() == 1:
-        candidates = [
-            float(sorted_scores.item() - 1e-6),
-            float(sorted_scores.item() + 1e-6),
-        ]
-    else:
-        midpoints = (sorted_scores[:-1] + sorted_scores[1:]) / 2
-        candidates = [float(sorted_scores[0] - 1e-6)]
-        candidates += [float(x) for x in midpoints]
-        candidates.append(float(sorted_scores[-1] + 1e-6))
-
-    best_metrics = None
-    best_f1 = -1.0
-    for threshold in candidates:
-        metrics = _evaluate_threshold_with_scores(scores, targets, threshold)
-        if (
-            metrics["f1"] > best_f1
-            or (
-                metrics["f1"] == best_f1
-                and metrics["precision"] > (best_metrics or {}).get("precision", -1.0)
-            )
-        ):
-            best_metrics = metrics
-            best_f1 = metrics["f1"]
-
-    return best_metrics or _evaluate_threshold_with_scores(scores, targets, 0.0)
-
-
-def _evaluate_pairwise_detection(
-    model: CrossModalErrorDetector,
-    dataset: Dataset,
-    *,
-    batch_size: int,
-    num_workers: int,
-    pin_memory: bool,
-    persistent_workers: bool,
-    device: str,
-    device_map: Optional[Dict[str, str]],
-    default_threshold: Optional[float] = None,
-) -> Dict[str, float]:
-    """
-    Evaluate pair-level matching accuracy by turning contrastive scores into binary predictions.
-    """
-
-    eval_loader = _prepare_eval_loader(
-        dataset,
-        batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-    )
-
-    score_list: List[torch.Tensor] = []
-    target_list: List[torch.Tensor] = []
-
-    model.eval()
-    with torch.no_grad():
-        for tabular_inputs, text_inputs, labels in eval_loader:
-            tabular_device = _resolve_runtime_device(device, device_map, "tabular_encoder")
-            text_device = _resolve_runtime_device(device, device_map, "text_encoder")
-            head_device = _resolve_runtime_device(device, device_map, "detection_head")
-
-            tabular_inputs = _move_batch_to_device(tabular_inputs, tabular_device)
-            text_inputs = _move_batch_to_device(text_inputs, text_device)
-            labels = labels.to(head_device)
-
-            logits = model(tabular_inputs, text_inputs).squeeze(-1)
-            score_list.append(logits.flatten().detach().cpu())
-            target_list.append((labels.flatten() > 0.5).int().cpu())
-
-    if not score_list:
-        return {
-            "pair_precision": 0.0,
-            "pair_recall": 0.0,
-            "pair_f1": 0.0,
-            "pair_accuracy": 0.0,
-            "pair_dirty_accuracy": 0.0,
-            "pair_clean_accuracy": 0.0,
-            "pair_overall_accuracy": 0.0,
-            "pair_best_threshold": 0.0,
-            "pair_default_threshold": default_threshold or 0.0,
-            "pair_precision_default": 0.0,
-            "pair_recall_default": 0.0,
-            "pair_f1_default": 0.0,
-            "pair_dirty_support": 0,
-            "pair_clean_support": 0,
-            "pair_total_support": 0,
-            "pair_clean_score_mean": 0.0,
-            "pair_dirty_score_mean": 0.0,
-        }
-
-    scores = torch.cat(score_list)
-    targets = torch.cat(target_list)
-
-    best_metrics = _search_best_score_threshold(scores, targets)
-    default_threshold = 0.0 if default_threshold is None else default_threshold
-    default_metrics = _evaluate_threshold_with_scores(scores, targets, default_threshold)
-
-    clean_mask = targets == 0
-    dirty_mask = targets == 1
-    clean_scores_mean = float(scores[clean_mask].mean().item()) if clean_mask.any() else 0.0
-    dirty_scores_mean = float(scores[dirty_mask].mean().item()) if dirty_mask.any() else 0.0
-
-    metrics = {
-        "pair_precision": best_metrics["precision"],
-        "pair_recall": best_metrics["recall"],
-        "pair_f1": best_metrics["f1"],
-        "pair_accuracy": best_metrics["accuracy"],
-        "pair_dirty_accuracy": best_metrics["dirty_accuracy"],
-        "pair_clean_accuracy": best_metrics["clean_accuracy"],
-        "pair_overall_accuracy": best_metrics["overall_accuracy"],
-        "pair_best_threshold": best_metrics["threshold"],
-        "pair_default_threshold": default_threshold,
-        "pair_precision_default": default_metrics["precision"],
-        "pair_recall_default": default_metrics["recall"],
-        "pair_f1_default": default_metrics["f1"],
-        "pair_dirty_support": int(targets.sum().item()),
-        "pair_clean_support": int((targets == 0).sum().item()),
-        "pair_total_support": int(targets.numel()),
-        "pair_clean_score_mean": clean_scores_mean,
-        "pair_dirty_score_mean": dirty_scores_mean,
-    }
-    return metrics
-
-
-from tqdm import tqdm
 
 
 def _precompute_text_embeddings(
@@ -593,182 +441,6 @@ def compute_error_mask(
     return error_masks
 
 
-def _search_best_score_threshold(scores: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
-    """
-    Find the threshold on raw logits that maximizes F1 for detecting dirty pairs.
-    """
-
-    if scores.numel() == 0:
-        return {
-            "threshold": 0.0,
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1": 0.0,
-            "accuracy": 0.0,
-            "dirty_accuracy": 0.0,
-            "clean_accuracy": 0.0,
-            "overall_accuracy": 0.0,
-            "tp": 0,
-            "tn": 0,
-            "fp": 0,
-            "fn": 0,
-        }
-
-    sorted_scores = torch.sort(torch.unique(scores)).values
-    if sorted_scores.numel() == 1:
-        candidates = [
-            float(sorted_scores.item() - 1e-6),
-            float(sorted_scores.item() + 1e-6),
-        ]
-    else:
-        midpoints = (sorted_scores[:-1] + sorted_scores[1:]) / 2
-        candidates = [float(sorted_scores[0] - 1e-6)]
-        candidates += [float(x) for x in midpoints]
-        candidates.append(float(sorted_scores[-1] + 1e-6))
-
-    best_metrics = None
-    best_f1 = -1.0
-    for threshold in candidates:
-        metrics = _evaluate_threshold_with_scores(scores, targets, threshold)
-        if (
-            metrics["f1"] > best_f1
-            or (
-                metrics["f1"] == best_f1
-                and metrics["precision"] > (best_metrics or {}).get("precision", -1.0)
-            )
-        ):
-            best_metrics = metrics
-            best_f1 = metrics["f1"]
-
-    return best_metrics or _evaluate_threshold_with_scores(scores, targets, 0.0)
-
-
-def evaluate_pretrain_stage_and_search_threshold(
-    tabular_encoder,
-    text_encoder,
-    eval_dataset: CleanDirtyEvaluationDataset,
-    device: str,
-    device_map: Optional[Dict[str, str]],
-) -> float:
-    """
-    Stage A evaluation: Compute embedding similarity and search for best threshold.
-
-    This evaluates how well the pretrained encoders can distinguish between
-    matching and non-matching tabular-text pairs by computing cosine similarity
-    and finding the optimal threshold.
-
-    Returns:
-        best_threshold: The similarity threshold that maximizes F1 score
-    """
-    all_scores = []
-    all_labels = []
-
-    for clean_row, dirty_row, text in zip(
-        eval_dataset.clean_rows,
-        eval_dataset.dirty_rows,
-        eval_dataset.text_descriptions
-    ):
-        # Process clean row (positive sample)
-        clean_tabular = eval_dataset.tabular_processor.process(clean_row, row_idx=0)
-        clean_text = eval_dataset.text_processor.process(text)
-        clean_score = compute_embedding_similarity(
-            tabular_encoder, text_encoder, clean_tabular, clean_text,
-            device=device, device_map=device_map
-        ).item()
-        all_scores.append(clean_score)
-        all_labels.append(1)  # clean matches text (positive)
-
-        # Process dirty row (negative sample)
-        dirty_tabular = eval_dataset.tabular_processor.process(dirty_row, row_idx=0)
-        dirty_score = compute_embedding_similarity(
-            tabular_encoder, text_encoder, dirty_tabular, clean_text,
-            device=device, device_map=device_map
-        ).item()
-        all_scores.append(dirty_score)
-        all_labels.append(0)  # dirty doesn't match text (negative)
-
-    # Search for best threshold
-    scores_tensor = torch.tensor(all_scores)
-    labels_tensor = torch.tensor(all_labels)
-    best_threshold = _search_best_score_threshold(scores_tensor, labels_tensor)["threshold"]
-
-    return best_threshold
-
-
-def evaluate_two_stage_model(
-    model: CrossModalErrorDetector,
-    eval_dataset: CleanDirtyEvaluationDataset,
-    device: str,
-    device_map: Optional[Dict[str, str]],
-) -> Dict[str, float]:
-    """
-    Stage B evaluation: Compute precision/recall/f1 for error detection.
-
-    This evaluates how well the trained model detects errors in dirty data.
-    Only considers cells that were actually erroneous (as determined by error mask).
-    """
-    # Compute error mask
-    error_masks = compute_error_mask(
-        eval_dataset.clean_rows,
-        eval_dataset.dirty_rows
-    )
-
-    # Predict on dirty data using binary classification
-    predictions = []
-    for dirty_row, text in zip(eval_dataset.dirty_rows, eval_dataset.text_descriptions):
-        tabular_inputs = eval_dataset.tabular_processor.process(dirty_row, row_idx=0)
-        text_inputs = eval_dataset.text_processor.process(text)
-
-        # Add batch dimension for single-row evaluation
-        tabular_inputs = {k: v.unsqueeze(0) for k, v in tabular_inputs.items()}
-        text_inputs = {k: v.unsqueeze(0) for k, v in text_inputs.items()}
-
-        with torch.no_grad():
-            logits = model(tabular_inputs, text_inputs)  # [1, seq_len, 1]
-            # Apply sigmoid to get probabilities
-            probs = torch.sigmoid(logits)  # [1, seq_len, 1]
-            # Model predicts match probability - lower score means more likely to be an error
-            # So we predict error if prob < 0.5 (i.e., mismatch)
-            pred = (probs < 0.5).int().squeeze(0).squeeze(-1).cpu().numpy()  # [seq_len]
-            predictions.append(pred)
-
-    # Compute metrics only on erroneous cells
-    error_precisions, error_recalls, error_f1s = [], [], []
-
-    for pred_row, error_mask in zip(predictions, error_masks):
-        # Find positions with errors
-        error_positions = [i for i, is_error in enumerate(error_mask) if is_error == 1]
-
-        if not error_positions:
-            continue
-
-        # Extract predictions and true labels for error positions
-        pred_errors = pred_row[error_positions]
-        true_errors = [1] * len(error_positions)
-
-        # Compute metrics for this row
-        metrics = _compute_classification_metrics(
-            torch.tensor(pred_errors),
-            torch.tensor(true_errors)
-        )
-
-        error_precisions.append(metrics["precision"])
-        error_recalls.append(metrics["recall"])
-        error_f1s.append(metrics["f1"])
-
-    # Compute average metrics
-    avg_precision = np.mean(error_precisions) if error_precisions else 0.0
-    avg_recall = np.mean(error_recalls) if error_recalls else 0.0
-    avg_f1 = np.mean(error_f1s) if error_f1s else 0.0
-
-    return {
-        "error_precision": avg_precision,
-        "error_recall": avg_recall,
-        "error_f1": avg_f1,
-        "num_error_rows": len([m for m in error_masks if sum(m) > 0]),
-    }
-
-
 def evaluate_per_column_model(
     tabular_encoder: nn.Module,
     text_encoder: nn.Module,
@@ -812,12 +484,30 @@ def evaluate_per_column_model(
         with torch.no_grad():
             H_table = tabular_encoder(tabular_inputs)
             H_text = text_encoder(text_inputs)
-            H_fused = fusion_module(H_table, H_text)
 
             # Get predictions from each column's MLP
             row_preds = []
-            for col_idx in range(min(num_cols, H_fused.size(1))):
-                col_embedding = H_fused[:, col_idx, :].unsqueeze(1)
+
+            for col_idx in range(num_cols):
+                # Check if using per-column fusion (ModuleList) or optimized single-column fusion
+                if isinstance(fusion_module, nn.ModuleList):
+                    # Per-column fusion: use dedicated fusion module for each column
+                    col_tabular_embed = H_table[:, col_idx:col_idx+1, :]  # [batch, 1, d_model]
+                    H_fused = fusion_module[col_idx](col_tabular_embed, H_text)  # [batch, 1, d_model]
+                    col_embedding = H_fused.squeeze(1)  # [batch, d_model]
+                elif isinstance(fusion_module, SingleColumnFusion):
+                    # Optimized: only compute fusion for the current column
+                    col_tabular_embed = H_table[:, col_idx:col_idx+1, :]  # [batch, 1, d_model]
+                    H_fused = fusion_module(col_tabular_embed, H_text)  # [batch, 1, d_model]
+                    col_embedding = H_fused.squeeze(1)  # [batch, d_model]
+                else:
+                    # Original: compute fusion for all columns once, then extract
+                    if col_idx == 0:
+                        # Compute fusion for all columns (only once)
+                        H_fused_all = fusion_module(H_table, H_text)
+                    col_embedding = H_fused_all[:, col_idx, :]
+
+                col_embedding = col_embedding.unsqueeze(1)
                 logits = column_mlps[col_idx](col_embedding)
                 prob = torch.sigmoid(logits.squeeze())
                 # Predict error if match probability < 0.5
@@ -919,17 +609,12 @@ def run_contrastive_two_stage_experiment(
     is_frozen = text_encoder_params.get("freeze_pretrained", True) or text_encoder_params.get("freeze_base_model", True)
 
     if is_frozen and hasattr(text_encoder, "forward"):
-        # 解析缓存设备
-        cache_device = device
-        if device_map and "text_encoder" in device_map:
-            cache_device = resolve_runtime_device(device_map["text_encoder"], fallback_device=device)
-
-        # 预计算并缓存文本embeddings
+       # 预计算并缓存文本embeddings
         cached_text_embeddings = _precompute_text_embeddings(
             text_encoder,
             text_descriptions,
             text_processor,
-            device=cache_device,
+            device=runtime_device,
             batch_size=stage_a_cfg.get("batch_size", 16),
         )
         print(f"✓ Stage A已启用文本embedding缓存，共缓存 {len(cached_text_embeddings)} 条")
@@ -995,7 +680,7 @@ def run_contrastive_two_stage_experiment(
         pretrain_losses.append(avg_loss)
         print(f"    Epoch {epoch+1}/{num_epochs_a}, Loss: {avg_loss:.4f}")
 
-    # Load eval dataset for Stage A threshold search
+    # Load eval dataset for Stage A
     eval_dataset = _build_eval_dataset(exp_cfg, config_dir, project_root)
     if eval_dataset is not None:
         # Use the same processors as training to ensure dimension consistency
@@ -1007,13 +692,52 @@ def run_contrastive_two_stage_experiment(
     # Get number of columns
     num_cols = len(clean_rows[0]) if clean_rows else 0
 
-    # Build shared fusion module
-    fusion_module = build_component(
-        stage_b_cfg["fusion_module"],
-        FUSION_REGISTRY,
-        config_dir,
-        project_root,
-    )
+    # Build fusion module (check if per-column fusion or single-column optimization is enabled)
+    fusion_cfg = stage_b_cfg["fusion_module"]
+    use_per_column_fusion = fusion_cfg.get("params", {}).pop("per_column", False)
+    use_single_column_fusion = fusion_cfg.get("params", {}).pop("single_column", False)
+
+    if use_per_column_fusion:
+        # Per-column fusion: create separate fusion module for each column (like per-column MLPs)
+        fusion_type = fusion_cfg["type"]
+        fusion_params = fusion_cfg.get("params", {})
+        d_model = fusion_params.get("d_model", 32)
+
+        # Create ModuleList of fusion modules, one for each column
+        fusion_modules = nn.ModuleList()
+        for _ in range(num_cols):
+            if fusion_type == "CrossAttentionFusion":
+                module = CrossAttentionFusion(
+                    d_model=d_model,
+                    **{k: v for k, v in fusion_params.items() if k != "d_model"}
+                )
+            elif fusion_type == "SimpleConcatFusion":
+                module = SimpleConcatFusion(d_model=d_model)
+            else:
+                raise ValueError(f"Unknown fusion type: {fusion_type}")
+            fusion_modules.append(module)
+
+        fusion_module = fusion_modules
+        print(f"✓ 启用per-column fusion，为{num_cols}列创建独立的fusion模块")
+    elif use_single_column_fusion:
+        # Single-column fusion: optimized for processing only one column at a time
+        fusion_type = fusion_cfg["type"]
+        fusion_params = fusion_cfg.get("params", {})
+        fusion_module = SingleColumnFusion(
+            fusion_type=fusion_type,
+            d_model=fusion_params.get("d_model", 32),
+            **{k: v for k, v in fusion_params.items() if k != "d_model"}
+        )
+        print("✓ 启用single-column fusion优化（仅计算当前需要的列）")
+    else:
+        # Shared fusion module
+        fusion_module = build_component(
+            fusion_cfg,
+            FUSION_REGISTRY,
+            config_dir,
+            project_root,
+        )
+        print("✓ 使用shared fusion module")
 
     # Create per-column MLP detection heads
     detection_head_cfg = stage_b_cfg["detection_head"]
@@ -1029,29 +753,34 @@ def run_contrastive_two_stage_experiment(
     # Freeze encoders
     tabular_encoder.eval()
     text_encoder.eval()
-    for param in tabular_encoder.parameters():
-        param.requires_grad = False
-    for param in text_encoder.parameters():
-        param.requires_grad = False
+    tabular_encoder.requires_grad_(False)
+    text_encoder.requires_grad_(False)
 
     batch_size_b = stage_b_cfg.get("batch_size", 32)
     num_epochs_b = stage_b_cfg.get("num_epochs", 20)
     binary_losses = []
 
     # Build optimizer for all column MLPs and fusion
-    optimizer_b = build_optimizer(
-        nn.Sequential(fusion_module, column_mlps),
-        stage_b_cfg.get("optimizer", {"type": "Adam", "params": {"lr": 1e-3}})
-    )
+    if isinstance(fusion_module, nn.ModuleList):
+        # Per-column fusion: fusion_module is a ModuleList
+        optimizer_b = build_optimizer(
+            nn.Sequential(fusion_module, column_mlps),
+            stage_b_cfg.get("optimizer", {"type": "Adam", "params": {"lr": 1e-3}})
+        )
+    else:
+        # Shared fusion or single-column fusion
+        optimizer_b = build_optimizer(
+            nn.Sequential(fusion_module, column_mlps),
+            stage_b_cfg.get("optimizer", {"type": "Adam", "params": {"lr": 1e-3}})
+        )
 
     # ============ 简化的缓存策略 ============
     # 分别缓存每行的 row embedding 和 text embedding
-    # 总缓存量: 2N (N = num_rows)，而不是 N × M × (1 + neg_ratio)
+    # 总缓存量: 2N (N = num_rows)
     print("\n预计算并缓存编码器输出...")
 
     num_rows = len(clean_rows)
     cached_row_embeddings = {}  # row_idx -> [seq_len, d_model]
-    cached_text_embeddings = {}  # row_idx -> [seq_len, d_model] or [d_model]
 
     # Process rows in batches
     cache_batch_size = 64
@@ -1091,17 +820,25 @@ def run_contrastive_two_stage_experiment(
 
         with torch.no_grad():
             H_table = tabular_encoder(tabular_batch)  # [batch, seq_len, d_model]
-            if "cached_embedding" in text_batch:
-                H_text = text_batch["cached_embedding"]
-            else:
-                H_text = text_encoder(text_batch)  # [batch, text_seq_len, d_model]
+            # 只有在没有复用Stage A缓存时才计算text embedding
+            compute_text = (len(cached_text_embeddings) == 0)
+            if compute_text:
+                if "cached_embedding" in text_batch:
+                    H_text = text_batch["cached_embedding"]
+                else:
+                    H_text = text_encoder(text_batch)  # [batch, text_seq_len, d_model]
 
         # Cache embeddings by row index
         for i, row_idx in enumerate(range(batch_start, batch_end)):
             cached_row_embeddings[row_idx] = H_table[i].cpu()  # [seq_len, d_model]
-            cached_text_embeddings[row_idx] = H_text[i].cpu()  # [text_seq_len, d_model]
+            # 只有在没有缓存时才存储text embedding
+            if compute_text:
+                cached_text_embeddings[row_idx] = H_text[i].cpu()  # [text_seq_len, d_model]
 
-    print(f"缓存完成！共缓存 {num_rows} 行的 row/text embeddings")
+    if len(cached_text_embeddings) > 0:
+        print(f"✓ 缓存完成！共缓存 {num_rows} 行的 row embeddings + {len(cached_text_embeddings)} 条text embeddings（复用Stage A）")
+    else:
+        print(f"✓ 缓存完成！共缓存 {num_rows} 行的 row/text embeddings")
 
     # ============ 重建 Dataset 使用缓存 ============
     # 构建样本列表：(row_idx, text_idx, col_idx, label)
@@ -1126,7 +863,7 @@ def run_contrastive_two_stage_experiment(
     for epoch in range(num_epochs_b):
         epoch_losses = []
 
-        for col_idx in range(num_cols):
+        for col_idx in tqdm(range(num_cols), ncols=120, desc=f"{epoch+1}/{num_epochs_b} Col {col_idx+1}/{num_cols}"):
             # Get samples for this column from new structure
             col_samples = samples_by_column[col_idx]
             if not col_samples:
@@ -1136,7 +873,7 @@ def run_contrastive_two_stage_experiment(
             random.shuffle(col_samples)
 
             # Simple batching using cached embeddings
-            for batch_start in tqdm(range(0, len(col_samples), batch_size_b), ncols=100, desc=f"Epoch {epoch+1}/{num_epochs_b} Col {col_idx+1}/{num_cols}"):
+            for batch_start in range(0, len(col_samples), batch_size_b):
                 batch_end = min(batch_start + batch_size_b, len(col_samples))
                 batch_samples = col_samples[batch_start:batch_end]
 
@@ -1161,10 +898,22 @@ def run_contrastive_two_stage_experiment(
                 batch_labels = batch_labels.to(runtime_device)
 
                 # Forward pass through fusion module (only this needs training)
-                H_fused = fusion_module(batch_tabular_embeds, batch_text_embeds)  # [batch, seq_len, d_model]
+                # Check if using per-column fusion (ModuleList) or optimized single-column fusion
+                if isinstance(fusion_module, nn.ModuleList):
+                    # Per-column fusion: use dedicated fusion module for this column
+                    col_tabular_embed = batch_tabular_embeds[:, col_idx:col_idx+1, :]  # [batch, 1, d_model]
+                    H_fused = fusion_module[col_idx](col_tabular_embed, batch_text_embeds)  # [batch, 1, d_model]
+                    col_embedding = H_fused.squeeze(1)  # [batch, d_model]
+                elif isinstance(fusion_module, SingleColumnFusion):
+                    # Optimized: only compute fusion for the column we need
+                    col_tabular_embed = batch_tabular_embeds[:, col_idx:col_idx+1, :]  # [batch, 1, d_model]
+                    H_fused = fusion_module(col_tabular_embed, batch_text_embeds)  # [batch, 1, d_model]
+                    col_embedding = H_fused.squeeze(1)  # [batch, d_model]
+                else:
+                    # Original: compute fusion for all columns, then extract the one we need
+                    H_fused = fusion_module(batch_tabular_embeds, batch_text_embeds)  # [batch, num_cols, d_model]
+                    col_embedding = H_fused[:, col_idx, :]  # [batch, d_model]
 
-                # Extract fused embedding for this column and pass through column MLP
-                col_embedding = H_fused[:, col_idx, :]  # [batch, d_model]
                 col_embedding = col_embedding.unsqueeze(1)  # [batch, 1, d_model]
                 logits = column_mlps[col_idx](col_embedding)  # [batch, 1, 1]
                 logits = logits.squeeze(-1).squeeze(-1)  # [batch]

@@ -9,13 +9,10 @@ Cross-Modal Error Detector - Main Runner
 4. 消融实验（ablation study）
 
 使用方式：
-    python main_cross_modal_detector.py --config configs/hospital_corruption_experiment.json
-    python main_cross_modal_detector.py --config configs/hospital_contrastive_experiment.json
-    python main_cross_modal_detector.py --config configs/hospital_two_stage_experiment.json
-    python main_cross_modal_detector.py --config configs/hospital_ablation_experiment.json
+    python main_cross_modal_detector.py --config configs/[dataset]_[xxx]_experiment.json
 
 Mock 实验：
-    python main_cross_modal_detector.py --config configs/mock_corruption_experiment.json
+    python main_cross_modal_detector.py --config configs/mock_[xxx]_experiment.json
 """
 
 from __future__ import annotations
@@ -150,7 +147,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/hospital_two_stage_experiment.json"),
+        default=Path("configs/beers_two_stage_experiment.json"),
         help="配置文件路径（每个配置对应一个实验）",
     )
     args = parser.parse_args()

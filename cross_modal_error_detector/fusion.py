@@ -59,6 +59,82 @@ class SimpleConcatFusion(BaseFusion):
         return H_fuse
 
 
-__all__ = ["CrossAttentionFusion", "SimpleConcatFusion"]
+class SingleColumnFusion(BaseFusion):
+    """
+    Optimized fusion module that processes only a single column at a time.
+    This avoids computing fusion for all columns when only one column is needed.
+
+    Args:
+        fusion_type: Type of fusion to use ('CrossAttentionFusion' or 'SimpleConcatFusion')
+        d_model: Hidden dimension size
+        **kwargs: Additional parameters for the fusion module
+    """
+
+    def __init__(self, fusion_type: str, d_model: int, **kwargs):
+        super().__init__()
+        if fusion_type == "CrossAttentionFusion":
+            self.fusion_module = CrossAttentionFusion(d_model=d_model, **kwargs)
+        elif fusion_type == "SimpleConcatFusion":
+            self.fusion_module = SimpleConcatFusion(d_model=d_model)
+        else:
+            raise ValueError(f"Unknown fusion type: {fusion_type}")
+
+    def forward(self, H_table: torch.Tensor, H_text: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for a single column.
+
+        Args:
+            H_table: [batch, 1, d_model] - single column embedding
+            H_text: [batch, seq_len, d_model] - text embeddings
+
+        Returns:
+            H_fused: [batch, 1, d_model] - fused single column embedding
+        """
+        # Ensure H_table has shape [batch, 1, d_model]
+        if H_table.dim() == 2:
+            H_table = H_table.unsqueeze(1)  # [batch, d_model] -> [batch, 1, d_model]
+        elif H_table.shape[1] != 1:
+            raise ValueError(f"SingleColumnFusion expects H_table with 1 column, got shape {H_table.shape}")
+
+        # Forward pass through the underlying fusion module
+        H_fused = self.fusion_module(H_table, H_text)  # [batch, 1, d_model]
+        return H_fused
+
+
+class PerColumnFusionWrapper(BaseFusion):
+    """
+    Wrapper that creates separate fusion modules for each column.
+    Each column gets its own fusion module, similar to per-column MLPs.
+    """
+
+    def __init__(self, fusion_type: str, d_model: int, num_cols: int, **kwargs):
+        super().__init__()
+        # 创建num_cols个独立的fusion模块
+        self.fusion_modules = nn.ModuleList()
+
+        for _ in range(num_cols):
+            if fusion_type == "CrossAttentionFusion":
+                module = CrossAttentionFusion(d_model=d_model, **kwargs)
+            elif fusion_type == "SimpleConcatFusion":
+                module = SimpleConcatFusion(d_model=d_model)
+            else:
+                raise ValueError(f"Unknown fusion type: {fusion_type}")
+            self.fusion_modules.append(module)
+
+    def forward(self, H_table: torch.Tensor, H_text: torch.Tensor) -> torch.Tensor:
+        batch_size, num_cols, d_model = H_table.shape
+
+        # 为每列应用对应的fusion模块
+        fused_embeddings = []
+        for col_idx in range(num_cols):
+            col_embedding = H_table[:, col_idx, :].unsqueeze(1)  # [batch, 1, d_model]
+            fused = self.fusion_modules[col_idx](col_embedding, H_text)  # [batch, 1, d_model]
+            fused_embeddings.append(fused.squeeze(1))  # [batch, d_model]
+
+        # 重新堆叠为 [batch, num_cols, d_model]
+        return torch.stack(fused_embeddings, dim=1)
+
+
+__all__ = ["CrossAttentionFusion", "SimpleConcatFusion", "PerColumnFusionWrapper", "SingleColumnFusion"]
 
 

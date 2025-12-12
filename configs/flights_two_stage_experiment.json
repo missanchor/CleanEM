@@ -4,8 +4,8 @@
     "default": "cuda:0"
   },
   "seed": 42,
-  "dataset": "hospital_error-01",
-  "data_path": "data/hospital_error-01.csv",
+  "dataset": "flights_error-01",
+  "data_path": "data/flights_error-01.csv",
   "stage_a": {
     "num_epochs": 200,
     "batch_size": 32,
@@ -48,7 +48,8 @@
       "params": {
         "d_model": 32,
         "nhead": 2,
-        "dropout": 0.1
+        "dropout": 0.1,
+        "per_column": true
       }
     },
     "detection_head": {
@@ -75,8 +76,8 @@
     }
   },
   "evaluation": {
-    "dataset_name": "hospital_error_eval",
-    "clean_data_path": "data/hospital_clean.csv",
-    "dirty_data_path": "data/hospital_error-01.csv"
+    "dataset_name": "flights_error_eval",
+    "clean_data_path": "data/flights_clean.csv",
+    "dirty_data_path": "data/flights_error-01.csv"
   }
 }
