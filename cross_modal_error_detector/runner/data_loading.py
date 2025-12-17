@@ -136,7 +136,7 @@ def load_csv_dataset(
             raise ValueError(f"无法从 {data_path} 读取列名。")
 
         column_names = list(reader.fieldnames)
-        clean_rows: List[List[Any]] = []
+        dirty_rows: List[List[Any]] = []
         text_descriptions: List[str] = []
         resolved_name = dataset_name or data_path.stem
 
@@ -145,13 +145,13 @@ def load_csv_dataset(
                 break
             ordered_values = [row_dict.get(column, "") for column in column_names]
             parsed_row = [_parse_cell_value(value) for value in ordered_values]
-            clean_rows.append(parsed_row)
+            dirty_rows.append(parsed_row)
             text_descriptions.append(_row_dict_to_text(row_dict, idx, resolved_name))
 
-    if not clean_rows:
+    if not dirty_rows:
         raise ValueError(f"{data_path} 不包含任何可用数据。")
 
-    return clean_rows, text_descriptions, resolved_name, column_names
+    return dirty_rows, text_descriptions, resolved_name, column_names
 
 
 def load_data_from_config(
@@ -166,10 +166,10 @@ def load_data_from_config(
         data_path = Path(_resolve_path_like(data_path_value, config_dir, project_root))
         dataset_name = exp_cfg.get("dataset") or exp_cfg.get("dataset_name")
         max_rows = exp_cfg.get("max_rows")
-        clean_rows, text_descriptions, dataset_name, column_names = load_csv_dataset(
+        dirty_rows, text_descriptions, dataset_name, column_names = load_csv_dataset(
             data_path, dataset_name=dataset_name, max_rows=max_rows
         )
-        return clean_rows, text_descriptions, dataset_name, column_names
+        return dirty_rows, text_descriptions, dataset_name, column_names
 
     mock_cfg = exp_cfg.get("mock_data")
     if mock_cfg is not None:

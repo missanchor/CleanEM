@@ -147,7 +147,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/beers_two_stage_experiment.json"),
+        default=Path("configs/hospital_two_stage_experiment.json"),
         help="配置文件路径（每个配置对应一个实验）",
     )
     args = parser.parse_args()

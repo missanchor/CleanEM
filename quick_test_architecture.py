@@ -21,6 +21,7 @@ from cross_modal_error_detector import (
     CorruptionBasedDataset,
     train_step_corruption,
     collate_fn_corruption,
+    build_tabular_inputs_from_rows,
 )
 from torch.utils.data import DataLoader
 
@@ -97,7 +98,12 @@ def quick_test():
         
         # 测试前向传播
         batch = next(iter(dataloader))
-        tabular_inputs, text_inputs, labels = batch
+        row_samples, text_inputs, labels = batch
+        tabular_inputs = build_tabular_inputs_from_rows(
+            row_samples,
+            dataset.tabular_processor.to(device),
+            dataset.column_names,
+        )
         
         with torch.no_grad():
             logits = model(tabular_inputs, text_inputs)
@@ -114,13 +120,24 @@ def quick_test():
         detection_head=MLPDetectionHead(d_model, hidden_dim=64, output_dim=1)
     )
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer_groups = [{"params": model.parameters()}]
+    proc_params = list(dataset.tabular_processor.parameters())
+    if proc_params:
+        optimizer_groups.append({"params": proc_params})
+    optimizer = torch.optim.Adam(optimizer_groups, lr=1e-3)
     
     # 训练几个步骤
     for epoch in range(3):
         losses = []
         for batch in dataloader:
-            loss = train_step_corruption(model, batch, optimizer, device)
+            loss = train_step_corruption(
+                model,
+                batch,
+                optimizer,
+                dataset.tabular_processor,
+                device,
+                column_names=dataset.column_names,
+            )
             losses.append(loss)
         avg_loss = np.mean(losses)
         print(f"  Epoch {epoch+1}: Loss = {avg_loss:.4f}")
@@ -133,7 +150,12 @@ def quick_test():
     
     with torch.no_grad():
         batch = next(iter(dataloader))
-        tabular_inputs, text_inputs, labels = batch
+        row_samples, text_inputs, labels = batch
+        tabular_inputs = build_tabular_inputs_from_rows(
+            row_samples,
+            dataset.tabular_processor.to(device),
+            dataset.column_names,
+        )
         
         logits = model(tabular_inputs, text_inputs).squeeze(-1)
         predictions = torch.sigmoid(logits) > 0.5

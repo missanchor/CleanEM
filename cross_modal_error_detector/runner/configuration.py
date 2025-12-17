@@ -83,10 +83,26 @@ def load_config(config_path: Path) -> Dict[str, Any]:
 
 
 def set_seed(seed: int) -> None:
+    """
+    设置所有随机种子以确保实验可重现
+
+    Args:
+        seed: 随机种子值
+    """
+    # Python 内置 random 模块
+    import random
+    random.seed(seed)
+
+    # NumPy
     np.random.seed(seed)
+
+    # PyTorch
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        # 重要：设置 CUDA 确定性模式，确保结果完全可重现
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 __all__ = [

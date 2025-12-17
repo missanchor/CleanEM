@@ -92,14 +92,14 @@ class ContrastiveDataset(Dataset):
 
     def __init__(
         self,
-        clean_rows: List[List[Any]],
+        dirty_rows: List[List[Any]],
         text_descriptions: List[str],
         tabular_processor: Optional[TabularProcessor] = None,
         text_processor: Optional[TextProcessor] = None,
         cached_text_embeddings: Optional[Dict[int, torch.Tensor]] = None,
         column_names: Optional[List[str]] = None,
     ):
-        self.clean_rows = clean_rows
+        self.dirty_rows = dirty_rows
         self.text_descriptions = text_descriptions
         self.tabular_processor = tabular_processor or TabularProcessor()
         self.text_processor = text_processor or TextProcessor()
@@ -107,13 +107,13 @@ class ContrastiveDataset(Dataset):
         self.column_names = column_names
 
     def __len__(self) -> int:
-        return len(self.clean_rows)
+        return len(self.dirty_rows)
 
     def __getitem__(self, idx: int) -> Tuple[Dict, Dict]:
-        clean_row = self.clean_rows[idx]
+        dirty_row = self.dirty_rows[idx]
         text = self.text_descriptions[idx]
         row_payload = {
-            "row_data": clean_row,
+            "row_data": dirty_row,
             "row_idx": 0,
         }
         if self.column_names is not None:
