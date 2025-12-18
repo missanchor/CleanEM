@@ -9,9 +9,11 @@ focused modules based on functionality.
 from .core import (
     run_corruption_experiment,
     run_contrastive_two_stage_experiment,
+    run_mcm_experiment,
 )
 
 __all__ = [
     "run_corruption_experiment",
     "run_contrastive_two_stage_experiment",
+    "run_mcm_experiment",
 ]

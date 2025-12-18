@@ -75,6 +75,10 @@ class TabularProcessor(nn.Module):
         # string_embedding always exists, so we can reliably infer device from it
         return self.string_embedding.weight.device
 
+    @property
+    def device(self) -> torch.device:
+        return self._infer_device()
+
     def process(
         self, 
         row_data: List[Any], 

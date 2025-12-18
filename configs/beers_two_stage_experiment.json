@@ -1,11 +1,67 @@
 {
   "experiment": "contrastive_two_stage",
+  "objective": "mcm",
   "device_map": {
     "default": "cuda:0"
   },
   "seed": 42,
   "dataset": "beers_error-01",
   "data_path": "data/beers_error-01.csv",
+  "mcm": {
+    "num_epochs": 200,
+    "batch_size": 32,
+    "mask_ratio": 0.2,
+    "numeric_ratio_threshold": 0.9,
+    "optimizer": {
+      "type": "Adam",
+      "params": {
+        "lr": 1e-3
+      }
+    },
+    "tabular_encoder": {
+      "type": "StructureAwareTransformer",
+      "params": {
+        "d_cell": 4,
+        "d_model": 32,
+        "nhead": 2,
+        "num_layers": 1,
+        "dim_feedforward": 128,
+        "dropout": 0.1
+      }
+    },
+    "text_encoder": {
+      "type": "PretrainedTextEncoder",
+      "params": {
+        "d_model": 32,
+        "model_name_or_path": "/mnt/data/welkinni/Qwen2.5-0.5B-Instruct/qwen/Qwen2.5-0.5B-Instruct",
+        "trust_remote_code": true,
+        "output_proj_dim": 32,
+        "freeze_base_model": true,
+        "adapter_hidden_dim": 32,
+        "adapter_dropout": 0.1
+      }
+    },
+    "fusion_module": {
+      "type": "CrossAttentionFusion",
+      "params": {
+        "d_model": 32,
+        "nhead": 2,
+        "dropout": 0.1
+      }
+    },
+    "detection_head": {
+      "type": "TabularReconstructionHead",
+      "params": {
+        "d_model": 32,
+        "vocab_size": 10000
+      }
+    },
+    "scoring": {
+      "batch_size": 64,
+      "top_k": 50,
+      "return_cell_scores": false
+    }
+  },
   "stage_a": {
     "num_epochs": 100,
     "batch_size": 16,

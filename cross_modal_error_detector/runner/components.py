@@ -6,7 +6,7 @@ import torch
 
 from ..encoders import PretrainedTextEncoder, SimpleMLPEncoder, StructureAwareTransformer
 from ..fusion import CrossAttentionFusion, SimpleConcatFusion
-from ..heads import ContrastiveDetectionHead, MLPDetectionHead
+from ..heads import ContrastiveDetectionHead, MLPDetectionHead, TabularReconstructionHead
 
 
 ENCODER_REGISTRY = {
@@ -23,6 +23,7 @@ FUSION_REGISTRY = {
 DETECTION_HEAD_REGISTRY = {
     "MLPDetectionHead": MLPDetectionHead,
     "ContrastiveDetectionHead": ContrastiveDetectionHead,
+    "TabularReconstructionHead": TabularReconstructionHead,
 }
 
 OPTIMIZER_REGISTRY = {

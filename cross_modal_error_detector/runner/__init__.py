@@ -14,6 +14,7 @@ from .configuration import load_config, set_seed
 from .experiments import (
     run_contrastive_two_stage_experiment,
     run_corruption_experiment,
+    run_mcm_experiment,
 )
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "set_seed",
     "run_corruption_experiment",
     "run_contrastive_two_stage_experiment",
+    "run_mcm_experiment",
 ]
 
 

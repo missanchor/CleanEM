@@ -176,6 +176,96 @@ def collate_fn_contrastive_cell_level(batch):
     return row_samples, text_inputs, labels, cell_indices
 
 
+def collate_fn_mcm(batch):
+    """
+    Collate function for Masked Cell Modeling (MCM).
+    Expects batch items:
+      (row_payload, text_inputs, mask_indices, target_ids, target_nums, target_types)
+    
+    Now supports per-column text inputs stored in row_payload["per_column_text_inputs"]
+    """
+    (
+        row_samples,
+        text_inputs_list,
+        mask_indices_list,
+        target_ids_list,
+        target_nums_list,
+        target_types_list,
+    ) = zip(*batch)
+
+    row_samples = list(row_samples)
+
+    # Extract per-column text inputs from row_payloads
+    per_column_text_inputs_dict: Dict[int, List[Dict[str, Any]]] = {}
+    for sample in row_samples:
+        if isinstance(sample, dict) and "per_column_text_inputs" in sample:
+            per_col_inputs = sample["per_column_text_inputs"]
+            for col_idx, col_text_input in per_col_inputs.items():
+                if col_idx not in per_column_text_inputs_dict:
+                    per_column_text_inputs_dict[col_idx] = []
+                per_column_text_inputs_dict[col_idx].append(col_text_input)
+
+    # Legacy: also support global text inputs for backward compatibility
+    input_ids_list = []
+    attention_mask_list = []
+    cached_embeddings_list = []
+    has_cached = False
+
+    for x in text_inputs_list:
+        if "cached_embedding" in x:
+            cached_embeddings_list.append(x["cached_embedding"])
+            has_cached = True
+        else:
+            input_ids_list.append(x["input_ids"])
+            attention_mask_list.append(x["attention_mask"])
+
+    if has_cached:
+        text_inputs = {
+            "cached_embedding": torch.stack(cached_embeddings_list),
+        }
+    else:
+        text_inputs = {
+            "input_ids": torch.stack(input_ids_list),
+            "attention_mask": torch.stack(attention_mask_list),
+        }
+
+    # Collate per-column text inputs
+    per_column_text_inputs_collated: Dict[int, Dict[str, torch.Tensor]] = {}
+    for col_idx, col_text_list in per_column_text_inputs_dict.items():
+        col_cached_list = []
+        col_input_ids_list = []
+        col_attention_mask_list = []
+        col_has_cached = False
+        
+        for x in col_text_list:
+            if "cached_embedding" in x:
+                col_cached_list.append(x["cached_embedding"])
+                col_has_cached = True
+            else:
+                col_input_ids_list.append(x["input_ids"])
+                col_attention_mask_list.append(x["attention_mask"])
+        
+        if col_has_cached:
+            per_column_text_inputs_collated[col_idx] = {
+                "cached_embedding": torch.stack(col_cached_list),
+            }
+        else:
+            per_column_text_inputs_collated[col_idx] = {
+                "input_ids": torch.stack(col_input_ids_list),
+                "attention_mask": torch.stack(col_attention_mask_list),
+            }
+    
+    # Store per-column text inputs in text_inputs dict
+    text_inputs["per_column"] = per_column_text_inputs_collated
+
+    mask_indices = torch.stack(mask_indices_list)  # [B, K]
+    target_ids = torch.stack(target_ids_list)      # [B, K]
+    target_nums = torch.stack(target_nums_list)    # [B, K]
+    target_types = torch.stack(target_types_list)  # [B, K]
+
+    return row_samples, text_inputs, mask_indices, target_ids, target_nums, target_types
+
+
 def _resolve_device(default_device: str, device_map: Optional[Dict[str, str]], key: str) -> str:
     if device_map:
         if key in device_map:
@@ -276,9 +366,16 @@ def compute_embedding_similarity(
     # Handle text inputs
     if "cached_embedding" in text_inputs:
         H_text = text_inputs["cached_embedding"]
-        # Ensure batch dimension
+        # Determine if this is a pooled embedding (last token) or full sequence
+        # If cached_embedding is 2D (already pooled), or if it's 3D but we want to use last token
         if H_text.dim() == 2:
-            H_text = H_text.unsqueeze(0)
+            # Already pooled (e.g., last token from _precompute_text_embeddings with use_text_output_last_token_embedding=True)
+            # Shape: [B, d_model] - add sequence dimension for consistency with downstream code
+            H_text = H_text.unsqueeze(1)  # [B, 1, d_model]
+        elif H_text.dim() == 3:
+            # Full sequence [B, seq_len, d_model] - extract last token
+            H_text = H_text[:, -1, :]  # [B, d_model]
+            H_text = H_text.unsqueeze(1)  # [B, 1, d_model] for consistency
         H_text = H_text.to(default_device)
     else:
         # Add batch dimension if needed
@@ -382,21 +479,26 @@ def train_step_contrastive_pretrain(
 
     # Text embeddings - need to pool from token-level to sequence-level
     if "cached_embedding" in text_inputs:
-        H_text_all = text_inputs["cached_embedding"]  # [batch_size, seq_len, d_model]
+        H_text_all = text_inputs["cached_embedding"]  # [batch_size, seq_len, d_model] or [batch_size, d_model]
+        # If cached_embedding is 2D (already pooled), use as is; otherwise mean pool
+        if H_text_all.dim() == 2:
+            H_text_pooled = H_text_all  # Already pooled
+        else:
+            # Full sequence, use mean pooling
+            H_text_pooled = torch.mean(H_text_all, dim=1)  # [batch_size, d_model]
     else:
         H_text_all = text_encoder(text_inputs)  # [batch_size, text_seq_len, d_model]
-
-    # Pool text embeddings to get one representation per row
-    # Use attention mask if available, otherwise use mean pooling
-    if "attention_mask" in text_inputs:
-        # Mean pooling with attention mask
-        attention_mask = text_inputs["attention_mask"]  # [batch_size, text_seq_len]
-        mask_expanded = attention_mask.unsqueeze(-1).expand(H_text_all.size()).float()
-        sum_embeddings = torch.sum(H_text_all * mask_expanded, 1)
-        sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
-        H_text_pooled = sum_embeddings / sum_mask  # [batch_size, d_model]
-    else:
-        H_text_pooled = torch.mean(H_text_all, dim=1)  # [batch_size, d_model]
+        # Pool text embeddings to get one representation per row
+        # Use attention mask if available, otherwise use mean pooling
+        if "attention_mask" in text_inputs:
+            # Mean pooling with attention mask
+            attention_mask = text_inputs["attention_mask"]  # [batch_size, text_seq_len]
+            mask_expanded = attention_mask.unsqueeze(-1).expand(H_text_all.size()).float()
+            sum_embeddings = torch.sum(H_text_all * mask_expanded, 1)
+            sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
+            H_text_pooled = sum_embeddings / sum_mask  # [batch_size, d_model]
+        else:
+            H_text_pooled = torch.mean(H_text_all, dim=1)  # [batch_size, d_model]
 
     # Move to default device after pooling
     H_text_pooled = H_text_pooled.to(default_device)
@@ -433,12 +535,339 @@ def train_step_contrastive_pretrain(
     return loss.item()
 
 
+def train_step_mcm(
+    tabular_encoder,
+    text_encoder,
+    fusion_module,
+    recon_heads,  # Changed from recon_head to recon_heads (ModuleList)
+    batch: Tuple,
+    optimizer: torch.optim.Optimizer,
+    tabular_processor,
+    mask_embedding: torch.Tensor,
+    device: Optional[str] = None,
+    *,
+    device_map: Optional[Dict[str, str]] = None,
+    column_names: Optional[Sequence[str]] = None,
+    w_cat: float = 1.0,
+    w_num: float = 1.0,
+) -> Dict[str, float]:
+    """
+    Single training step for Masked Cell Modeling (MCM).
+
+    - Mask selected cells in tabular_processor embeddings using a learned mask vector.
+    - Encode -> fuse with text -> reconstruct masked cells using per-column heads.
+    - Loss: categorical CE + numeric MSE (masked positions only).
+    
+    Args:
+        recon_heads: nn.ModuleList of per-column reconstruction heads
+    """
+    device = device or "cpu"
+    tabular_device = fusion_device = head_device = text_device = device
+
+    tabular_encoder.train()
+    fusion_module.train()
+    # Set all reconstruction heads to train mode
+    if isinstance(recon_heads, torch.nn.ModuleList):
+        for recon_head in recon_heads:
+            recon_head.train()
+    else:
+        recon_heads.train()
+    # text_encoder should be frozen/cached; keep in eval to avoid dropout.
+    text_encoder.eval()
+
+    (
+        row_samples,
+        text_inputs,
+        mask_indices,
+        target_ids,
+        target_nums,
+        target_types,
+    ) = batch
+
+    if tabular_processor is None:
+        raise ValueError("tabular_processor is required for train_step_mcm.")
+
+    tabular_processor = tabular_processor.to(tabular_device)
+    tabular_inputs = build_tabular_inputs_from_rows(row_samples, tabular_processor, column_names)
+    tabular_inputs = {k: v.to(tabular_device) for k, v in tabular_inputs.items()}
+
+    mask_indices = mask_indices.to(tabular_device)
+    target_ids = target_ids.to(head_device)
+    target_nums = target_nums.to(head_device)
+    target_types = target_types.to(head_device)
+
+    # Prepare text embeddings - use per-column text inputs if available
+    # For each masked position, use the corresponding column's text embedding
+    per_column_text_embeddings: Dict[int, torch.Tensor] = {}
+    
+    if "per_column" in text_inputs:
+        # Use per-column text inputs
+        per_col_inputs = text_inputs["per_column"]
+        text_encoder = text_encoder.to(text_device)
+        
+        for col_idx, col_text_input in per_col_inputs.items():
+            if "cached_embedding" in col_text_input:
+                H_text_col = col_text_input["cached_embedding"]
+                # Check if already pooled (2D) or full sequence (3D)
+                if H_text_col.dim() == 2:
+                    # Already pooled (e.g., last token from _precompute_text_embeddings with use_text_output_last_token_embedding=True)
+                    # Shape: [B, d_model] - use as is
+                    pass
+                elif H_text_col.dim() == 3:
+                    # Full sequence [B, seq_len, d_model] - extract last token
+                    H_text_col = H_text_col[:, -1, :]  # [B, d_model]
+                H_text_col = H_text_col.to(fusion_device)
+            elif "raw_text" in col_text_input:
+                # Process raw text through text_processor then text_encoder
+                processed = text_encoder.process(col_text_input["raw_text"])
+                col_text_input_device = _move_to_device(processed, text_device)
+                H_text_col = text_encoder(col_text_input_device).to(fusion_device)
+            else:
+                col_text_input_device = _move_to_device(col_text_input, text_device)
+                H_text_col = text_encoder(col_text_input_device).to(fusion_device)
+            
+            # Extract last token embedding (TimeCMA strategy)
+            # The last token embedding represents LLM's response to the instruction
+            # This is the "output" of the instruction, capturing LLM's understanding
+            # H_text_col shape: [B, seq_len, d_model]
+            if H_text_col.dim() == 3:
+                # Use last token embedding - this is the instruction output
+                # It represents LLM's understanding of the instruction for this column
+                H_text_col = H_text_col[:, -1, :]  # [B, d_model]
+            elif H_text_col.dim() == 2:
+                # Already pooled or single token
+                # If it's [B, d_model], use as is (already the instruction output)
+                pass
+            
+            per_column_text_embeddings[col_idx] = H_text_col
+    
+    # Fallback to global text embedding if per-column not available
+    if not per_column_text_embeddings:
+        if "cached_embedding" in text_inputs:
+            H_text = text_inputs["cached_embedding"]
+            # Check if already pooled (2D) or full sequence (3D)
+            if H_text.dim() == 2:
+                # Already pooled (e.g., last token from _precompute_text_embeddings with use_text_output_last_token_embedding=True)
+                # Shape: [B, d_model] - use as is
+                pass
+            elif H_text.dim() == 3:
+                # Full sequence [B, seq_len, d_model] - extract last token
+                H_text = H_text[:, -1, :]  # [B, d_model]
+            H_text = H_text.to(fusion_device)
+        else:
+            text_encoder = text_encoder.to(text_device)
+            text_inputs_device = _move_to_device(text_inputs, text_device)
+            H_text = text_encoder(text_inputs_device).to(fusion_device)
+            # Extract last token embedding
+            if H_text.dim() == 3:
+                H_text = H_text[:, -1, :]  # [B, d_model]
+
+    # Mask tabular embeddings (operate on tabular_device)
+    cell_embeddings = tabular_inputs["cell_embeddings"]
+    if cell_embeddings.dim() != 3:
+        raise ValueError(f"Expected cell_embeddings as [B,C,d_cell], got {cell_embeddings.shape}")
+
+    B, _, d_cell = cell_embeddings.shape
+    masked = cell_embeddings.clone()
+
+    if mask_indices.numel() > 0:
+        if mask_embedding.dim() != 1 or mask_embedding.numel() != d_cell:
+            raise ValueError(
+                f"mask_embedding must have shape [d_cell]={d_cell}, got {tuple(mask_embedding.shape)}"
+            )
+        mask_vec = mask_embedding.to(tabular_device)
+        batch_idx = torch.arange(B, device=tabular_device).unsqueeze(1).expand_as(mask_indices)
+        masked[batch_idx, mask_indices] = mask_vec
+
+    tabular_inputs["cell_embeddings"] = masked
+
+    # Forward
+    tabular_encoder = tabular_encoder.to(tabular_device)
+    H_table = tabular_encoder(tabular_inputs).to(fusion_device)  # [B, C, d_model]
+    fusion_module = fusion_module.to(fusion_device)
+    
+    # Use per-column text embeddings if available
+    B, C, d_model = H_table.shape
+    H_text_expanded = None
+    
+    if per_column_text_embeddings:
+        # For each column, use its corresponding text embedding
+        # Create H_text with shape [B, C, d_model] where each column uses its own text embedding
+        H_text_expanded = torch.zeros((B, C, d_model), device=fusion_device, dtype=H_table.dtype)
+        
+        # Fill in per-column text embeddings
+        for col_idx, H_text_col in per_column_text_embeddings.items():
+            if col_idx >= 0 and col_idx < C:
+                # H_text_col shape should be [B, d_model]
+                if H_text_col.dim() == 2 and H_text_col.shape[0] == B:
+                    H_text_expanded[:, col_idx, :] = H_text_col
+                elif H_text_col.dim() == 1:
+                    # Single embedding, expand to batch
+                    H_text_expanded[:, col_idx, :] = H_text_col.unsqueeze(0).expand(B, -1)
+        
+        # For columns without per-column embeddings, use the first available or mean
+        for c in range(C):
+            if H_text_expanded[:, c, :].sum() == 0:  # Not set yet
+                if per_column_text_embeddings:
+                    # Use first available column's embedding
+                    first_col_idx = next(iter(per_column_text_embeddings.keys()))
+                    first_col_emb = per_column_text_embeddings[first_col_idx]
+                    if first_col_emb.dim() == 2:
+                        H_text_expanded[:, c, :] = first_col_emb
+                    else:
+                        H_text_expanded[:, c, :] = first_col_emb.unsqueeze(0).expand(B, -1)
+    else:
+        # Fallback to global text embedding
+        if "cached_embedding" in text_inputs:
+            H_text = text_inputs["cached_embedding"]
+            # Check if already pooled (2D) or full sequence (3D)
+            if H_text.dim() == 2:
+                # Already pooled (e.g., last token from _precompute_text_embeddings with use_text_output_last_token_embedding=True)
+                # Shape: [B, d_model] - use as is
+                pass
+            elif H_text.dim() == 3:
+                # Full sequence [B, seq_len, d_model] - extract last token
+                H_text = H_text[:, -1, :]  # [B, d_model]
+            H_text = H_text.to(fusion_device)
+        else:
+            text_encoder = text_encoder.to(text_device)
+            text_inputs_device = _move_to_device(text_inputs, text_device)
+            H_text = text_encoder(text_inputs_device).to(fusion_device)
+            # Extract last token embedding (TimeCMA strategy)
+            if H_text.dim() == 3:
+                H_text = H_text[:, -1, :]  # [B, d_model]
+        
+        # Expand H_text to match column dimension: [B, d_model] -> [B, C, d_model]
+        if H_text.dim() == 2:
+            H_text_expanded = H_text.unsqueeze(1).expand(-1, C, -1)  # [B, C, d_model]
+        else:
+            H_text_expanded = H_text
+    
+    H_fuse = fusion_module(H_table, H_text_expanded).to(head_device)  # [B, C, d_model]
+
+    # Move recon_heads to device
+    if isinstance(recon_heads, torch.nn.ModuleList):
+        recon_heads = recon_heads.to(head_device)
+    else:
+        recon_heads = recon_heads.to(head_device)
+
+    # Compute losses on masked positions only using per-column heads
+    mask_indices_on_head = mask_indices.to(head_device)
+    target_ids = target_ids.to(head_device)
+    target_nums = target_nums.to(head_device)
+    target_types = target_types.to(head_device)
+    
+    # Collect predictions for each masked position using the corresponding column head
+    cat_logits_list = []
+    num_pred_list = []
+    flat_types_list = []
+    flat_target_ids_list = []
+    flat_target_nums_list = []
+    
+    # Group masked positions by column for efficient batch processing
+    # Process each masked position with its corresponding column head
+    for b in range(B):
+        for k in range(mask_indices_on_head.shape[1]):
+            col_idx = int(mask_indices_on_head[b, k].item())
+            if col_idx < 0 or col_idx >= len(recon_heads):
+                continue
+            
+            # Extract column embedding for this batch item and column
+            col_embedding = H_fuse[b:b+1, col_idx:col_idx+1, :]  # [1, 1, d_model]
+            col_recon_head = recon_heads[col_idx]
+            cat_logits_col, num_pred_col = col_recon_head(col_embedding)  # [1, 1, vocab_size], [1, 1]
+            
+            cat_logits_list.append(cat_logits_col.squeeze(0).squeeze(0))  # [vocab_size]
+            num_pred_list.append(num_pred_col.squeeze(0).squeeze(0))  # [1] -> scalar
+            flat_types_list.append(target_types[b, k])
+            flat_target_ids_list.append(target_ids[b, k])
+            flat_target_nums_list.append(target_nums[b, k])
+    
+    if len(cat_logits_list) == 0:
+        # No valid masked positions
+        loss_cat = torch.tensor(0.0, device=head_device)
+        loss_num = torch.tensor(0.0, device=head_device)
+    else:
+        # Stack predictions
+        flat_cat_logits = torch.stack(cat_logits_list)  # [K, vocab_size]
+        flat_num_pred = torch.stack(num_pred_list)  # [K]
+        flat_types = torch.stack(flat_types_list)  # [K]
+        flat_target_ids = torch.stack(flat_target_ids_list)  # [K]
+        flat_target_nums = torch.stack(flat_target_nums_list)  # [K]
+        
+        cat_mask = flat_types == 0
+        num_mask = flat_types == 1
+        
+        loss_cat = torch.tensor(0.0, device=head_device)
+        if torch.any(cat_mask):
+            loss_cat = F.cross_entropy(
+                flat_cat_logits[cat_mask],
+                flat_target_ids[cat_mask],
+            )
+        
+        loss_num = torch.tensor(0.0, device=head_device)
+        if torch.any(num_mask):
+            # targets for numeric positions should be finite; ignore NaNs if any slip through
+            pred = flat_num_pred[num_mask]
+            tgt = flat_target_nums[num_mask]
+            finite = torch.isfinite(tgt)
+            if torch.any(finite):
+                loss_num = F.mse_loss(pred[finite], tgt[finite])
+
+    loss = (float(w_cat) * loss_cat) + (float(w_num) * loss_num)
+
+    optimizer.zero_grad()
+    loss.backward()
+
+    # Debug check: ensure params and grads share device/dtype
+    device_groups = {}
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if not isinstance(param, torch.Tensor) or param.grad is None:
+                continue
+            if param.device != param.grad.device:
+                raise RuntimeError(
+                    f"[train_step_mcm] Gradient device mismatch for param {param.shape}: "
+                    f"param={param.device}, grad={param.grad.device}"
+                )
+            if param.dtype != param.grad.dtype:
+                raise RuntimeError(
+                    f"[train_step_mcm] Gradient dtype mismatch for param {param.shape}: "
+                    f"param={param.dtype}, grad={param.grad.dtype}"
+                )
+            # Track devices
+            device_key = (param.device, param.dtype)
+            if device_key not in device_groups:
+                device_groups[device_key] = []
+            device_groups[device_key].append(param)
+
+    # Check if we have params on multiple devices
+    if len(device_groups) > 1:
+        print("\n[DEBUG] Parameters found on multiple devices/dtypes:")
+        for (device, dtype), params in device_groups.items():
+            print(f"  Device: {device}, Dtype: {dtype}, Num params: {len(params)}")
+        raise RuntimeError(
+            f"[train_step_mcm] Found parameters on {len(device_groups)} different device/dtype combinations. "
+            "Adam optimizer requires all params in each param_group to be on the same device/dtype."
+        )
+
+    optimizer.step()
+
+    return {
+        "loss": float(loss.detach().item()),
+        "loss_cat": float(loss_cat.detach().item()),
+        "loss_num": float(loss_num.detach().item()),
+    }
+
+
 __all__ = [
     "collate_fn_corruption",
     "collate_fn_contrastive",
     "collate_fn_contrastive_cell_level",
+    "collate_fn_mcm",
     "build_tabular_inputs_from_rows",
     "train_step_corruption",
     "compute_embedding_similarity",
     "train_step_contrastive_pretrain",
+    "train_step_mcm",
 ]

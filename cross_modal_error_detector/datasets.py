@@ -3,6 +3,7 @@ Dataset implementations supporting different training strategies.
 """
 
 import random
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -24,7 +25,7 @@ class CorruptionBasedDataset(Dataset):
         corruption_prob: float = 0.3,
         tabular_processor: Optional[TabularProcessor] = None,
         text_processor: Optional[TextProcessor] = None,
-        cached_text_embeddings: Optional[Dict[int, torch.Tensor]] = None,
+        cached_text_embeddings: Optional[Dict] = None,
         column_names: Optional[List[str]] = None,
     ):
         self.clean_rows = clean_rows
@@ -96,7 +97,7 @@ class ContrastiveDataset(Dataset):
         text_descriptions: List[str],
         tabular_processor: Optional[TabularProcessor] = None,
         text_processor: Optional[TextProcessor] = None,
-        cached_text_embeddings: Optional[Dict[int, torch.Tensor]] = None,
+        cached_text_embeddings: Optional[Dict] = None,
         column_names: Optional[List[str]] = None,
     ):
         self.dirty_rows = dirty_rows
@@ -288,10 +289,226 @@ class PerColumnBinaryDataset(Dataset):
         return row_payload, text_inputs, label_tensor, col_idx_tensor
 
 
+class MaskedCellModelingDataset(Dataset):
+    """
+    Masked Cell Modeling (MCM) dataset for self-supervised reconstruction.
+
+    Each sample returns:
+      - row_payload: {"row_data": [...], "row_idx": idx, "column_names": [...]?}
+      - text_inputs: tokenized text or {"cached_embedding": ...}
+      - mask_indices: LongTensor[K] (column indices masked in this row)
+      - target_ids: LongTensor[K] (categorical targets; -1 for numeric positions)
+      - target_nums: FloatTensor[K] (numeric targets in [0,1]; NaN for categorical positions)
+      - target_types: LongTensor[K] (0=categorical, 1=numeric)
+    """
+
+    def __init__(
+        self,
+        dirty_rows: List[List[Any]],
+        text_descriptions: List[str],
+        *,
+        mask_ratio: float = 0.2,
+        num_masked_cells: Optional[int] = None,
+        numeric_ratio_threshold: float = 0.9,
+        max_rows_for_type_inference: int = 2000,
+        tabular_processor: Optional[TabularProcessor] = None,
+        text_processor: Optional[TextProcessor] = None,
+        cached_text_embeddings: Optional[Dict] = None,
+        column_names: Optional[List[str]] = None,
+        seed: Optional[int] = None,
+    ):
+        if len(dirty_rows) != len(text_descriptions):
+            raise ValueError("dirty_rows 与 text_descriptions 的长度不一致，无法对齐。")
+        self.dirty_rows = dirty_rows
+        self.text_descriptions = text_descriptions
+        self.tabular_processor = tabular_processor or TabularProcessor()
+        self.text_processor = text_processor or TextProcessor()
+        self.cached_text_embeddings = cached_text_embeddings
+        self.column_names = column_names
+        self.mask_ratio = float(mask_ratio)
+        self.num_masked_cells = num_masked_cells
+        self.numeric_ratio_threshold = float(numeric_ratio_threshold)
+        self.max_rows_for_type_inference = int(max_rows_for_type_inference)
+        self.seed = seed
+
+        self.num_cols = len(dirty_rows[0]) if dirty_rows else 0
+        self.num_rows = len(dirty_rows)
+        self.col_is_numeric = self._infer_column_types()
+
+        if self.num_cols > 0 and self.num_rows > 0:
+            if self.num_masked_cells is None:
+                # 计算整个数据集的总单元格数，然后按 mask_ratio 计算总掩码数量
+                total_cells = self.num_rows * self.num_cols
+                inferred = int(round(total_cells * self.mask_ratio))
+                self.num_masked_cells = max(1, inferred)
+            else:
+                self.num_masked_cells = max(1, int(self.num_masked_cells))
+
+            # 计算每行应该掩码的单元格数
+            self.cells_per_row = max(1, self.num_masked_cells // self.num_rows)
+            # 确保不超过列数
+            self.cells_per_row = min(self.cells_per_row, self.num_cols)
+
+    def __len__(self) -> int:
+        return len(self.dirty_rows)
+
+    def _stable_hash_to_bucket(self, text: str, vocab_size: int) -> int:
+        digest = hashlib.md5(text.encode("utf-8")).hexdigest()
+        return int(digest[:8], 16) % int(vocab_size)
+
+    def _normalize_numeric(self, value: float, num_numeric_bins: int) -> float:
+        # Mirror TabularProcessor normalization behavior.
+        return (float(value) % float(num_numeric_bins)) / float(num_numeric_bins)
+
+    def _infer_column_types(self) -> List[bool]:
+        """
+        Infer per-column type (numeric vs categorical) by scanning values.
+        """
+        if not self.dirty_rows:
+            return []
+        num_cols = len(self.dirty_rows[0])
+        numeric_counts = [0] * num_cols
+        total_counts = [0] * num_cols
+
+        limit = min(len(self.dirty_rows), max(1, self.max_rows_for_type_inference))
+        for r in range(limit):
+            row = self.dirty_rows[r]
+            if len(row) != num_cols:
+                raise ValueError("dirty_rows must be rectangular (all rows same number of columns).")
+            for c, v in enumerate(row):
+                if v is None:
+                    continue
+                if isinstance(v, str) and v.strip() == "":
+                    continue
+                total_counts[c] += 1
+                # Treat bool as categorical-ish by default to reduce accidental numeric inference
+                is_num = isinstance(v, (int, float)) and not isinstance(v, bool)
+                if is_num:
+                    numeric_counts[c] += 1
+
+        col_is_numeric: List[bool] = []
+        for c in range(num_cols):
+            denom = total_counts[c]
+            ratio = (numeric_counts[c] / denom) if denom > 0 else 0.0
+            col_is_numeric.append(ratio >= self.numeric_ratio_threshold)
+        return col_is_numeric
+
+    def __getitem__(self, idx: int):
+        row = self.dirty_rows[idx]
+        text = self.text_descriptions[idx]
+        if self.num_cols and len(row) != self.num_cols:
+            raise ValueError("dirty_rows must be rectangular (all rows same number of columns).")
+
+        row_payload: Dict[str, Any] = {
+            "row_data": row,
+            "row_idx": idx,
+        }
+        if self.column_names is not None:
+            row_payload["column_names"] = self.column_names
+
+        # Generate per-column text prompts for each column
+        # Format: Instruction-based prompt following TimeCMA strategy
+        # Serialize row data: "Attribute: Value, Attribute: Value..."
+        row_serialized = ", ".join([
+            f"{self.column_names[c] if self.column_names and c < len(self.column_names) else f'Col{c}'}: {row[c]}"
+            for c in range(self.num_cols)
+        ])
+        
+        # For each column, create a column-specific instruction prompt
+        # The instruction asks LLM to check consistency for a specific column
+        # The output (last token embedding) represents LLM's understanding of the instruction
+        per_column_text_inputs: Dict[int, Dict[str, Any]] = {}
+        
+        first_cached_column_embedding = None
+
+        for col_idx in range(self.num_cols):
+            col_name = self.column_names[col_idx] if self.column_names and col_idx < len(self.column_names) else f"Column {col_idx}"
+            # Create per-column instruction prompt
+            # Format: Instruction + Data + Output placeholder
+            # The LLM processes this instruction and outputs embeddings
+            # Last token embedding captures LLM's response to the instruction
+            col_prompt = (
+                f"Instruction: Check the consistency/errorneousness of this record on column '{col_name}'. "
+                f"Record: {row_serialized}. "
+                f"The summary consistency/errorneousness check result is:"
+            )
+
+            cache_key = (idx, col_idx)
+            if self.cached_text_embeddings is not None and cache_key in self.cached_text_embeddings:
+                cached_embedding = self.cached_text_embeddings[cache_key]
+                per_column_text_inputs[col_idx] = {"cached_embedding": cached_embedding}
+                if first_cached_column_embedding is None:
+                    first_cached_column_embedding = cached_embedding
+            else:
+                per_column_text_inputs[col_idx] = self.text_processor.process(col_prompt)
+        
+        # For backward compatibility, also provide a default text input (for non-masked columns)
+        # But we'll use per-column inputs for masked columns
+        if self.cached_text_embeddings is not None:
+            if first_cached_column_embedding is not None:
+                # Fall back to the first cached per-column embedding when only (idx, col_idx) keys exist
+                text_inputs = {"cached_embedding": first_cached_column_embedding}
+            elif idx in self.cached_text_embeddings:
+                text_inputs = {"cached_embedding": self.cached_text_embeddings[idx]}
+            else:
+                text_inputs = self.text_processor.process(text)
+        else:
+            text_inputs = self.text_processor.process(text)
+        
+        # Store per-column text inputs in row_payload for use in training
+        row_payload["per_column_text_inputs"] = per_column_text_inputs
+        
+        # Also provide default text_inputs for backward compatibility
+        # (will be used if per-column inputs are not available)
+
+        # Deterministic masking per row if seed is provided.
+        rng = random.Random((self.seed or 0) + int(idx))
+
+        if self.num_cols <= 0:
+            mask_indices = torch.empty((0,), dtype=torch.long)
+            target_ids = torch.empty((0,), dtype=torch.long)
+            target_nums = torch.empty((0,), dtype=torch.float32)
+            target_types = torch.empty((0,), dtype=torch.long)
+            return row_payload, text_inputs, mask_indices, target_ids, target_nums, target_types
+
+        # 使用每行固定的掩码数量
+        k = self.cells_per_row
+        chosen = rng.sample(range(self.num_cols), k=k)
+        mask_indices_list = list(chosen)
+
+        vocab_size = int(getattr(self.tabular_processor, "vocab_size", 10000))
+        num_numeric_bins = int(getattr(self.tabular_processor, "num_numeric_bins", 1000))
+
+        target_ids_list: List[int] = []
+        target_nums_list: List[float] = []
+        target_types_list: List[int] = []
+
+        for c in mask_indices_list:
+            v = row[c]
+            is_num_col = bool(self.col_is_numeric[c]) if c < len(self.col_is_numeric) else False
+            if is_num_col and isinstance(v, (int, float)) and not isinstance(v, bool):
+                target_types_list.append(1)
+                target_ids_list.append(-1)
+                target_nums_list.append(self._normalize_numeric(float(v), num_numeric_bins))
+            else:
+                target_types_list.append(0)
+                text_value = "" if v is None else str(v)
+                target_ids_list.append(self._stable_hash_to_bucket(text_value, vocab_size))
+                target_nums_list.append(float("nan"))
+
+        mask_indices = torch.tensor(mask_indices_list, dtype=torch.long)
+        target_ids = torch.tensor(target_ids_list, dtype=torch.long)
+        target_nums = torch.tensor(target_nums_list, dtype=torch.float32)
+        target_types = torch.tensor(target_types_list, dtype=torch.long)
+
+        return row_payload, text_inputs, mask_indices, target_ids, target_nums, target_types
+
+
 __all__ = [
     "CorruptionBasedDataset",
     "ContrastiveDataset",
     "CleanDirtyEvaluationDataset",
     "PerColumnBinaryDataset",
+    "MaskedCellModelingDataset",
 ]
 

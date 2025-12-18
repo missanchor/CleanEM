@@ -85,7 +85,7 @@ def run_corruption_experiment(
 
     # Import here to avoid circular dependency
     from ..configuration import _instantiate_processors
-    from ..components import build_component
+    from ..components import ENCODER_REGISTRY, FUSION_REGISTRY, DETECTION_HEAD_REGISTRY, build_component
     from ...datasets import CorruptionBasedDataset
     from ...fusion import CrossAttentionFusion, SimpleConcatFusion, SingleColumnFusion
     from ...model import CrossModalErrorDetector
@@ -113,13 +113,47 @@ def run_corruption_experiment(
         if device_map and "text_encoder" in device_map:
             cache_device = resolve_runtime_device(device_map["text_encoder"], fallback_device=device)
 
-        cached_embeddings = _precompute_text_embeddings(
-            text_encoder,
-            text_descriptions,
-            text_processor,
-            device=cache_device,
-            batch_size=batch_size,
-        )
+        # Check if we should use last token embeddings (like in training)
+        use_last_token = text_encoder_params.get("use_text_output_last_token_embedding", False)
+        # Check if we should generate response first (NEW FEATURE)
+        generate_response = text_encoder_params.get("generate_response", False)
+        max_new_tokens = text_encoder_params.get("max_new_tokens", 10)
+
+        if generate_response:
+            # NEW: Use generate_and_encode for each prompt
+            print("  → 使用生成式模型生成响应并编码...")
+            cached_embeddings = {}
+            for idx, prompt in enumerate(tqdm(text_descriptions, desc="生成响应并缓存文本 Embeddings", ncols=100)):
+                try:
+                    last_token_emb = text_encoder.generate_and_encode(
+                        prompt=prompt,
+                        text_processor=text_processor,
+                        max_new_tokens=max_new_tokens,
+                        device=cache_device,
+                    )
+                    cached_embeddings[idx] = last_token_emb
+                except Exception as e:
+                    print(f"  ⚠ 生成响应失败，使用编码方式: {e}")
+                    # Fallback to encoding
+                    text_inputs = text_processor.process(prompt)
+                    text_inputs = {k: v.to(cache_device) for k, v in text_inputs.items() if isinstance(v, torch.Tensor)}
+                    with torch.no_grad():
+                        H_text = text_encoder(text_inputs)
+                        if H_text.dim() == 3:
+                            last_token_emb = H_text[:, -1, :].squeeze(0).unsqueeze(0).cpu()  # [1, d_model]
+                        else:
+                            last_token_emb = H_text.unsqueeze(0).cpu()  # [1, d_model]
+                        cached_embeddings[idx] = last_token_emb
+        else:
+            # Original behavior: use _precompute_text_embeddings
+            cached_embeddings = _precompute_text_embeddings(
+                text_encoder,
+                text_descriptions,
+                text_processor,
+                device=cache_device,
+                batch_size=batch_size,
+                use_text_output_last_token_embedding=use_last_token,
+            )
 
     model = CrossModalErrorDetector(
         tabular_encoder=tabular_encoder,
@@ -217,6 +251,628 @@ def run_corruption_experiment(
     }
 
 
+def run_mcm_experiment(
+    exp_cfg: Dict[str, Any],
+    device: str,
+    device_map: Optional[Dict[str, str]],
+    *,
+    seed: int,
+    config_dir: Path,
+    project_root: Path,
+) -> Dict[str, Any]:
+    """
+    Masked Cell Modeling (MCM) experiment.
+
+    Single-stage self-supervised reconstruction training using masked cell modeling.
+    Trains models to reconstruct masked cells, then uses reconstruction loss as error score.
+
+    Args:
+        exp_cfg: Experiment configuration
+        device: Device to use
+        device_map: Device mapping for model components
+        seed: Random seed
+        config_dir: Configuration directory
+        project_root: Project root directory
+
+    Returns:
+        Dict containing training losses, scoring results, and evaluation metrics
+    """
+    print("\n" + "=" * 80)
+    print("实验：MCM 无监督重构（结构 + 语义 + 融合）")
+    print("=" * 80)
+
+    # Load data
+    dirty_rows, text_descriptions, dataset_name, column_names = load_data_from_config(
+        exp_cfg,
+        default_seed=seed,
+        config_dir=config_dir,
+        project_root=project_root,
+    )
+
+    # Instantiate processors
+    from ..configuration import _instantiate_processors
+    tabular_processor, text_processor = _instantiate_processors(exp_cfg, config_dir, project_root)
+
+    # Resolve and fix runtime device once to avoid device mismatch
+    runtime_device = resolve_runtime_device(device)
+    print(f"\n使用设备: {runtime_device}")
+
+    # Import MCM-specific components
+    from ..components import ENCODER_REGISTRY, FUSION_REGISTRY, DETECTION_HEAD_REGISTRY, build_component, build_optimizer
+    from ...datasets import MaskedCellModelingDataset
+    from ...training import collate_fn_mcm, train_step_mcm
+
+    mcm_cfg: Dict[str, Any] = exp_cfg.get("mcm", {})
+    batch_size = int(mcm_cfg.get("batch_size", exp_cfg.get("batch_size", 32)))
+    num_epochs = int(mcm_cfg.get("num_epochs", exp_cfg.get("num_epochs", 20)))
+    mask_ratio = float(mcm_cfg.get("mask_ratio", 0.2))
+    num_masked_cells = mcm_cfg.get("num_masked_cells")
+    numeric_ratio_threshold = float(mcm_cfg.get("numeric_ratio_threshold", 0.9))
+    w_cat = float(mcm_cfg.get("w_cat", mcm_cfg.get("loss_w_cat", 1.0)))
+    w_num = float(mcm_cfg.get("w_num", mcm_cfg.get("loss_w_num", 1.0)))
+
+    # Resolve component configs (prefer mcm.* then top-level)
+    tabular_encoder_cfg = mcm_cfg.get("tabular_encoder") or exp_cfg.get("tabular_encoder")
+    text_encoder_cfg = mcm_cfg.get("text_encoder") or exp_cfg.get("text_encoder")
+    fusion_cfg = mcm_cfg.get("fusion_module") or exp_cfg.get("fusion_module")
+    head_cfg = (
+        mcm_cfg.get("detection_head")
+        or mcm_cfg.get("reconstruction_head")
+        or exp_cfg.get("detection_head")
+    )
+
+    if tabular_encoder_cfg is None or text_encoder_cfg is None or fusion_cfg is None:
+        raise ValueError(
+            "MCM experiment requires tabular_encoder, text_encoder, and fusion_module configs "
+            "(provide under mcm.* or at top-level)."
+        )
+
+    tabular_encoder = build_component(tabular_encoder_cfg, ENCODER_REGISTRY, config_dir, project_root)
+    text_encoder = build_component(text_encoder_cfg, ENCODER_REGISTRY, config_dir, project_root)
+    fusion_module = build_component(fusion_cfg, FUSION_REGISTRY, config_dir, project_root)
+
+    # Get number of columns for per-column reconstruction heads
+    num_cols = len(column_names) if column_names is not None else (len(dirty_rows[0]) if dirty_rows else 0)
+    
+    # Default reconstruction head config if not provided
+    if head_cfg is None:
+        head_cfg = {
+            "type": "TabularReconstructionHead",
+            "params": {
+                "d_model": int(getattr(tabular_encoder, "d_model", 32)),
+                "vocab_size": int(getattr(tabular_processor, "vocab_size", 10000)),
+            },
+        }
+    
+    # Create per-column reconstruction heads (each column has its own classifier)
+    recon_heads = nn.ModuleList([
+        build_component(head_cfg, DETECTION_HEAD_REGISTRY, config_dir, project_root)
+        for _ in range(num_cols)
+    ])
+    print(f"✓ 为{num_cols}列创建了独立的重构头（每列一个分类器）")
+
+    # Freeze text encoder by default for efficiency; enable caching when frozen.
+    cached_text_embeddings: Dict[int, torch.Tensor] = {}
+    text_encoder_params = (text_encoder_cfg or {}).get("params", {})
+    is_frozen = bool(text_encoder_params.get("freeze_pretrained", True) or text_encoder_params.get("freeze_base_model", True))
+    if is_frozen:
+        text_encoder.eval()
+        text_encoder.requires_grad_(False)
+
+    if is_frozen:
+        # Check if we should use last token embeddings (like in training)
+        use_last_token = mcm_cfg.get("use_text_output_last_token_embedding", False)
+        # Check if we should generate response first (NEW FEATURE)
+        generate_response = mcm_cfg.get("generate_response", False)
+        max_new_tokens = mcm_cfg.get("max_new_tokens", 10)
+        generation_row_batch_size = max(1, int(mcm_cfg.get("generation_row_batch_size", 1)))
+        generation_backend = mcm_cfg.get("generation_backend", "hf")
+        generation_prompt_batch_size = int(mcm_cfg.get("generation_prompt_batch_size", 256))
+        vllm_model = mcm_cfg.get("vllm_model") or (text_encoder_params.get("model_name_or_path") if isinstance(text_encoder_params, dict) else None)
+        cache_path = mcm_cfg.get("text_embedding_cache_path")
+        force_recompute_cache = bool(mcm_cfg.get("force_recompute_text_embedding_cache", False))
+        use_multiprocessing = bool(mcm_cfg.get("use_multiprocessing", False))
+        num_workers = mcm_cfg.get("generation_num_workers")
+        if num_workers is not None:
+            num_workers = int(num_workers)
+        # Use the intelligent precompute method from text_encoder
+        cached_text_embeddings = text_encoder.precompute_embeddings_for_mcm(
+            dirty_rows=dirty_rows,
+            column_names=column_names,
+            text_descriptions=text_descriptions,
+            text_processor=text_processor,
+            device=runtime_device,
+            batch_size=batch_size,
+            use_last_token=use_last_token,
+            generate_response=generate_response,
+            max_new_tokens=max_new_tokens,
+            generation_row_batch_size=generation_row_batch_size,
+            generation_backend=generation_backend,
+            generation_prompt_batch_size=generation_prompt_batch_size,
+            vllm_model=vllm_model,
+            cache_path=cache_path,
+            dataset_name=dataset_name,
+            force_recompute_cache=force_recompute_cache,
+            use_multiprocessing=use_multiprocessing,
+            num_workers=num_workers,
+        )
+        print(f"✓ 已启用文本embedding缓存，共缓存 {len(cached_text_embeddings)} 条")
+
+    # Trainable mask embedding (in TabularProcessor's input space)
+    d_cell = int(getattr(tabular_processor, "d_cell", 8))
+    mask_embedding = nn.Parameter(torch.zeros(d_cell, dtype=torch.float32))
+    nn.init.normal_(mask_embedding, mean=0.0, std=0.02)
+
+    # Wrap trainables for optimizer creation
+    class _MCMTrainable(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tabular_processor = tabular_processor
+            self.tabular_encoder = tabular_encoder
+            self.fusion_module = fusion_module
+            self.recon_heads = recon_heads
+            self.mask_embedding = mask_embedding
+
+    all_modules = _MCMTrainable().to(runtime_device)
+
+    optimizer = build_optimizer(
+        all_modules,
+        mcm_cfg.get("optimizer", exp_cfg.get("optimizer", {"type": "Adam", "params": {"lr": 1e-3}})),
+    )
+
+    # Dataset / loader
+    train_dataset = MaskedCellModelingDataset(
+        dirty_rows,
+        text_descriptions,
+        mask_ratio=mask_ratio,
+        num_masked_cells=num_masked_cells,
+        numeric_ratio_threshold=numeric_ratio_threshold,
+        tabular_processor=tabular_processor,
+        text_processor=text_processor,
+        cached_text_embeddings=cached_text_embeddings,
+        column_names=column_names,
+        seed=int(mcm_cfg.get("mask_seed", seed)),
+    )
+
+    num_workers, pin_memory, persistent_workers = _derive_loader_runtime(exp_cfg)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn_mcm,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+    )
+
+    train_losses: List[float] = []
+    for epoch in tqdm(range(num_epochs), desc=f"MCM Training ({num_epochs} epochs)", ncols=100):
+        epoch_losses: List[float] = []
+        epoch_cat: List[float] = []
+        epoch_num: List[float] = []
+        for batch in train_loader:
+            stats = train_step_mcm(
+                tabular_encoder,
+                text_encoder,
+                fusion_module,
+                recon_heads,
+                batch,
+                optimizer,
+                tabular_processor,
+                mask_embedding,
+                device=runtime_device,
+                device_map=device_map,
+                column_names=column_names,
+                w_cat=w_cat,
+                w_num=w_num,
+            )
+            epoch_losses.append(stats["loss"])
+            epoch_cat.append(stats["loss_cat"])
+            epoch_num.append(stats["loss_num"])
+        avg = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+        train_losses.append(avg)
+        print(
+            f"  Epoch [{epoch + 1}/{num_epochs}] "
+            f"Loss={avg:.4f} (CE={float(np.mean(epoch_cat)) if epoch_cat else 0.0:.4f}, "
+            f"MSE={float(np.mean(epoch_num)) if epoch_num else 0.0:.4f})"
+        )
+
+    # Continue with scoring and evaluation
+    return _run_mcm_scoring_and_evaluation(
+        exp_cfg, dirty_rows, text_descriptions, dataset_name, column_names,
+        tabular_processor, text_processor, tabular_encoder, text_encoder,
+        fusion_module, recon_heads, mask_embedding, train_dataset,
+        cached_text_embeddings, train_losses, runtime_device, device_map,
+        config_dir, project_root, mcm_cfg, batch_size
+    )
+
+
+def _run_mcm_scoring_and_evaluation(
+    exp_cfg: Dict[str, Any],
+    dirty_rows: List[List[Any]],
+    text_descriptions: List[str],
+    dataset_name: str,
+    column_names: Optional[List[str]],
+    tabular_processor,
+    text_processor,
+    tabular_encoder,
+    text_encoder,
+    fusion_module,
+    recon_heads: nn.ModuleList,
+    mask_embedding: nn.Parameter,
+    train_dataset,
+    cached_text_embeddings: Dict[int, torch.Tensor],
+    train_losses: List[float],
+    runtime_device: str,
+    device_map: Optional[Dict[str, str]],
+    config_dir: Path,
+    project_root: Path,
+    mcm_cfg: Dict[str, Any],
+    batch_size: int,
+) -> Dict[str, Any]:
+    """Helper function for MCM scoring and evaluation."""
+    from ..runtime import _move_batch_to_device
+    from ...training import build_tabular_inputs_from_rows
+    
+    # Lightweight scoring: per-column mean/std + global top-k cells (mask each column once)
+    score_cfg: Dict[str, Any] = mcm_cfg.get("scoring", {})
+    score_batch_size = int(score_cfg.get("batch_size", batch_size))
+    top_k = int(score_cfg.get("top_k", 50))
+    return_full = bool(score_cfg.get("return_cell_scores", False))
+
+    def _stable_hash_to_bucket(text: str, vocab_size: int) -> int:
+        import hashlib
+        digest = hashlib.md5(text.encode("utf-8")).hexdigest()
+        return int(digest[:8], 16) % int(vocab_size)
+
+    def _normalize_numeric(value: float, num_numeric_bins: int) -> float:
+        return (float(value) % float(num_numeric_bins)) / float(num_numeric_bins)
+
+    tabular_encoder.eval()
+    fusion_module.eval()
+    for recon_head in recon_heads:
+        recon_head.eval()
+    tabular_processor.eval()
+    
+    # Explicitly move all components to runtime_device before scoring to avoid device mismatches
+    tabular_processor = tabular_processor.to(runtime_device)
+    tabular_encoder = tabular_encoder.to(runtime_device)
+    fusion_module = fusion_module.to(runtime_device)
+    recon_heads = recon_heads.to(runtime_device)
+    mask_embedding = mask_embedding.to(runtime_device)
+
+    vocab_size = int(getattr(tabular_processor, "vocab_size", 10000))
+    num_numeric_bins = int(getattr(tabular_processor, "num_numeric_bins", 1000))
+    col_is_numeric = list(getattr(train_dataset, "col_is_numeric", []))
+    num_rows = len(dirty_rows)
+    num_cols = len(column_names) if column_names is not None else (len(dirty_rows[0]) if dirty_rows else 0)
+
+    cell_scores: Optional[np.ndarray] = None
+    if return_full and num_rows > 0 and num_cols > 0:
+        cell_scores = np.zeros((num_rows, num_cols), dtype=np.float32)
+
+    topk_cells: List[Dict[str, Any]] = []
+    per_column_stats: Dict[str, Dict[str, float]] = {}
+
+    with torch.no_grad():
+        for col_idx in tqdm(range(num_cols), desc="Scoring columns", ncols=100):
+            col_losses: List[float] = []
+            col_items: List[Tuple[float, int]] = []
+
+            for start in range(0, num_rows, score_batch_size):
+                end = min(start + score_batch_size, num_rows)
+                batch_rows = dirty_rows[start:end]
+                batch_texts = text_descriptions[start:end]
+
+                # Generate per-column text prompts for this column
+                col_name = column_names[col_idx] if column_names and col_idx < len(column_names) else f"Column {col_idx}"
+                per_column_text_inputs = {}
+                
+                for i, r in enumerate(batch_rows):
+                    row_idx = start + i
+                    # Serialize row data
+                    row_serialized = ", ".join([
+                        f"{column_names[c] if column_names and c < len(column_names) else f'Col{c}'}: {r[c]}"
+                        for c in range(num_cols)
+                    ])
+                    # Create per-column instruction prompt
+                    col_prompt = (
+                        f"Instruction: Check the consistency of this record on column '{col_name}'. "
+                        f"Record: {row_serialized}. "
+                        f"The summary embedding representing the consistency check result is: [MASK]"
+                    )
+                    
+                    cache_key = (row_idx, col_idx)
+                    if cached_text_embeddings and cache_key in cached_text_embeddings:
+                        per_column_text_inputs[i] = {"cached_embedding": cached_text_embeddings[cache_key]}
+                    else:
+                        per_column_text_inputs[i] = text_processor.process(col_prompt)
+                
+                # Collate per-column text inputs
+                col_cached_list = []
+                col_input_ids_list = []
+                col_attention_mask_list = []
+                col_has_cached = False
+                
+                for i in range(end - start):
+                    col_text_input = per_column_text_inputs[i]
+                    if "cached_embedding" in col_text_input:
+                        col_cached_list.append(col_text_input["cached_embedding"])
+                        col_has_cached = True
+                    else:
+                        col_input_ids_list.append(col_text_input["input_ids"])
+                        col_attention_mask_list.append(col_text_input["attention_mask"])
+                
+                if col_has_cached:
+                    text_inputs = {
+                        "cached_embedding": torch.stack(col_cached_list).to(runtime_device),
+                        "per_column": {col_idx: {"cached_embedding": torch.stack(col_cached_list).to(runtime_device)}}
+                    }
+                else:
+                    text_inputs = {
+                        "input_ids": torch.stack(col_input_ids_list).to(runtime_device),
+                        "attention_mask": torch.stack(col_attention_mask_list).to(runtime_device),
+                        "per_column": {
+                            col_idx: {
+                                "input_ids": torch.stack(col_input_ids_list).to(runtime_device),
+                                "attention_mask": torch.stack(col_attention_mask_list).to(runtime_device)
+                            }
+                        }
+                    }
+
+                B = end - start
+                mask_indices = torch.full((B, 1), int(col_idx), dtype=torch.long, device=runtime_device)
+
+                is_num_col = bool(col_is_numeric[col_idx]) if col_idx < len(col_is_numeric) else False
+                target_types = torch.full((B, 1), 1 if is_num_col else 0, dtype=torch.long, device=runtime_device)
+                if is_num_col:
+                    target_ids = torch.full((B, 1), -1, dtype=torch.long, device=runtime_device)
+                    vals = []
+                    for r in batch_rows:
+                        v = r[col_idx]
+                        if isinstance(v, (int, float)) and not isinstance(v, bool):
+                            vals.append(_normalize_numeric(float(v), num_numeric_bins))
+                        else:
+                            vals.append(float("nan"))
+                    target_nums = torch.tensor(vals, dtype=torch.float32, device=runtime_device).unsqueeze(1)
+                else:
+                    target_nums = torch.full((B, 1), float("nan"), dtype=torch.float32, device=runtime_device)
+                    ids = []
+                    for r in batch_rows:
+                        v = r[col_idx]
+                        ids.append(_stable_hash_to_bucket("" if v is None else str(v), vocab_size))
+                    target_ids = torch.tensor(ids, dtype=torch.long, device=runtime_device).unsqueeze(1)
+
+                # Forward path mirrors train_step_mcm (no backward)
+                tabular_processor = tabular_processor.to(runtime_device)
+                tabular_inputs = tabular_processor.process_batch(
+                    batch_rows,
+                    row_indices=list(range(start, end)),
+                    column_names=column_names,
+                )
+                tabular_inputs = {k: v.to(runtime_device) for k, v in tabular_inputs.items()}
+
+                # Apply mask
+                cell_emb = tabular_inputs["cell_embeddings"].clone()
+                batch_idx = torch.arange(B, device=runtime_device).unsqueeze(1)
+                cell_emb[batch_idx, mask_indices] = mask_embedding
+                tabular_inputs["cell_embeddings"] = cell_emb
+
+                H_table = tabular_encoder(tabular_inputs)  # [B, C, d_model]
+                
+                # Use per-column text encoding
+                if "per_column" in text_inputs and col_idx in text_inputs["per_column"]:
+                    col_text_input = text_inputs["per_column"][col_idx]
+                    if "cached_embedding" in col_text_input:
+                        H_text_col = col_text_input["cached_embedding"].to(runtime_device)
+                        if H_text_col.dim() == 2:
+                            H_text_col = H_text_col.unsqueeze(0)
+                        if H_text_col.dim() == 3:
+                            H_text_col = H_text_col[:, -1, :]  # [B, d_model]
+                    else:
+                        col_text_input_device = _move_batch_to_device(col_text_input, runtime_device)
+                        H_text_col = text_encoder(col_text_input_device)
+                        if H_text_col.dim() == 3:
+                            H_text_col = H_text_col[:, -1, :]  # [B, d_model]
+                    
+                    B, C, d_model = H_table.shape
+                    H_text_expanded = H_text_col.unsqueeze(1).expand(-1, C, -1)  # [B, C, d_model]
+                else:
+                    # Fallback to global text embedding
+                    if "cached_embedding" in text_inputs:
+                        H_text = text_inputs["cached_embedding"].to(runtime_device)
+                        if H_text.dim() == 2:
+                            H_text = H_text.unsqueeze(0)
+                        if H_text.dim() == 3:
+                            H_text = H_text[:, -1, :]  # [B, d_model]
+                        B, C, d_model = H_table.shape
+                        H_text_expanded = H_text.unsqueeze(1).expand(-1, C, -1)  # [B, C, d_model]
+                    else:
+                        H_text = text_encoder(_move_batch_to_device(text_inputs, runtime_device))
+                        if H_text.dim() == 3:
+                            H_text = H_text[:, -1, :]  # [B, d_model]
+                        B, C, d_model = H_table.shape
+                        H_text_expanded = H_text.unsqueeze(1).expand(-1, C, -1)  # [B, C, d_model]
+                
+                H_fuse = fusion_module(H_table, H_text_expanded)  # [B, C, d_model]
+                
+                # Use per-column reconstruction head: extract column embedding and use column-specific head
+                col_embedding = H_fuse[:, col_idx:col_idx+1, :]  # [B, 1, d_model]
+                col_recon_head = recon_heads[col_idx]
+                cat_logits_col, num_pred_col = col_recon_head(col_embedding)  # [B, 1, vocab_size], [B, 1]
+                
+                # Squeeze to remove column dimension
+                cat_logits_col = cat_logits_col.squeeze(1)  # [B, vocab_size]
+                num_pred_col = num_pred_col.squeeze(1)  # [B]
+
+                # Compute per-row loss for this (row, col)
+                if is_num_col:
+                    preds = num_pred_col
+                    tgt = target_nums.squeeze(1).to(runtime_device)
+                    finite = torch.isfinite(tgt)
+                    per_row = torch.zeros((B,), dtype=torch.float32, device=runtime_device)
+                    per_row[finite] = (preds[finite] - tgt[finite]).pow(2)
+                else:
+                    logits = cat_logits_col
+                    tgt = target_ids.squeeze(1).to(runtime_device)
+                    per_row = F.cross_entropy(logits, tgt, reduction="none").to(torch.float32)
+
+                per_row_cpu = per_row.detach().cpu().numpy()
+                for i in range(B):
+                    row_idx = start + i
+                    loss_val = float(per_row_cpu[i])
+                    col_losses.append(loss_val)
+                    col_items.append((loss_val, row_idx))
+                    if cell_scores is not None:
+                        cell_scores[row_idx, col_idx] = loss_val
+
+            if col_losses:
+                per_column_stats[str(column_names[col_idx] if column_names else col_idx)] = {
+                    "mean": float(np.mean(col_losses)),
+                    "std": float(np.std(col_losses)),
+                }
+                # keep top-k per column candidates, later we will merge globally
+                col_items.sort(key=lambda x: x[0], reverse=True)
+                for loss_val, row_idx in col_items[: min(top_k, len(col_items))]:
+                    v = dirty_rows[row_idx][col_idx]
+                    topk_cells.append(
+                        {
+                            "row_idx": int(row_idx),
+                            "col_idx": int(col_idx),
+                            "column": str(column_names[col_idx] if column_names else col_idx),
+                            "value": None if v is None else str(v),
+                            "score": float(loss_val),
+                            "type": "numeric" if is_num_col else "categorical",
+                        }
+                    )
+
+    # Global top-k (dedupe and sort)
+    topk_cells.sort(key=lambda x: float(x["score"]), reverse=True)
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for item in topk_cells:
+        key = (item["row_idx"], item["col_idx"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+        if len(deduped) >= top_k:
+            break
+
+    # ============ MCM Evaluation: Compare with clean data ============
+    mcm_eval_metrics: Optional[Dict[str, float]] = None
+    eval_cfg = exp_cfg.get("evaluation")
+    if eval_cfg:
+        clean_path_value = eval_cfg.get("clean_data_path")
+        if clean_path_value:
+            from ..configuration import _resolve_path_like
+            from ..data_loading import load_csv_dataset
+            from .error_analysis import compute_error_mask
+            from .evaluation import _compute_classification_metrics
+            
+            clean_path = Path(_resolve_path_like(clean_path_value, config_dir, project_root))
+            max_rows = eval_cfg.get("max_rows")
+            
+            print("\n" + "=" * 80)
+            print("MCM 评估：对比clean和dirty数据计算错误检测指标")
+            print("=" * 80)
+            
+            try:
+                clean_rows, _, _, clean_column_names = load_csv_dataset(
+                    clean_path, dataset_name=eval_cfg.get("dataset_name"), max_rows=max_rows
+                )
+                
+                # Ensure clean and dirty have same number of rows
+                min_rows = min(len(clean_rows), len(dirty_rows))
+                clean_rows = clean_rows[:min_rows]
+                dirty_rows_eval = dirty_rows[:min_rows]
+                
+                # Compute ground truth error mask
+                error_masks = compute_error_mask(clean_rows, dirty_rows_eval)
+                
+                # Convert error masks to flat list: 1 = error, 0 = correct
+                ground_truth = []
+                for mask in error_masks:
+                    ground_truth.extend(mask)
+                
+                # Generate predictions from cell_scores or topk_cells
+                predictions = [0] * len(ground_truth)
+                
+                if cell_scores is not None:
+                    # Use cell_scores: higher score = more likely to be error
+                    num_true_errors = sum(ground_truth)
+                    threshold_k = min(num_true_errors, top_k) if num_true_errors > 0 else top_k
+                    
+                    # Ensure cell_scores shape matches (num_rows, num_cols)
+                    num_rows_eval = len(dirty_rows_eval)
+                    num_cols_eval = len(dirty_rows_eval[0]) if dirty_rows_eval else 0
+                    
+                    if cell_scores.shape[0] >= num_rows_eval and cell_scores.shape[1] >= num_cols_eval:
+                        cell_scores_eval = cell_scores[:num_rows_eval, :num_cols_eval]
+                        flat_scores = cell_scores_eval.flatten()
+                        top_k_indices = np.argsort(flat_scores)[-threshold_k:][::-1]
+                        
+                        for idx in top_k_indices:
+                            if idx < len(predictions):
+                                predictions[idx] = 1
+                    else:
+                        # Fallback: use topk_cells if shape mismatch
+                        print(f"⚠️  cell_scores形状不匹配，使用topk_cells作为预测")
+                        for cell in deduped:
+                            row_idx = cell["row_idx"]
+                            col_idx = cell["col_idx"]
+                            if row_idx < num_rows_eval and col_idx < num_cols_eval:
+                                flat_idx = row_idx * num_cols_eval + col_idx
+                                if flat_idx < len(predictions):
+                                    predictions[flat_idx] = 1
+                else:
+                    # Fallback: use topk_cells
+                    for cell in deduped:
+                        row_idx = cell["row_idx"]
+                        col_idx = cell["col_idx"]
+                        if row_idx < len(dirty_rows_eval) and col_idx < len(dirty_rows_eval[0]):
+                            num_cols = len(dirty_rows_eval[0])
+                            flat_idx = row_idx * num_cols + col_idx
+                            if flat_idx < len(predictions):
+                                predictions[flat_idx] = 1
+                
+                # Compute metrics
+                preds_tensor = torch.tensor(predictions, dtype=torch.int32)
+                targets_tensor = torch.tensor(ground_truth, dtype=torch.int32)
+                
+                mcm_eval_metrics = _compute_classification_metrics(preds_tensor, targets_tensor)
+                
+                print(f"\nMCM 评估结果:")
+                print(f"  总cell数: {len(ground_truth)}")
+                print(f"  真实错误cell数: {sum(ground_truth)}")
+                print(f"  预测错误cell数: {sum(predictions)}")
+                print(f"  Precision (错误检测精确率): {mcm_eval_metrics['precision']:.4f}")
+                print(f"  Recall (错误检测召回率): {mcm_eval_metrics['recall']:.4f}")
+                print(f"  F1 Score: {mcm_eval_metrics['f1']:.4f}")
+                print(f"  TP: {mcm_eval_metrics['tp']}, FP: {mcm_eval_metrics['fp']}, FN: {mcm_eval_metrics['fn']}, TN: {mcm_eval_metrics['tn']}")
+                
+            except Exception as e:
+                print(f"\n⚠️  MCM评估失败: {e}")
+                import traceback
+                traceback.print_exc()
+                mcm_eval_metrics = None
+
+    result: Dict[str, Any] = {
+        "stage_a_losses": [],
+        "stage_b_losses": [],
+        "mcm_losses": train_losses,
+        "train_losses": train_losses,
+        "dataset": dataset_name,
+        "mcm_per_column_stats": per_column_stats,
+        "mcm_topk_cells": deduped,
+    }
+    if cell_scores is not None:
+        result["mcm_cell_scores"] = cell_scores
+    if mcm_eval_metrics is not None:
+        result["mcm_evaluation"] = mcm_eval_metrics
+    return result
+
+
 def run_contrastive_two_stage_experiment(
     exp_cfg: Dict[str, Any],
     device: str,
@@ -243,6 +899,12 @@ def run_contrastive_two_stage_experiment(
     Returns:
         Dict containing training losses and evaluation metrics
     """
+    # Check if this is actually an MCM experiment
+    objective = str(exp_cfg.get("objective") or "").lower().strip()
+    if objective == "mcm":
+        # Redirect to MCM experiment function
+        return run_mcm_experiment(exp_cfg, device, device_map, seed=seed, config_dir=config_dir, project_root=project_root)
+
     print("\n" + "=" * 80)
     print("实验：Contrastive 两阶段训练（预训练 + 二分类）")
     print("=" * 80)
@@ -296,13 +958,21 @@ def run_contrastive_two_stage_experiment(
     is_frozen = text_encoder_params.get("freeze_pretrained", True) or text_encoder_params.get("freeze_base_model", True)
 
     if is_frozen and hasattr(text_encoder, "forward"):
-        # 预计算并缓存文本embeddings
-        cached_text_embeddings = _precompute_text_embeddings(
-            text_encoder,
-            text_descriptions,
-            text_processor,
+        # Check if we should use last token embeddings (like in training)
+        use_last_token = stage_a_cfg.get("use_text_output_last_token_embedding", False)
+        # Check if we should generate response first (NEW FEATURE)
+        generate_response = stage_a_cfg.get("generate_response", False)
+        max_new_tokens = stage_a_cfg.get("max_new_tokens", 10)
+
+        # Use the simple precompute method from text_encoder
+        cached_text_embeddings = text_encoder.precompute_embeddings_simple(
+            text_descriptions=text_descriptions,
+            text_processor=text_processor,
             device=runtime_device,
             batch_size=stage_a_cfg.get("batch_size", 16),
+            use_last_token=use_last_token,
+            generate_response=generate_response,
+            max_new_tokens=max_new_tokens,
         )
         print(f"✓ Stage A已启用文本embedding缓存，共缓存 {len(cached_text_embeddings)} 条")
     else:

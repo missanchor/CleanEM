@@ -25,6 +25,7 @@ from cross_modal_error_detector.runner import (
     load_config,
     run_contrastive_two_stage_experiment,
     run_corruption_experiment,
+    run_mcm_experiment,
     set_seed,
 )
 from cross_modal_error_detector.utils.device import (
@@ -133,10 +134,31 @@ def main(config_path: Path) -> None:
             summary["包含错误的行数"] = str(results.get("num_error_rows", 0))
 
         _print_summary("Contrastive Two-Stage", summary)
+    elif experiment_key == "mcm":
+        results = run_mcm_experiment(
+            config,
+            device,
+            device_map,
+            seed=seed,
+            config_dir=config_dir,
+            project_root=project_root,
+        )
+        mcm_losses = results.get("mcm_losses", results.get("train_losses", []))
+        summary = {
+            "数据集": str(results.get("dataset")),
+            "MCM最终Loss": f"{mcm_losses[-1]:.4f}" if mcm_losses else "未计算",
+        }
+        if results.get("mcm_evaluation"):
+            eval_metrics = results["mcm_evaluation"]
+            summary["错误检测Precision"] = f"{eval_metrics.get('precision', 0.0):.2%}"
+            summary["错误检测Recall"] = f"{eval_metrics.get('recall', 0.0):.2%}"
+            summary["错误检测F1"] = f"{eval_metrics.get('f1', 0.0):.2%}"
+            summary["Top-K Cells"] = len(results.get("mcm_topk_cells", []))
+        _print_summary("MCM (Masked Cell Modeling)", summary)
     else:
         raise ValueError(
             f"不支持的实验类型：{experiment}. "
-            "请使用 'corruption'、'contrastive'、'contrastive_two_stage' 或 'ablation'。"
+            "请使用 'corruption'、'contrastive'、'contrastive_two_stage'、'mcm' 或 'ablation'。"
         )
 
     print("\n提示：可通过修改配置文件快速调整组件与超参数。")
@@ -147,7 +169,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/hospital_two_stage_experiment.json"),
+        default=Path("configs/hospital_mcm_experiment.json"),
         help="配置文件路径（每个配置对应一个实验）",
     )
     args = parser.parse_args()

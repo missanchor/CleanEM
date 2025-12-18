@@ -97,8 +97,14 @@ def select_optimal_cuda_device() -> Optional[str]:
 
 def resolve_runtime_device(device: Optional[str], fallback_device: str = "cpu") -> str:
     """
-    Resolve the concrete runtime device, automatically picking the optimal GPU
-    with the most free memory when CUDA is available.
+    Resolve the concrete runtime device.
+
+    Behavior:
+    - If ``device`` is ``None`` (or ``"cuda"`` without an explicit index), we
+      automatically pick the CUDA device with the most free memory.
+    - If ``device`` specifies an explicit CUDA device (e.g. ``"cuda:1"``), we
+      respect that selection to avoid splitting modules across GPUs.
+    - Non-CUDA devices are canonicalized and returned as-is.
     """
 
     candidate = device or ("cuda" if torch.cuda.is_available() else fallback_device)
@@ -108,11 +114,14 @@ def resolve_runtime_device(device: Optional[str], fallback_device: str = "cpu") 
         if not torch.cuda.is_available():
             return fallback_device
 
-        # Always use select_optimal_cuda_device() to pick the best GPU
-        best_device = select_optimal_cuda_device()
-        if best_device:
-            return best_device
-        return fallback_device
+        # Only auto-select when the caller did not specify an explicit index.
+        if normalized == "cuda":
+            best_device = select_optimal_cuda_device()
+            if best_device:
+                return best_device
+            return fallback_device
+
+        return normalized
 
     return normalized
 
