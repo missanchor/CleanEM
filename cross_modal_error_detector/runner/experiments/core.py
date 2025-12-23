@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import os
 import random
+import copy
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -42,6 +44,107 @@ from .negative_sampling import (
 )
 from ..runtime import _move_batch_to_device, _resolve_runtime_device
 from ...utils.device import resolve_runtime_device
+
+
+def _process_texts_with_batch_support(
+    text_processor,
+    texts: List[str],
+) -> List[Dict[str, Any]]:
+    """
+    Prefer text_processor.process_batch for efficiency, fallback to per-text processing.
+    """
+    if not texts:
+        return []
+
+    if hasattr(text_processor, "process_batch"):
+        batch_outputs = text_processor.process_batch(texts)
+        if isinstance(batch_outputs, list):
+            return batch_outputs
+        if isinstance(batch_outputs, dict):
+            processed: List[Dict[str, Any]] = []
+            for idx in range(len(texts)):
+                processed.append(
+                    {
+                        key: (value[idx] if isinstance(value, torch.Tensor) else value)
+                        for key, value in batch_outputs.items()
+                    }
+                )
+            return processed
+
+    return [text_processor.process(text) for text in texts]
+
+
+def _prepare_column_label_encoders(
+    rows: List[List[Any]],
+    *,
+    numeric_ratio_threshold: float,
+    max_rows_for_type_inference: int,
+    max_vocab_size: Optional[int],
+    unknown_token: str = "<UNK>",
+) -> Tuple[List[bool], List[Dict[str, int]], List[int]]:
+    """
+    Infer column types and build per-column categorical vocabularies.
+    Returns:
+        col_is_numeric: list of booleans indicating numeric columns
+        column_value_to_id: per-column mapping from token -> id (categorical columns)
+        column_vocab_sizes: per-column vocab sizes (>=1)
+    """
+    if not rows:
+        return [], [], []
+
+    num_cols = len(rows[0])
+    numeric_counts = [0] * num_cols
+    total_counts = [0] * num_cols
+    limit = min(len(rows), max(1, max_rows_for_type_inference))
+
+    for row_idx in range(limit):
+        row = rows[row_idx]
+        if len(row) != num_cols:
+            raise ValueError("dirty_rows must be rectangular (all rows same number of columns).")
+        for col_idx, value in enumerate(row):
+            if value is None:
+                continue
+            if isinstance(value, str) and value.strip() == "":
+                continue
+            total_counts[col_idx] += 1
+            is_num = isinstance(value, (int, float)) and not isinstance(value, bool)
+            if is_num:
+                numeric_counts[col_idx] += 1
+
+    col_is_numeric: List[bool] = []
+    for col_idx in range(num_cols):
+        denom = total_counts[col_idx]
+        ratio = (numeric_counts[col_idx] / denom) if denom > 0 else 0.0
+        col_is_numeric.append(ratio >= numeric_ratio_threshold)
+
+    column_value_to_id: List[Dict[str, int]] = []
+    column_vocab_sizes: List[int] = []
+
+    for col_idx in range(num_cols):
+        mapping: OrderedDict[str, int] = OrderedDict()
+        if unknown_token is not None:
+            mapping.setdefault(unknown_token, 0)
+
+        if not col_is_numeric[col_idx]:
+            for row in rows:
+                if col_idx >= len(row):
+                    continue
+                token = "" if row[col_idx] is None else str(row[col_idx])
+                if token in mapping:
+                    continue
+                if max_vocab_size is not None and len(mapping) >= max_vocab_size:
+                    continue
+                mapping[token] = len(mapping)
+
+        if not mapping:
+            mapping = OrderedDict()
+            if unknown_token is not None:
+                mapping[unknown_token] = 0
+
+        column_value_to_id.append(mapping)
+        column_vocab_sizes.append(max(1, len(mapping)))
+
+    return col_is_numeric, column_value_to_id, column_vocab_sizes
 
 
 def run_corruption_experiment(
@@ -308,6 +411,8 @@ def run_mcm_experiment(
     mask_ratio = float(mcm_cfg.get("mask_ratio", 0.2))
     num_masked_cells = mcm_cfg.get("num_masked_cells")
     numeric_ratio_threshold = float(mcm_cfg.get("numeric_ratio_threshold", 0.9))
+    max_rows_for_type_inference = int(mcm_cfg.get("max_rows_for_type_inference", 2000))
+    unknown_token = str(mcm_cfg.get("unknown_token", "<UNK>"))
     w_cat = float(mcm_cfg.get("w_cat", mcm_cfg.get("loss_w_cat", 1.0)))
     w_num = float(mcm_cfg.get("w_num", mcm_cfg.get("loss_w_num", 1.0)))
 
@@ -343,12 +448,47 @@ def run_mcm_experiment(
                 "vocab_size": int(getattr(tabular_processor, "vocab_size", 10000)),
             },
         }
+
+    default_vocab_size = int(getattr(tabular_processor, "vocab_size", 10000))
+    head_params = head_cfg.get("params", {}) if head_cfg else {}
+    max_vocab_size = int(head_params.get("vocab_size", default_vocab_size))
+
+    if dirty_rows:
+        col_is_numeric, column_value_to_id, column_vocab_sizes = _prepare_column_label_encoders(
+            dirty_rows,
+            numeric_ratio_threshold=numeric_ratio_threshold,
+            max_rows_for_type_inference=max_rows_for_type_inference,
+            max_vocab_size=max_vocab_size,
+            unknown_token=unknown_token,
+        )
+    else:
+        col_is_numeric = [False] * num_cols
+        column_value_to_id = [
+            OrderedDict({unknown_token: 0}) for _ in range(num_cols)
+        ]
+        column_vocab_sizes = [1] * num_cols
+
+    # Ensure lengths align with num_cols
+    if len(col_is_numeric) < num_cols:
+        col_is_numeric.extend([False] * (num_cols - len(col_is_numeric)))
+    if len(column_value_to_id) < num_cols:
+        pad_count = num_cols - len(column_value_to_id)
+        column_value_to_id.extend([OrderedDict({unknown_token: 0}) for _ in range(pad_count)])
+    if len(column_vocab_sizes) < num_cols:
+        column_vocab_sizes.extend([1] * (num_cols - len(column_vocab_sizes)))
     
     # Create per-column reconstruction heads (each column has its own classifier)
-    recon_heads = nn.ModuleList([
-        build_component(head_cfg, DETECTION_HEAD_REGISTRY, config_dir, project_root)
-        for _ in range(num_cols)
-    ])
+    recon_heads_list: List[nn.Module] = []
+    for col_idx in range(num_cols):
+        per_col_cfg = copy.deepcopy(head_cfg)
+        if per_col_cfg.get("type") == "TabularReconstructionHead":
+            per_params = copy.deepcopy(per_col_cfg.get("params", {}))
+            vocab_override = column_vocab_sizes[col_idx] if col_idx < len(column_vocab_sizes) else max_vocab_size
+            per_params["vocab_size"] = int(max(1, vocab_override))
+            per_col_cfg["params"] = per_params
+        recon_head = build_component(per_col_cfg, DETECTION_HEAD_REGISTRY, config_dir, project_root)
+        recon_heads_list.append(recon_head)
+    recon_heads = nn.ModuleList(recon_heads_list)
     print(f"✓ 为{num_cols}列创建了独立的重构头（每列一个分类器）")
 
     # Freeze text encoder by default for efficiency; enable caching when frozen.
@@ -427,11 +567,15 @@ def run_mcm_experiment(
         mask_ratio=mask_ratio,
         num_masked_cells=num_masked_cells,
         numeric_ratio_threshold=numeric_ratio_threshold,
+        max_rows_for_type_inference=max_rows_for_type_inference,
         tabular_processor=tabular_processor,
         text_processor=text_processor,
         cached_text_embeddings=cached_text_embeddings,
         column_names=column_names,
         seed=int(mcm_cfg.get("mask_seed", seed)),
+        col_is_numeric=col_is_numeric[:num_cols],
+        column_value_to_id=[dict(m) for m in column_value_to_id[:num_cols]],
+        unknown_token=unknown_token,
     )
 
     num_workers, pin_memory, persistent_workers = _derive_loader_runtime(exp_cfg)
@@ -544,6 +688,8 @@ def _run_mcm_scoring_and_evaluation(
     vocab_size = int(getattr(tabular_processor, "vocab_size", 10000))
     num_numeric_bins = int(getattr(tabular_processor, "num_numeric_bins", 1000))
     col_is_numeric = list(getattr(train_dataset, "col_is_numeric", []))
+    column_value_to_id = getattr(train_dataset, "column_value_to_id", None)
+    unknown_token = getattr(train_dataset, "unknown_token", "<UNK>")
     num_rows = len(dirty_rows)
     num_cols = len(column_names) if column_names is not None else (len(dirty_rows[0]) if dirty_rows else 0)
 
@@ -566,7 +712,9 @@ def _run_mcm_scoring_and_evaluation(
 
                 # Generate per-column text prompts for this column
                 col_name = column_names[col_idx] if column_names and col_idx < len(column_names) else f"Column {col_idx}"
-                per_column_text_inputs = {}
+                per_column_text_inputs: Dict[int, Dict[str, Any]] = {}
+                pending_indices: List[int] = []
+                pending_prompts: List[str] = []
                 
                 for i, r in enumerate(batch_rows):
                     row_idx = start + i
@@ -586,7 +734,13 @@ def _run_mcm_scoring_and_evaluation(
                     if cached_text_embeddings and cache_key in cached_text_embeddings:
                         per_column_text_inputs[i] = {"cached_embedding": cached_text_embeddings[cache_key]}
                     else:
-                        per_column_text_inputs[i] = text_processor.process(col_prompt)
+                        pending_indices.append(i)
+                        pending_prompts.append(col_prompt)
+                
+                if pending_prompts:
+                    processed_batch = _process_texts_with_batch_support(text_processor, pending_prompts)
+                    for local_idx, batch_idx in enumerate(pending_indices):
+                        per_column_text_inputs[batch_idx] = processed_batch[local_idx]
                 
                 # Collate per-column text inputs
                 col_cached_list = []
@@ -637,10 +791,19 @@ def _run_mcm_scoring_and_evaluation(
                     target_nums = torch.tensor(vals, dtype=torch.float32, device=runtime_device).unsqueeze(1)
                 else:
                     target_nums = torch.full((B, 1), float("nan"), dtype=torch.float32, device=runtime_device)
-                    ids = []
+                    ids: List[int] = []
+                    mapping = None
+                    unknown_id = 0
+                    if column_value_to_id and col_idx < len(column_value_to_id):
+                        mapping = column_value_to_id[col_idx] or {}
+                        unknown_id = mapping.get(unknown_token, 0)
                     for r in batch_rows:
                         v = r[col_idx]
-                        ids.append(_stable_hash_to_bucket("" if v is None else str(v), vocab_size))
+                        token = "" if v is None else str(v)
+                        if mapping:
+                            ids.append(int(mapping.get(token, unknown_id)))
+                        else:
+                            ids.append(_stable_hash_to_bucket(token, vocab_size))
                     target_ids = torch.tensor(ids, dtype=torch.long, device=runtime_device).unsqueeze(1)
 
                 # Forward path mirrors train_step_mcm (no backward)
@@ -795,46 +958,98 @@ def _run_mcm_scoring_and_evaluation(
                 for mask in error_masks:
                     ground_truth.extend(mask)
                 
-                # Generate predictions from cell_scores or topk_cells
+                # Generate predictions using per-column optimal thresholds
                 predictions = [0] * len(ground_truth)
+                num_rows_eval = len(dirty_rows_eval)
+                num_cols_eval = len(dirty_rows_eval[0]) if dirty_rows_eval else 0
                 
-                if cell_scores is not None:
-                    # Use cell_scores: higher score = more likely to be error
-                    num_true_errors = sum(ground_truth)
-                    threshold_k = min(num_true_errors, top_k) if num_true_errors > 0 else top_k
+                # Find optimal threshold per column to maximize F1-Score
+                best_thresholds = {}
+                best_f1_per_col = {}
+                
+                if cell_scores is not None and cell_scores.shape[0] >= num_rows_eval and cell_scores.shape[1] >= num_cols_eval:
+                    cell_scores_eval = cell_scores[:num_rows_eval, :num_cols_eval]
                     
-                    # Ensure cell_scores shape matches (num_rows, num_cols)
-                    num_rows_eval = len(dirty_rows_eval)
-                    num_cols_eval = len(dirty_rows_eval[0]) if dirty_rows_eval else 0
-                    
-                    if cell_scores.shape[0] >= num_rows_eval and cell_scores.shape[1] >= num_cols_eval:
-                        cell_scores_eval = cell_scores[:num_rows_eval, :num_cols_eval]
-                        flat_scores = cell_scores_eval.flatten()
-                        top_k_indices = np.argsort(flat_scores)[-threshold_k:][::-1]
+                    # For each column, find the optimal threshold
+                    for col_idx in range(num_cols_eval):
+                        col_scores = cell_scores_eval[:, col_idx]  # [num_rows]
+                        col_ground_truth = [ground_truth[r * num_cols_eval + col_idx] for r in range(num_rows_eval)]
                         
-                        for idx in top_k_indices:
-                            if idx < len(predictions):
-                                predictions[idx] = 1
+                        # Get unique score values to use as candidate thresholds
+                        unique_scores = np.sort(np.unique(col_scores))[::-1]  # Descending order
+                        
+                        best_f1 = -1
+                        best_thresh = unique_scores[0] if len(unique_scores) > 0 else 0
+                        
+                        # Try each unique score as a threshold
+                        for threshold in unique_scores:
+                            col_preds = [1 if score >= threshold else 0 for score in col_scores]
+                            
+                            # Compute F1 for this threshold
+                            tp = sum(1 for i in range(len(col_preds)) if col_preds[i] == 1 and col_ground_truth[i] == 1)
+                            fp = sum(1 for i in range(len(col_preds)) if col_preds[i] == 1 and col_ground_truth[i] == 0)
+                            fn = sum(1 for i in range(len(col_preds)) if col_preds[i] == 0 and col_ground_truth[i] == 1)
+                            
+                            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+                            
+                            if f1 > best_f1:
+                                best_f1 = f1
+                                best_thresh = threshold
+                        
+                        best_thresholds[col_idx] = best_thresh
+                        best_f1_per_col[col_idx] = best_f1
+                    
+                    # Apply per-column thresholds to generate predictions
+                    for r in range(num_rows_eval):
+                        for c in range(num_cols_eval):
+                            flat_idx = r * num_cols_eval + c
+                            score = cell_scores_eval[r, c]
+                            threshold = best_thresholds.get(c, 0)
+                            if score >= threshold:
+                                predictions[flat_idx] = 1
+                    
+                    # Print per-column thresholds and F1 scores
+                    print(f"\n  每列最优阈值及F1-Score:")
+                    for col_idx in range(num_cols_eval):
+                        col_name = column_names[col_idx] if column_names and col_idx < len(column_names) else f"Col{col_idx}"
+                        print(f"    {col_name}: 阈值={best_thresholds[col_idx]:.4f}, 列级F1={best_f1_per_col[col_idx]:.4f}")
+                
+                else:
+                    # Fallback: use global threshold on all cell_scores
+                    if cell_scores is not None:
+                        print(f"⚠️  无法逐列计算阈值，使用全局阈值")
+                        flat_scores = cell_scores.flatten()
+                        unique_scores = np.sort(np.unique(flat_scores))[::-1]
+                        
+                        best_f1 = -1
+                        best_global_thresh = unique_scores[0] if len(unique_scores) > 0 else 0
+                        
+                        for threshold in unique_scores:
+                            global_preds = [1 if score >= threshold else 0 for score in flat_scores]
+                            tp = sum(1 for i in range(len(global_preds)) if global_preds[i] == 1 and ground_truth[i] == 1)
+                            fp = sum(1 for i in range(len(global_preds)) if global_preds[i] == 1 and ground_truth[i] == 0)
+                            fn = sum(1 for i in range(len(global_preds)) if global_preds[i] == 0 and ground_truth[i] == 1)
+                            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+                            if f1 > best_f1:
+                                best_f1 = f1
+                                best_global_thresh = threshold
+                        
+                        predictions = [1 if score >= best_global_thresh else 0 for score in flat_scores]
+                        print(f"    全局最优阈值={best_global_thresh:.4f}, 全局F1={best_f1:.4f}")
                     else:
-                        # Fallback: use topk_cells if shape mismatch
-                        print(f"⚠️  cell_scores形状不匹配，使用topk_cells作为预测")
-                        for cell in deduped:
+                        # Last resort: use topk_cells
+                        print(f"⚠️  没有cell_scores可用，使用TopK预测")
+                        for cell in deduped[:top_k]:
                             row_idx = cell["row_idx"]
                             col_idx = cell["col_idx"]
                             if row_idx < num_rows_eval and col_idx < num_cols_eval:
                                 flat_idx = row_idx * num_cols_eval + col_idx
                                 if flat_idx < len(predictions):
                                     predictions[flat_idx] = 1
-                else:
-                    # Fallback: use topk_cells
-                    for cell in deduped:
-                        row_idx = cell["row_idx"]
-                        col_idx = cell["col_idx"]
-                        if row_idx < len(dirty_rows_eval) and col_idx < len(dirty_rows_eval[0]):
-                            num_cols = len(dirty_rows_eval[0])
-                            flat_idx = row_idx * num_cols + col_idx
-                            if flat_idx < len(predictions):
-                                predictions[flat_idx] = 1
                 
                 # Compute metrics
                 preds_tensor = torch.tensor(predictions, dtype=torch.int32)
@@ -1166,17 +1381,15 @@ def run_contrastive_two_stage_experiment(
     for batch_start in tqdm(range(0, num_rows, cache_batch_size), ncols=100, desc="缓存编码器输出"):
         batch_end = min(batch_start + cache_batch_size, num_rows)
 
-        # Prepare batch data (batched tabular processor)
-        batch_text_inputs = []
+        # Prepare batch data (batched tabular/text processors)
         batch_rows = [dirty_rows[row_idx] for row_idx in range(batch_start, batch_end)]
+        batch_texts = [text_descriptions[row_idx] for row_idx in range(batch_start, batch_end)]
+        batch_text_inputs = _process_texts_with_batch_support(text_processor, batch_texts)
         with torch.no_grad():
             tabular_batch = tabular_processor.process_batch(
                 batch_rows,
                 row_indices=[0] * len(batch_rows),
             )
-            for row_idx in range(batch_start, batch_end):
-                text_inputs = text_processor.process(text_descriptions[row_idx])
-                batch_text_inputs.append(text_inputs)
 
         if "cached_embedding" in batch_text_inputs[0]:
             text_batch = {"cached_embedding": torch.stack([x["cached_embedding"] for x in batch_text_inputs])}

@@ -79,10 +79,20 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         content = fp.read()
     # 支持 JSONC 格式（带注释的 JSON）
     content = _strip_json_comments(content)
-    return json.loads(content)
+    config = json.loads(content)
+
+    # 打印配置内容
+    print("\n" + "-" * 40)
+    print(f"加载配置文件: {config_path}")
+    print("配置内容 (Configuration):")
+    print("-" * 40)
+    print(json.dumps(config, indent=2, ensure_ascii=False))
+    print("-" * 40)
+
+    return config
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int = 42) -> None:
     """
     设置所有随机种子以确保实验可重现
 

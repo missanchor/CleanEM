@@ -315,6 +315,9 @@ class MaskedCellModelingDataset(Dataset):
         text_processor: Optional[TextProcessor] = None,
         cached_text_embeddings: Optional[Dict] = None,
         column_names: Optional[List[str]] = None,
+        col_is_numeric: Optional[List[bool]] = None,
+        column_value_to_id: Optional[List[Dict[str, int]]] = None,
+        unknown_token: str = "<UNK>",
         seed: Optional[int] = None,
     ):
         if len(dirty_rows) != len(text_descriptions):
@@ -330,10 +333,31 @@ class MaskedCellModelingDataset(Dataset):
         self.numeric_ratio_threshold = float(numeric_ratio_threshold)
         self.max_rows_for_type_inference = int(max_rows_for_type_inference)
         self.seed = seed
+        self.unknown_token = unknown_token
 
         self.num_cols = len(dirty_rows[0]) if dirty_rows else 0
         self.num_rows = len(dirty_rows)
-        self.col_is_numeric = self._infer_column_types()
+        if col_is_numeric is not None:
+            if self.num_cols and len(col_is_numeric) != self.num_cols:
+                raise ValueError("Length of col_is_numeric must match number of columns.")
+            self.col_is_numeric = list(col_is_numeric)
+        else:
+            self.col_is_numeric = self._infer_column_types()
+
+        if column_value_to_id is not None:
+            if self.num_cols and len(column_value_to_id) != self.num_cols:
+                raise ValueError("Length of column_value_to_id must match number of columns.")
+            self.column_value_to_id = [dict(mapping) for mapping in column_value_to_id]
+        else:
+            self.column_value_to_id = None
+
+        if self.column_value_to_id is not None:
+            self.column_unknown_ids = [
+                mapping.get(self.unknown_token) if isinstance(mapping, dict) else None
+                for mapping in self.column_value_to_id
+            ]
+        else:
+            self.column_unknown_ids: List[Optional[int]] = []
 
         if self.num_cols > 0 and self.num_rows > 0:
             if self.num_masked_cells is None:
@@ -493,7 +517,20 @@ class MaskedCellModelingDataset(Dataset):
             else:
                 target_types_list.append(0)
                 text_value = "" if v is None else str(v)
-                target_ids_list.append(self._stable_hash_to_bucket(text_value, vocab_size))
+                target_id: Optional[int] = None
+                if self.column_value_to_id and c < len(self.column_value_to_id):
+                    mapping = self.column_value_to_id[c] or {}
+                    target_id = mapping.get(text_value)
+                    if target_id is None:
+                        unknown_id = (
+                            self.column_unknown_ids[c]
+                            if c < len(self.column_unknown_ids)
+                            else None
+                        )
+                        target_id = unknown_id if unknown_id is not None else 0
+                if target_id is None:
+                    target_id = self._stable_hash_to_bucket(text_value, vocab_size)
+                target_ids_list.append(int(target_id))
                 target_nums_list.append(float("nan"))
 
         mask_indices = torch.tensor(mask_indices_list, dtype=torch.long)

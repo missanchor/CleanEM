@@ -417,9 +417,33 @@ class TextProcessor:
         else:
             attention_mask = [1] * seq_len
 
-        return {
+            return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        }
+
+    def process_batch(self, texts: List[str]) -> Dict[str, torch.Tensor]:
+        """批量处理文本，显著提高效率"""
+        if self.use_hf_tokenizer:
+            encoded = self.tokenizer(
+                texts,
+                truncation=True,
+                padding="max_length",
+                max_length=self.max_seq_len,
+                return_tensors="pt",
+            )
+            # 返回所有张量，保留 batch 维度
+            output: Dict[str, torch.Tensor] = {
+                k: v for k, v in encoded.items() if isinstance(v, torch.Tensor)
+            }
+            return output
+        
+        # 非 HF tokenizer 回退到循环处理并 stack
+        results = [self.process(t) for t in texts]
+        return {
+            k: torch.stack([r[k] for r in results])
+            for k in ["input_ids", "attention_mask"]
+            if k in results[0]
         }
 
 

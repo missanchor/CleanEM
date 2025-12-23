@@ -757,14 +757,11 @@ def train_step_mcm(
     target_nums = target_nums.to(head_device)
     target_types = target_types.to(head_device)
     
-    # Collect predictions for each masked position using the corresponding column head
-    cat_logits_list = []
-    num_pred_list = []
-    flat_types_list = []
-    flat_target_ids_list = []
-    flat_target_nums_list = []
+    # Collect predictions and losses for each masked position using the corresponding column head
+    # Since each column has a different vocab_size, we compute losses individually instead of stacking
+    cat_losses = []
+    num_losses = []
     
-    # Group masked positions by column for efficient batch processing
     # Process each masked position with its corresponding column head
     for b in range(B):
         for k in range(mask_indices_on_head.shape[1]):
@@ -772,47 +769,37 @@ def train_step_mcm(
             if col_idx < 0 or col_idx >= len(recon_heads):
                 continue
             
+            target_type = int(target_types[b, k].item())
+            
             # Extract column embedding for this batch item and column
             col_embedding = H_fuse[b:b+1, col_idx:col_idx+1, :]  # [1, 1, d_model]
             col_recon_head = recon_heads[col_idx]
             cat_logits_col, num_pred_col = col_recon_head(col_embedding)  # [1, 1, vocab_size], [1, 1]
             
-            cat_logits_list.append(cat_logits_col.squeeze(0).squeeze(0))  # [vocab_size]
-            num_pred_list.append(num_pred_col.squeeze(0).squeeze(0))  # [1] -> scalar
-            flat_types_list.append(target_types[b, k])
-            flat_target_ids_list.append(target_ids[b, k])
-            flat_target_nums_list.append(target_nums[b, k])
+            if target_type == 0:  # Categorical
+                target_id = target_ids[b, k:k+1]  # [1]
+                # cat_logits_col is [1, 1, vocab_size], squeeze to [vocab_size]
+                logits = cat_logits_col.squeeze(0).squeeze(0).unsqueeze(0)  # [1, vocab_size]
+                loss = F.cross_entropy(logits, target_id)
+                cat_losses.append(loss)
+            elif target_type == 1:  # Numeric
+                target_num = target_nums[b, k]
+                if torch.isfinite(target_num):
+                    pred = num_pred_col.squeeze(1).squeeze(0)  # scalar
+                    loss = (pred - target_num) ** 2
+                    num_losses.append(loss)
     
-    if len(cat_logits_list) == 0:
-        # No valid masked positions
+    if len(cat_losses) == 0:
+        # No valid categorical positions
         loss_cat = torch.tensor(0.0, device=head_device)
+    else:
+        loss_cat = torch.stack(cat_losses).mean()
+    
+    if len(num_losses) == 0:
+        # No valid numeric positions
         loss_num = torch.tensor(0.0, device=head_device)
     else:
-        # Stack predictions
-        flat_cat_logits = torch.stack(cat_logits_list)  # [K, vocab_size]
-        flat_num_pred = torch.stack(num_pred_list)  # [K]
-        flat_types = torch.stack(flat_types_list)  # [K]
-        flat_target_ids = torch.stack(flat_target_ids_list)  # [K]
-        flat_target_nums = torch.stack(flat_target_nums_list)  # [K]
-        
-        cat_mask = flat_types == 0
-        num_mask = flat_types == 1
-        
-        loss_cat = torch.tensor(0.0, device=head_device)
-        if torch.any(cat_mask):
-            loss_cat = F.cross_entropy(
-                flat_cat_logits[cat_mask],
-                flat_target_ids[cat_mask],
-            )
-        
-        loss_num = torch.tensor(0.0, device=head_device)
-        if torch.any(num_mask):
-            # targets for numeric positions should be finite; ignore NaNs if any slip through
-            pred = flat_num_pred[num_mask]
-            tgt = flat_target_nums[num_mask]
-            finite = torch.isfinite(tgt)
-            if torch.any(finite):
-                loss_num = F.mse_loss(pred[finite], tgt[finite])
+        loss_num = torch.stack(num_losses).mean()
 
     loss = (float(w_cat) * loss_cat) + (float(w_num) * loss_num)
 

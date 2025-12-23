@@ -17,8 +17,8 @@
     "vllm_model": "/mnt/data/welkinni/Qwen2.5-0.5B-Instruct/qwen/Qwen2.5-0.5B-Instruct",
     "generation_prompt_batch_size": 1024,
     "text_embedding_cache_path": "cache/hospital_mcm_text_embeds.pt",
-    "max_new_tokens": 1024,
-    "generation_row_batch_size": 32,
+    "max_new_tokens": 512,
+    "generation_row_batch_size": 64,
     "optimizer": {
       "type": "Adam",
       "params": {
@@ -66,12 +66,12 @@
     "scoring": {
       "batch_size": 64,
       "top_k": 50,
-      "return_cell_scores": false
+      "return_cell_scores": true
     }
   },
   "tabular_processor": {
     "d_cell": 4,
-    "use_column_names": false
+    "use_column_names": true
   },
   "text_processor": {
     "max_seq_len": 512,

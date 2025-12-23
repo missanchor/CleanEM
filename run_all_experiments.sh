@@ -63,11 +63,13 @@ HOSPITAL_EXIT=0
 if [ "$RUN_MODE" = "parallel" ]; then
   echo "⚠️  RUN_MODE=parallel：仅建议多 GPU 时使用，并手动设置 CUDA_VISIBLE_DEVICES 映射。"
 
-  CUDA_VISIBLE_DEVICES=0 run_one "beers" "$BEERS_CFG" "$BEERS_LOG" &
+  CUDA_VISIBLE_DEVICES=0,1 run_one "beers" "$BEERS_CFG" "$BEERS_LOG" &
   BEERS_PID=$!
-  CUDA_VISIBLE_DEVICES=1 run_one "flights" "$FLIGHTS_CFG" "$FLIGHTS_LOG" &
+  sleep 30
+  CUDA_VISIBLE_DEVICES=2,3 run_one "flights" "$FLIGHTS_CFG" "$FLIGHTS_LOG" &
   FLIGHTS_PID=$!
-  CUDA_VISIBLE_DEVICES=2 run_one "hospital" "$HOSPITAL_CFG" "$HOSPITAL_LOG" &
+  sleep 30
+  CUDA_VISIBLE_DEVICES=4,5 run_one "hospital" "$HOSPITAL_CFG" "$HOSPITAL_LOG" &
   HOSPITAL_PID=$!
 
   wait $BEERS_PID; BEERS_EXIT=$?
