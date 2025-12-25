@@ -692,9 +692,9 @@ class PretrainedTextEncoder(BaseEncoder):
                 row_prompts = {}
                 for col_idx, col_name in enumerate(column_names):
                     col_prompt = (
-                        f"Instruction: Check the consistency/errorneousness of this record on column '{col_name}'. "
+                        f"Instruction: Check for errors (missing, typo, column pattern violations, rule violations) in column '{col_name}' for this record. "
                         f"Record: {row_serialized}. "
-                        f"The summary consistency/errorneousness check result is:"
+                        f"The error checking analysis result is:"
                     )
                     row_prompts[col_idx] = col_prompt
                 per_column_prompts.append(row_prompts)

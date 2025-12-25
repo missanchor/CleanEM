@@ -1,12 +1,33 @@
 {
   "experiment": "mcm",
   "device_map": {
-    "default": "cuda:0"
+    "default": "cuda"
   },
   "seed": 42,
   "dataset": "hospital_error-01",
   "data_path": "data/hospital_error-01.csv",
+  "column_types": {
+    "ProviderNumber": "categorical",
+    "HospitalName": "categorical",
+    "Address": "categorical",
+    "City": "categorical",
+    "State": "categorical",
+    "ZipCode": "categorical",
+    "CountyName": "categorical",
+    "PhoneNumber": "categorical",
+    "HospitalType": "categorical",
+    "HospitalOwner": "categorical",
+    "EmergencyService": "categorical",
+    "Condition": "categorical",
+    "MeasureCode": "categorical",
+    "MeasureName": "categorical",
+    "Score": "categorical",
+    "Sample": "categorical",
+    "Stateavg": "categorical"
+  },
   "mcm": {
+    "use_direct_comparison": true,        
+    "numeric_tolerance": 0.1,             
     "num_epochs": 200,
     "batch_size": 32,
     "mask_ratio": 0.2,

@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 
 from .evaluation import _compute_classification_metrics, _evaluate_threshold_with_scores
@@ -255,7 +256,7 @@ def evaluate_per_column_model(
     all_targets: List[int] = []
     all_cols: List[int] = []
 
-    for row_idx, (dirty_row, text) in enumerate(zip(eval_dataset.dirty_rows, eval_dataset.text_descriptions)):
+    for row_idx, (dirty_row, text) in enumerate(tqdm(zip(eval_dataset.dirty_rows, eval_dataset.text_descriptions), desc="评估行", ncols=100)):
         with torch.no_grad():
             tabular_inputs = eval_dataset.tabular_processor.process(
                 dirty_row, row_idx=row_idx, column_names=eval_dataset.column_names

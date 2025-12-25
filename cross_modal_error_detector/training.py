@@ -5,6 +5,7 @@ Collate utilities and training steps for different strategies.
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from .model import CrossModalErrorDetector
@@ -561,8 +562,10 @@ def train_step_mcm(
     Args:
         recon_heads: nn.ModuleList of per-column reconstruction heads
     """
-    device = device or "cpu"
-    tabular_device = fusion_device = head_device = text_device = device
+    # 使用统一的runtime_device，确保整个流程设备一致性
+    runtime_device = resolve_runtime_device(device)
+    # 所有组件都使用统一的runtime_device
+    tabular_device = fusion_device = head_device = text_device = runtime_device
 
     tabular_encoder.train()
     fusion_module.train()
@@ -617,16 +620,11 @@ def train_step_mcm(
                     # Full sequence [B, seq_len, d_model] - extract last token
                     H_text_col = H_text_col[:, -1, :]  # [B, d_model]
                 H_text_col = H_text_col.to(fusion_device)
-            elif "raw_text" in col_text_input:
-                # Process raw text through text_processor then text_encoder
-                processed = text_encoder.process(col_text_input["raw_text"])
-                col_text_input_device = _move_to_device(processed, text_device)
-                H_text_col = text_encoder(col_text_input_device).to(fusion_device)
             else:
                 col_text_input_device = _move_to_device(col_text_input, text_device)
                 H_text_col = text_encoder(col_text_input_device).to(fusion_device)
             
-            # Extract last token embedding (TimeCMA strategy)
+            # Extract last token embedding
             # The last token embedding represents LLM's response to the instruction
             # This is the "output" of the instruction, capturing LLM's understanding
             # H_text_col shape: [B, seq_len, d_model]
@@ -694,7 +692,7 @@ def train_step_mcm(
         # For each column, use its corresponding text embedding
         # Create H_text with shape [B, C, d_model] where each column uses its own text embedding
         H_text_expanded = torch.zeros((B, C, d_model), device=fusion_device, dtype=H_table.dtype)
-        
+
         # Fill in per-column text embeddings
         for col_idx, H_text_col in per_column_text_embeddings.items():
             if col_idx >= 0 and col_idx < C:
@@ -704,7 +702,7 @@ def train_step_mcm(
                 elif H_text_col.dim() == 1:
                     # Single embedding, expand to batch
                     H_text_expanded[:, col_idx, :] = H_text_col.unsqueeze(0).expand(B, -1)
-        
+
         # For columns without per-column embeddings, use the first available or mean
         for c in range(C):
             if H_text_expanded[:, c, :].sum() == 0:  # Not set yet
@@ -733,7 +731,7 @@ def train_step_mcm(
             text_encoder = text_encoder.to(text_device)
             text_inputs_device = _move_to_device(text_inputs, text_device)
             H_text = text_encoder(text_inputs_device).to(fusion_device)
-            # Extract last token embedding (TimeCMA strategy)
+            # Extract last token embedding
             if H_text.dim() == 3:
                 H_text = H_text[:, -1, :]  # [B, d_model]
         
@@ -743,7 +741,37 @@ def train_step_mcm(
         else:
             H_text_expanded = H_text
     
-    H_fuse = fusion_module(H_table, H_text_expanded).to(head_device)  # [B, C, d_model]
+    # Apply fusion: check if using per-column fusion modules
+    if isinstance(fusion_module, nn.ModuleList):
+        # Per-column fusion: apply fusion per column, only for masked positions
+        # Initialize H_fuse with zeros, will be filled for masked positions
+        B, C, d_model = H_table.shape
+        H_fuse = torch.zeros((B, C, d_model), device=fusion_device, dtype=H_table.dtype)
+
+        # Process each masked position with its corresponding column fusion module
+        for b in range(B):
+            for k in range(mask_indices.shape[1]):
+                col_idx = int(mask_indices[b, k].item())
+                if col_idx >= 0 and col_idx < C:
+                    # Extract column embeddings
+                    col_table_embed = H_table[b:b+1, col_idx:col_idx+1, :]  # [1, 1, d_model]
+
+                    # Get corresponding text embedding for this column
+                    if per_column_text_embeddings and col_idx in per_column_text_embeddings:
+                        col_text_emb = per_column_text_embeddings[col_idx][b:b+1]  # [1, d_model]
+                    else:
+                        col_text_emb = H_text_expanded[b:b+1, col_idx:col_idx+1, :]  # [1, 1, d_model]
+                        if col_text_emb.dim() == 3:
+                            col_text_emb = col_text_emb.squeeze(1)  # [1, d_model]
+
+                    # Apply per-column fusion
+                    col_fused = fusion_module[col_idx](col_table_embed, col_text_emb.unsqueeze(1))  # [1, 1, d_model]
+                    H_fuse[b, col_idx:col_idx+1, :] = col_fused
+    else:
+        # Shared fusion module: compute for all columns
+        H_fuse = fusion_module(H_table, H_text_expanded).to(head_device)  # [B, C, d_model]
+
+    H_fuse = H_fuse.to(head_device)
 
     # Move recon_heads to device
     if isinstance(recon_heads, torch.nn.ModuleList):
@@ -756,50 +784,65 @@ def train_step_mcm(
     target_ids = target_ids.to(head_device)
     target_nums = target_nums.to(head_device)
     target_types = target_types.to(head_device)
-    
-    # Collect predictions and losses for each masked position using the corresponding column head
-    # Since each column has a different vocab_size, we compute losses individually instead of stacking
-    cat_losses = []
-    num_losses = []
-    
-    # Process each masked position with its corresponding column head
-    for b in range(B):
-        for k in range(mask_indices_on_head.shape[1]):
-            col_idx = int(mask_indices_on_head[b, k].item())
-            if col_idx < 0 or col_idx >= len(recon_heads):
-                continue
-            
-            target_type = int(target_types[b, k].item())
-            
-            # Extract column embedding for this batch item and column
-            col_embedding = H_fuse[b:b+1, col_idx:col_idx+1, :]  # [1, 1, d_model]
-            col_recon_head = recon_heads[col_idx]
-            cat_logits_col, num_pred_col = col_recon_head(col_embedding)  # [1, 1, vocab_size], [1, 1]
-            
-            if target_type == 0:  # Categorical
-                target_id = target_ids[b, k:k+1]  # [1]
-                # cat_logits_col is [1, 1, vocab_size], squeeze to [vocab_size]
-                logits = cat_logits_col.squeeze(0).squeeze(0).unsqueeze(0)  # [1, vocab_size]
-                loss = F.cross_entropy(logits, target_id)
-                cat_losses.append(loss)
-            elif target_type == 1:  # Numeric
-                target_num = target_nums[b, k]
-                if torch.isfinite(target_num):
-                    pred = num_pred_col.squeeze(1).squeeze(0)  # scalar
-                    loss = (pred - target_num) ** 2
-                    num_losses.append(loss)
-    
-    if len(cat_losses) == 0:
-        # No valid categorical positions
+
+    # Verify single-column training mode (all rows must mask the same column)
+    def _is_single_column_mask(mask_indices):
+        """Check if all rows mask the same column"""
+        if mask_indices.numel() == 0:
+            return True
+        unique_indices = torch.unique(mask_indices)
+        return len(unique_indices) <= 1
+
+    if not _is_single_column_mask(mask_indices_on_head):
+        raise ValueError(
+            f"train_step_mcm requires single-column training mode. "
+            f"All rows in the batch must mask the same column, "
+            f"but got mask_indices with unique values: {torch.unique(mask_indices_on_head).tolist()}. "
+            f"Please ensure your dataset sets fixed_mask_column before training."
+        )
+
+    # Single-column training: all rows mask the same column
+    col_idx = int(mask_indices_on_head[0, 0].item()) if mask_indices_on_head.numel() > 0 else 0
+
+    if col_idx < 0 or col_idx >= len(recon_heads):
         loss_cat = torch.tensor(0.0, device=head_device)
-    else:
-        loss_cat = torch.stack(cat_losses).mean()
-    
-    if len(num_losses) == 0:
-        # No valid numeric positions
         loss_num = torch.tensor(0.0, device=head_device)
     else:
-        loss_num = torch.stack(num_losses).mean()
+        # Extract column embeddings for all rows at once
+        col_embeddings = H_fuse[:, col_idx:col_idx+1, :]  # [B, 1, d_model]
+        col_recon_head = recon_heads[col_idx]
+        cat_logits, num_preds = col_recon_head(col_embeddings)  # [B, 1, vocab_size], [B, 1]
+
+        # Extract targets for this column
+        target_ids_col = target_ids[:, 0] if target_ids.shape[1] > 0 else target_ids.new_zeros(B)
+        target_nums_col = target_nums[:, 0] if target_nums.shape[1] > 0 else target_nums.new_zeros(B)
+        target_types_col = target_types[:, 0] if target_types.shape[1] > 0 else target_types.new_zeros(B)
+
+        # Vectorized loss computation
+        cat_mask = (target_types_col == 0)
+        num_mask = (target_types_col == 1)
+
+        # Categorical loss
+        if cat_mask.any():
+            loss_cat = F.cross_entropy(
+                cat_logits[cat_mask].squeeze(1),  # [N, vocab_size]
+                target_ids_col[cat_mask]  # [N]
+            )
+        else:
+            loss_cat = torch.tensor(0.0, device=head_device)
+
+        # Numeric loss
+        if num_mask.any():
+            finite_mask = torch.isfinite(target_nums_col[num_mask])
+            if finite_mask.any():
+                loss_num = F.mse_loss(
+                    num_preds[num_mask][finite_mask].squeeze(),
+                    target_nums_col[num_mask][finite_mask]
+                )
+            else:
+                loss_num = torch.tensor(0.0, device=head_device)
+        else:
+            loss_num = torch.tensor(0.0, device=head_device)
 
     loss = (float(w_cat) * loss_cat) + (float(w_num) * loss_num)
 

@@ -1,12 +1,22 @@
 {
   "experiment": "mcm",
   "device_map": {
-    "default": "cuda:0"
+    "default": "cuda"
   },
   "seed": 42,
   "dataset": "flights_error-01",
   "data_path": "data/flights_error-01.csv",
+  "column_types": {
+    "src": "categorical",
+    "flight": "categorical",
+    "sched_dep_time": "categorical",
+    "act_dep_time": "categorical",
+    "sched_arr_time": "categorical",
+    "act_arr_time": "categorical"
+  },
   "mcm": {
+    "use_direct_comparison": true,        
+    "numeric_tolerance": 0.1,  
     "num_epochs": 200,
     "batch_size": 32,
     "mask_ratio": 0.2,

@@ -319,6 +319,7 @@ class MaskedCellModelingDataset(Dataset):
         column_value_to_id: Optional[List[Dict[str, int]]] = None,
         unknown_token: str = "<UNK>",
         seed: Optional[int] = None,
+        fixed_mask_column: Optional[int] = None,  # 新增：固定mask单列
     ):
         if len(dirty_rows) != len(text_descriptions):
             raise ValueError("dirty_rows 与 text_descriptions 的长度不一致，无法对齐。")
@@ -334,6 +335,7 @@ class MaskedCellModelingDataset(Dataset):
         self.max_rows_for_type_inference = int(max_rows_for_type_inference)
         self.seed = seed
         self.unknown_token = unknown_token
+        self.fixed_mask_column = fixed_mask_column  # 新增：固定mask列
 
         self.num_cols = len(dirty_rows[0]) if dirty_rows else 0
         self.num_rows = len(dirty_rows)
@@ -431,7 +433,6 @@ class MaskedCellModelingDataset(Dataset):
             row_payload["column_names"] = self.column_names
 
         # Generate per-column text prompts for each column
-        # Format: Instruction-based prompt following TimeCMA strategy
         # Serialize row data: "Attribute: Value, Attribute: Value..."
         row_serialized = ", ".join([
             f"{self.column_names[c] if self.column_names and c < len(self.column_names) else f'Col{c}'}: {row[c]}"
@@ -452,9 +453,9 @@ class MaskedCellModelingDataset(Dataset):
             # The LLM processes this instruction and outputs embeddings
             # Last token embedding captures LLM's response to the instruction
             col_prompt = (
-                f"Instruction: Check the consistency/errorneousness of this record on column '{col_name}'. "
+                f"Instruction: Check for errors (missing, typo, column pattern violations, rule violations) in column '{col_name}' for this record. "
                 f"Record: {row_serialized}. "
-                f"The summary consistency/errorneousness check result is:"
+                f"The error checking analysis result is:"
             )
 
             cache_key = (idx, col_idx)
@@ -495,10 +496,15 @@ class MaskedCellModelingDataset(Dataset):
             target_types = torch.empty((0,), dtype=torch.long)
             return row_payload, text_inputs, mask_indices, target_ids, target_nums, target_types
 
-        # 使用每行固定的掩码数量
-        k = self.cells_per_row
-        chosen = rng.sample(range(self.num_cols), k=k)
-        mask_indices_list = list(chosen)
+        # 掩码策略：单列或多列
+        if self.fixed_mask_column is not None:
+            # 单列训练：所有行都mask同一列
+            mask_indices_list = [self.fixed_mask_column]
+        else:
+            # 原始策略：每行随机mask多列
+            k = self.cells_per_row
+            chosen = rng.sample(range(self.num_cols), k=k)
+            mask_indices_list = list(chosen)
 
         vocab_size = int(getattr(self.tabular_processor, "vocab_size", 10000))
         num_numeric_bins = int(getattr(self.tabular_processor, "num_numeric_bins", 1000))

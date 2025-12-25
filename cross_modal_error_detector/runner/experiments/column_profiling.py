@@ -10,6 +10,7 @@ from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from tqdm import tqdm
 
 from .data_utils import _safe_str, _try_parse_float
 from .types import _ColumnProfile
@@ -71,7 +72,7 @@ def _build_column_profiles(
         return []
     num_cols = len(clean_rows[0])
     profiles: List[_ColumnProfile] = []
-    for col_idx in range(num_cols):
+    for col_idx in tqdm(range(num_cols), desc="构建列分析", ncols=100):
         name = (
             column_names[col_idx]
             if column_names and col_idx < len(column_names)

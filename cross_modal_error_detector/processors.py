@@ -2,7 +2,6 @@
 Data processing utilities.
 """
 
-import hashlib
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -12,7 +11,9 @@ import torch.nn as nn
 class TabularProcessor(nn.Module):
     """
     Converts raw table rows into tensor inputs.
-    Supports both cell-value-only and col_name+col_value modes.
+
+    Each categorical column has its own learnable embedding table (no hash collision).
+    Numeric columns use linear projection.
     """
 
     def __init__(
@@ -20,16 +21,21 @@ class TabularProcessor(nn.Module):
         num_numeric_bins: int = 1000,
         d_cell: int = 8,
         use_column_names: bool = True,
-        vocab_size: int = 10000,
-        numeric_embedding_dim: int = 16
+        vocab_size: int = 10000,  # kept for backward compat, not used for per-column embeddings
+        numeric_embedding_dim: int = 16,
+        unknown_token: str = "<UNK>",
     ):
         super().__init__()
         self.num_numeric_bins = num_numeric_bins
         self.d_cell = d_cell
         self.use_column_names = use_column_names
-        self.column_name_to_id: Dict[str, int] = {}
-        self.vocab_size = vocab_size
+        self.vocab_size = vocab_size  # backward compat
         self.numeric_embedding_dim = numeric_embedding_dim
+        self.unknown_token = unknown_token
+
+        # Column name related
+        self.column_name_to_id: Dict[str, int] = {}
+        self.num_cols: int = 0
 
         if self.use_column_names:
             self.d_name = max(1, d_cell // 2)
@@ -37,16 +43,18 @@ class TabularProcessor(nn.Module):
             self.d_name = 0
         self.d_value = d_cell - self.d_name
 
+        # Column name embedding (shared across all rows)
         self.column_embedding: Optional[nn.Embedding] = None
 
-        # String value embedding
-        self.string_embedding = nn.Embedding(vocab_size, self.d_value)
-        nn.init.xavier_uniform_(self.string_embedding.weight)
+        # Per-column value embeddings for categorical columns
+        # Will be initialized when column vocabularies are registered
+        self.per_column_value_embeddings: nn.ModuleList = nn.ModuleList()
+        self.per_column_value_to_id: List[Dict[str, int]] = []
+        self.per_column_is_numeric: List[bool] = []
+        self._columns_initialized: bool = False
 
-        # Numeric embedding layer
+        # Numeric embedding layers (shared across all numeric columns)
         self.numeric_embedding = nn.Linear(1, numeric_embedding_dim)
-
-        # Project numeric embedding to match d_value
         self.numeric_projection = nn.Linear(numeric_embedding_dim, self.d_value)
 
         # Interaction / projection layers
@@ -72,22 +80,234 @@ class TabularProcessor(nn.Module):
             )
 
     def _infer_device(self) -> torch.device:
-        # string_embedding always exists, so we can reliably infer device from it
-        return self.string_embedding.weight.device
+        return self.numeric_embedding.weight.device
 
     @property
     def device(self) -> torch.device:
         return self._infer_device()
 
+    def register_column_vocabularies(
+        self,
+        column_names: List[str],
+        column_value_to_id: List[Dict[str, int]],
+        col_is_numeric: Optional[List[bool]] = None,
+    ) -> None:
+        """
+        Register per-column vocabularies and create embedding tables.
+
+        Must be called before processing data.
+
+        Args:
+            column_names: List of column names
+            column_value_to_id: Per-column mapping from value -> id
+            col_is_numeric: Per-column flag indicating if column is numeric
+        """
+        device = self._infer_device()
+        num_cols = len(column_names)
+        self.num_cols = num_cols
+
+        # Register column names
+        self.column_name_to_id = {name: idx for idx, name in enumerate(column_names)}
+        if self.d_name > 0:
+            self.column_embedding = nn.Embedding(num_cols, self.d_name).to(device)
+            nn.init.xavier_uniform_(self.column_embedding.weight)
+
+        # Store per-column info
+        self.per_column_value_to_id = column_value_to_id
+        self.per_column_is_numeric = col_is_numeric if col_is_numeric else [False] * num_cols
+
+        # Create per-column embedding tables
+        self.per_column_value_embeddings = nn.ModuleList()
+        for col_idx in range(num_cols):
+            if self.per_column_is_numeric[col_idx]:
+                # Numeric column: no embedding table needed, use linear projection
+                # Add a placeholder to keep indices aligned
+                self.per_column_value_embeddings.append(nn.Identity())
+            else:
+                # Categorical column: create embedding table
+                vocab = column_value_to_id[col_idx] if col_idx < len(column_value_to_id) else {}
+                vocab_size = max(1, len(vocab))
+                embedding = nn.Embedding(vocab_size, self.d_value).to(device)
+                nn.init.xavier_uniform_(embedding.weight)
+                self.per_column_value_embeddings.append(embedding)
+
+        self._columns_initialized = True
+        print(f"✓ TabularProcessor: 注册了 {num_cols} 列的词汇表")
+        for col_idx, name in enumerate(column_names):
+            if self.per_column_is_numeric[col_idx]:
+                print(f"    {name}: 数值列 (线性投影)")
+            else:
+                vocab_size = len(column_value_to_id[col_idx]) if col_idx < len(column_value_to_id) else 0
+                print(f"    {name}: 分类列 (vocab_size={vocab_size})")
+
+    def _get_or_register_column_ids(self, column_names: List[str]) -> torch.Tensor:
+        """Get column IDs, auto-register if not initialized."""
+        device = self._infer_device()
+
+        if not self.column_name_to_id:
+            # Auto-register columns (backward compatibility)
+            for idx, name in enumerate(column_names):
+                self.column_name_to_id[name] = idx
+            self.num_cols = len(column_names)
+            if self.d_name > 0:
+                self.column_embedding = nn.Embedding(len(self.column_name_to_id), self.d_name).to(device)
+                nn.init.xavier_uniform_(self.column_embedding.weight)
+        else:
+            unknown = [name for name in column_names if name not in self.column_name_to_id]
+            if unknown:
+                raise ValueError(f"检测到未知列名: {unknown}. 请提前注册所有列名。")
+
+        ids = [self.column_name_to_id[name] for name in column_names]
+        return torch.tensor(ids, dtype=torch.long, device=device)
+
+    def _embed_value_for_column(
+        self,
+        value: Any,
+        col_idx: int,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Embed a single cell value using the appropriate column embedding.
+
+        Args:
+            value: Cell value
+            col_idx: Column index
+            device: Target device
+
+        Returns:
+            Tensor of shape [d_value]
+        """
+        # Check if column is numeric
+        is_numeric_col = (
+            col_idx < len(self.per_column_is_numeric)
+            and self.per_column_is_numeric[col_idx]
+        )
+
+        # Check if value itself is numeric
+        is_numeric_value = isinstance(value, (int, float)) and not isinstance(value, bool)
+
+        if is_numeric_col or is_numeric_value:
+            # Numeric: use linear projection
+            if is_numeric_value:
+                numeric_value = float(value)
+            else:
+                # Try to parse string as number
+                try:
+                    numeric_value = float(value) if value is not None else 0.0
+                except (ValueError, TypeError):
+                    numeric_value = 0.0
+
+            normalized = (numeric_value % self.num_numeric_bins) / self.num_numeric_bins
+            numeric_input = torch.tensor([[normalized]], dtype=torch.float32, device=device)
+            numeric_hidden = self.numeric_embedding(numeric_input)
+            numeric_output = self.numeric_projection(numeric_hidden)
+            return numeric_output.squeeze(0)
+
+        # Categorical: use per-column embedding table
+        text_value = "" if value is None else str(value)
+
+        if self._columns_initialized and col_idx < len(self.per_column_value_to_id):
+            vocab = self.per_column_value_to_id[col_idx]
+            value_id = vocab.get(text_value)
+            if value_id is None:
+                # Unknown value: use UNK token or fallback to 0
+                value_id = vocab.get(self.unknown_token, 0)
+
+            embedding_table = self.per_column_value_embeddings[col_idx]
+            if isinstance(embedding_table, nn.Embedding):
+                value_id_tensor = torch.tensor(value_id, dtype=torch.long, device=device)
+                return embedding_table(value_id_tensor)
+
+        # Fallback: return zeros (should not happen if properly initialized)
+        return torch.zeros(self.d_value, dtype=torch.float32, device=device)
+
+    def _embed_values_flat_per_column(
+        self,
+        values: List[Any],
+        col_indices: List[int],
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Vectorized embedding for a flat list of values with their column indices.
+
+        Args:
+            values: Flat list of values (length N)
+            col_indices: Column index for each value (length N)
+            device: Target device
+
+        Returns:
+            Tensor of shape [N, d_value]
+        """
+        n = len(values)
+        if n == 0:
+            return torch.empty((0, self.d_value), dtype=torch.float32, device=device)
+
+        embeddings = []
+        for i, (value, col_idx) in enumerate(zip(values, col_indices)):
+            emb = self._embed_value_for_column(value, col_idx, device)
+            embeddings.append(emb)
+
+        return torch.stack(embeddings, dim=0)
+
+    def _embed_values_flat(self, values: List[Any], *, device: torch.device) -> torch.Tensor:
+        """
+        Vectorized embedding for a flat list of values.
+
+        Note: This method assumes values are in row-major order (all cols of row 0, then row 1, etc.)
+        """
+        n = len(values)
+        if n == 0:
+            return torch.empty((0, self.d_value), dtype=torch.float32, device=device)
+
+        if not self._columns_initialized or self.num_cols == 0:
+            # Fallback: treat all as numeric or use zeros
+            embeddings = []
+            for v in values:
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    normalized = (float(v) % self.num_numeric_bins) / self.num_numeric_bins
+                    numeric_input = torch.tensor([[normalized]], dtype=torch.float32, device=device)
+                    numeric_hidden = self.numeric_embedding(numeric_input)
+                    numeric_output = self.numeric_projection(numeric_hidden)
+                    embeddings.append(numeric_output.squeeze(0))
+                else:
+                    embeddings.append(torch.zeros(self.d_value, dtype=torch.float32, device=device))
+            return torch.stack(embeddings, dim=0)
+
+        # Compute column indices for each value
+        col_indices = [i % self.num_cols for i in range(n)]
+        return self._embed_values_flat_per_column(values, col_indices, device)
+
+    def _embed_row_values(self, row_data: List[Any], *, device: torch.device) -> torch.Tensor:
+        """
+        Embed all values in a single row.
+
+        Args:
+            row_data: List of cell values
+            device: Target device
+
+        Returns:
+            Tensor of shape [num_cols, d_value]
+        """
+        num_cols = len(row_data)
+        if num_cols == 0:
+            return torch.empty((0, self.d_value), dtype=torch.float32, device=device)
+
+        embeddings = []
+        for col_idx, value in enumerate(row_data):
+            emb = self._embed_value_for_column(value, col_idx, device)
+            embeddings.append(emb)
+
+        return torch.stack(embeddings, dim=0)
+
     def process(
-        self, 
-        row_data: List[Any], 
+        self,
+        row_data: List[Any],
         row_idx: int = 0,
         column_names: Optional[List[str]] = None
     ) -> Dict[str, torch.Tensor]:
         num_cols = len(row_data)
         device = self._infer_device()
-        
+
         # Use column names if provided and enabled
         name_embeddings = None
         if self.use_column_names and column_names is not None and self.d_name > 0:
@@ -210,141 +430,6 @@ class TabularProcessor(nn.Module):
             "col_indices": col_idx_tensor,
         }
 
-    def _get_or_register_column_ids(self, column_names: List[str]) -> torch.Tensor:
-        device = self._infer_device()
-        if not self.column_name_to_id:
-            for idx, name in enumerate(column_names):
-                self.column_name_to_id[name] = idx
-            self.column_embedding = nn.Embedding(len(self.column_name_to_id), self.d_name).to(device)
-            nn.init.xavier_uniform_(self.column_embedding.weight)
-        else:
-            unknown = [name for name in column_names if name not in self.column_name_to_id]
-            if unknown:
-                raise ValueError(f"检测到未知列名: {unknown}. 请提前注册所有列名。")
-
-        ids = [self.column_name_to_id[name] for name in column_names]
-        return torch.tensor(ids, dtype=torch.long, device=device)
-
-    def _stable_hash_to_bucket(self, text: str) -> int:
-        digest = hashlib.md5(text.encode("utf-8")).hexdigest()
-        return int(digest[:8], 16) % self.vocab_size
-
-    def _embed_values_flat(self, values: List[Any], *, device: torch.device) -> torch.Tensor:
-        """
-        Vectorized embedding for a flat list of values (N, d_value).
-        """
-        n = len(values)
-        if n == 0:
-            return torch.empty((0, self.d_value), dtype=torch.float32, device=device)
-
-        numeric_mask_list: List[bool] = []
-        numeric_vals: List[float] = []
-        string_ids: List[int] = []
-
-        for v in values:
-            is_num = isinstance(v, (int, float))
-            numeric_mask_list.append(is_num)
-            if is_num:
-                numeric_value = float(v)
-                normalized = (numeric_value % self.num_numeric_bins) / self.num_numeric_bins
-                numeric_vals.append(normalized)
-                string_ids.append(0)
-            else:
-                numeric_vals.append(0.0)
-                text_value = "" if v is None else str(v)
-                string_ids.append(self._stable_hash_to_bucket(text_value))
-
-        numeric_mask = torch.tensor(numeric_mask_list, dtype=torch.bool, device=device)
-        numeric_tensor = torch.tensor(numeric_vals, dtype=torch.float32, device=device).unsqueeze(1)  # [N, 1]
-        string_ids_tensor = torch.tensor(string_ids, dtype=torch.long, device=device)  # [N]
-
-        numeric_hidden = self.numeric_embedding(numeric_tensor)  # [N, numeric_embedding_dim]
-        numeric_output = self.numeric_projection(numeric_hidden)  # [N, d_value]
-        string_output = self.string_embedding(string_ids_tensor)  # [N, d_value]
-
-        return torch.where(numeric_mask.unsqueeze(1), numeric_output, string_output)
-
-    def _embed_row_values(self, row_data: List[Any], *, device: torch.device) -> torch.Tensor:
-        """
-        Vectorized embedding for a full row (num_cols, d_value).
-
-        - Numeric cells: Linear projection of normalized scalar.
-        - Non-numeric cells: Hashed bucket lookup into a learned nn.Embedding.
-        """
-        num_cols = len(row_data)
-        if num_cols == 0:
-            return torch.empty((0, self.d_value), dtype=torch.float32, device=device)
-
-        numeric_mask_list: List[bool] = []
-        numeric_vals: List[float] = []
-        string_ids: List[int] = []
-
-        for v in row_data:
-            is_num = isinstance(v, (int, float))
-            numeric_mask_list.append(is_num)
-            if is_num:
-                numeric_value = float(v)
-                normalized = (numeric_value % self.num_numeric_bins) / self.num_numeric_bins
-                numeric_vals.append(normalized)
-                string_ids.append(0)
-            else:
-                numeric_vals.append(0.0)
-                text_value = "" if v is None else str(v)
-                string_ids.append(self._stable_hash_to_bucket(text_value))
-
-        numeric_mask = torch.tensor(numeric_mask_list, dtype=torch.bool, device=device)
-        numeric_tensor = torch.tensor(numeric_vals, dtype=torch.float32, device=device).unsqueeze(1)  # [N, 1]
-        string_ids_tensor = torch.tensor(string_ids, dtype=torch.long, device=device)  # [N]
-
-        numeric_hidden = self.numeric_embedding(numeric_tensor)  # [N, numeric_embedding_dim]
-        numeric_output = self.numeric_projection(numeric_hidden)  # [N, d_value]
-        string_output = self.string_embedding(string_ids_tensor)  # [N, d_value]
-
-        # select per-cell based on numeric_mask
-        value_embeddings = torch.where(numeric_mask.unsqueeze(1), numeric_output, string_output)
-        return value_embeddings
-
-    def _embed_cell_value(self, value: Any) -> torch.Tensor:
-        """
-        Embed a cell value using appropriate embedding based on type.
-
-        For numeric values: use linear transformation that preserves magnitude relationships
-        For string values: use learned embedding that captures semantic similarity
-
-        Args:
-            value: The cell value to embed
-
-        Returns:
-            torch.Tensor: Embedded representation of shape (d_value,)
-        """
-        device = self._infer_device()
-        if self.d_value == 0:
-            return torch.empty(0, dtype=torch.float32, device=device)
-
-        if isinstance(value, (int, float)):
-            # Use linear embedding for numeric values
-            # Normalize to [0, 1] and then apply linear transformation
-            numeric_value = float(value)
-            normalized = (numeric_value % self.num_numeric_bins) / self.num_numeric_bins
-
-            # Apply linear transformation to preserve magnitude relationships
-            numeric_input = torch.tensor([[normalized]], dtype=torch.float32, device=device)
-            numeric_hidden = self.numeric_embedding(numeric_input)
-            numeric_output = self.numeric_projection(numeric_hidden)
-
-            return numeric_output.squeeze(0)
-
-        # Handle string values using learned embedding
-        text_value = "" if value is None else str(value)
-
-        # Hash string to vocabulary index
-        string_id = self._stable_hash_to_bucket(text_value)
-
-        # Get embedding for string
-        string_embedding = self.string_embedding(torch.tensor(string_id, dtype=torch.long, device=device))
-
-        return string_embedding
-
 
 class TextProcessor:
     """
@@ -437,7 +522,7 @@ class TextProcessor:
                 k: v for k, v in encoded.items() if isinstance(v, torch.Tensor)
             }
             return output
-        
+
         # 非 HF tokenizer 回退到循环处理并 stack
         results = [self.process(t) for t in texts]
         return {
@@ -448,5 +533,3 @@ class TextProcessor:
 
 
 __all__ = ["TabularProcessor", "TextProcessor"]
-
-

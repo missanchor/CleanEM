@@ -155,6 +155,15 @@ def main(config_path: Path) -> None:
             summary["错误检测F1"] = f"{eval_metrics.get('f1', 0.0):.2%}"
             summary["Top-K Cells"] = len(results.get("mcm_topk_cells", []))
         _print_summary("MCM (Masked Cell Modeling)", summary)
+
+        # Print detailed per-column analysis after summary
+        detailed_analysis = results.get("mcm_detailed_analysis")
+        if detailed_analysis:
+            print("\n" + "=" * 80)
+            print("逐列详细分析:")
+            print("=" * 80)
+            for line in detailed_analysis:
+                print(line)
     else:
         raise ValueError(
             f"不支持的实验类型：{experiment}. "
@@ -169,7 +178,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/hospital_mcm_experiment.json"),
+        default=Path("configs/beers_mcm_experiment.json"),
         help="配置文件路径（每个配置对应一个实验）",
     )
     args = parser.parse_args()

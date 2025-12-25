@@ -404,6 +404,7 @@ def run_mcm_experiment(
     from ..components import ENCODER_REGISTRY, FUSION_REGISTRY, DETECTION_HEAD_REGISTRY, build_component, build_optimizer
     from ...datasets import MaskedCellModelingDataset
     from ...training import collate_fn_mcm, train_step_mcm
+    from ...fusion import CrossAttentionFusion, SimpleConcatFusion
 
     mcm_cfg: Dict[str, Any] = exp_cfg.get("mcm", {})
     batch_size = int(mcm_cfg.get("batch_size", exp_cfg.get("batch_size", 32)))
@@ -415,6 +416,10 @@ def run_mcm_experiment(
     unknown_token = str(mcm_cfg.get("unknown_token", "<UNK>"))
     w_cat = float(mcm_cfg.get("w_cat", mcm_cfg.get("loss_w_cat", 1.0)))
     w_num = float(mcm_cfg.get("w_num", mcm_cfg.get("loss_w_num", 1.0)))
+
+    # New config: direct comparison for error detection
+    use_direct_comparison = bool(mcm_cfg.get("use_direct_comparison", False))
+    numeric_tolerance = float(mcm_cfg.get("numeric_tolerance", 0.1))
 
     # Resolve component configs (prefer mcm.* then top-level)
     tabular_encoder_cfg = mcm_cfg.get("tabular_encoder") or exp_cfg.get("tabular_encoder")
@@ -434,10 +439,38 @@ def run_mcm_experiment(
 
     tabular_encoder = build_component(tabular_encoder_cfg, ENCODER_REGISTRY, config_dir, project_root)
     text_encoder = build_component(text_encoder_cfg, ENCODER_REGISTRY, config_dir, project_root)
-    fusion_module = build_component(fusion_cfg, FUSION_REGISTRY, config_dir, project_root)
 
-    # Get number of columns for per-column reconstruction heads
+    # Get number of columns for per-column reconstruction heads and fusion modules
     num_cols = len(column_names) if column_names is not None else (len(dirty_rows[0]) if dirty_rows else 0)
+
+    # Build fusion module with per-column support
+    fusion_params = fusion_cfg.get("params", {})
+    use_per_column_fusion = fusion_params.pop("per_column", True)  # Default to per-column fusion
+
+    if use_per_column_fusion:
+        # Create per-column fusion modules
+        fusion_type = fusion_cfg["type"]
+        d_model = fusion_params.get("d_model", 32)
+
+        fusion_modules = nn.ModuleList()
+        for _ in range(num_cols):
+            if fusion_type == "CrossAttentionFusion":
+                module = CrossAttentionFusion(
+                    d_model=d_model,
+                    **{k: v for k, v in fusion_params.items() if k != "d_model"}
+                )
+            elif fusion_type == "SimpleConcatFusion":
+                module = SimpleConcatFusion(d_model=d_model)
+            else:
+                module = build_component(fusion_cfg, FUSION_REGISTRY, config_dir, project_root)
+            fusion_modules.append(module)
+
+        fusion_module = fusion_modules
+        print(f"✓ 启用MCM per-column fusion，为{num_cols}列创建独立的fusion模块")
+    else:
+        # Shared fusion module
+        fusion_module = build_component(fusion_cfg, FUSION_REGISTRY, config_dir, project_root)
+        print("✓ 使用MCM shared fusion module")
     
     # Default reconstruction head config if not provided
     if head_cfg is None:
@@ -453,14 +486,56 @@ def run_mcm_experiment(
     head_params = head_cfg.get("params", {}) if head_cfg else {}
     max_vocab_size = int(head_params.get("vocab_size", default_vocab_size))
 
+    # Get column types from config first (all columns must be configured)
+    column_types = exp_cfg.get("column_types", {})
+
+    # Check that all columns are configured
+    if column_names:
+        for col_name in column_names:
+            if col_name not in column_types:
+                raise ValueError(f"Column '{col_name}' not found in column_types configuration. "
+                               f"All columns must be explicitly configured in the 'column_types' section.")
+
     if dirty_rows:
-        col_is_numeric, column_value_to_id, column_vocab_sizes = _prepare_column_label_encoders(
-            dirty_rows,
-            numeric_ratio_threshold=numeric_ratio_threshold,
-            max_rows_for_type_inference=max_rows_for_type_inference,
-            max_vocab_size=max_vocab_size,
-            unknown_token=unknown_token,
-        )
+        # Use config-based column types
+        col_is_numeric = [False] * num_cols
+        for col_idx in range(num_cols):
+            col_name = column_names[col_idx] if column_names and col_idx < len(column_names) else f"Col{col_idx}"
+            if column_types and col_name in column_types:
+                col_type = column_types[col_name].lower()
+                col_is_numeric[col_idx] = col_type in ["numeric", "numerical", "number", "int", "float"]
+            else:
+                # This should not happen due to the check above, but just in case
+                col_is_numeric[col_idx] = False
+
+        # Prepare vocabularies for categorical columns
+        column_value_to_id = []
+        column_vocab_sizes = []
+
+        for col_idx in range(num_cols):
+            mapping: OrderedDict[str, int] = OrderedDict()
+            if unknown_token is not None:
+                mapping.setdefault(unknown_token, 0)
+
+            # Only build vocab for categorical columns
+            if not col_is_numeric[col_idx]:
+                for row in dirty_rows:
+                    if col_idx >= len(row):
+                        continue
+                    token = "" if row[col_idx] is None else str(row[col_idx])
+                    if token in mapping:
+                        continue
+                    if max_vocab_size is not None and len(mapping) >= max_vocab_size:
+                        continue
+                    mapping[token] = len(mapping)
+
+            if not mapping:
+                mapping = OrderedDict()
+                if unknown_token is not None:
+                    mapping[unknown_token] = 0
+
+            column_value_to_id.append(mapping)
+            column_vocab_sizes.append(max(1, len(mapping)))
     else:
         col_is_numeric = [False] * num_cols
         column_value_to_id = [
@@ -476,7 +551,14 @@ def run_mcm_experiment(
         column_value_to_id.extend([OrderedDict({unknown_token: 0}) for _ in range(pad_count)])
     if len(column_vocab_sizes) < num_cols:
         column_vocab_sizes.extend([1] * (num_cols - len(column_vocab_sizes)))
-    
+
+    # Register per-column vocabularies with TabularProcessor (no hash collision)
+    tabular_processor.register_column_vocabularies(
+        column_names=column_names,
+        column_value_to_id=[dict(m) for m in column_value_to_id],
+        col_is_numeric=col_is_numeric,
+    )
+
     # Create per-column reconstruction heads (each column has its own classifier)
     recon_heads_list: List[nn.Module] = []
     for col_idx in range(num_cols):
@@ -589,45 +671,121 @@ def run_mcm_experiment(
         persistent_workers=persistent_workers,
     )
 
+    # 逐列训练：外层遍历列，内层遍历epochs和batches
+    num_cols = len(column_names) if column_names is not None else (len(dirty_rows[0]) if dirty_rows else 0)
+
+    # 为每列创建独立的数据集
+    per_column_datasets = []
+    for col_idx in range(num_cols):
+        col_dataset = MaskedCellModelingDataset(
+            dirty_rows,
+            text_descriptions,
+            mask_ratio=mask_ratio,
+            num_masked_cells=num_masked_cells,
+            numeric_ratio_threshold=numeric_ratio_threshold,
+            max_rows_for_type_inference=max_rows_for_type_inference,
+            tabular_processor=tabular_processor,
+            text_processor=text_processor,
+            cached_text_embeddings=cached_text_embeddings,
+            column_names=column_names,
+            col_is_numeric=col_is_numeric[:num_cols],
+            column_value_to_id=[dict(m) for m in column_value_to_id[:num_cols]],
+            unknown_token=unknown_token,
+            seed=int(mcm_cfg.get("mask_seed", seed)),
+            fixed_mask_column=col_idx,  # 设置固定mask列
+        )
+        per_column_datasets.append(col_dataset)
+
+    # 训练每列
     train_losses: List[float] = []
-    for epoch in tqdm(range(num_epochs), desc=f"MCM Training ({num_epochs} epochs)", ncols=100):
-        epoch_losses: List[float] = []
-        epoch_cat: List[float] = []
-        epoch_num: List[float] = []
-        for batch in train_loader:
-            stats = train_step_mcm(
-                tabular_encoder,
-                text_encoder,
-                fusion_module,
-                recon_heads,
-                batch,
-                optimizer,
-                tabular_processor,
-                mask_embedding,
-                device=runtime_device,
-                device_map=device_map,
-                column_names=column_names,
-                w_cat=w_cat,
-                w_num=w_num,
-            )
-            epoch_losses.append(stats["loss"])
-            epoch_cat.append(stats["loss_cat"])
-            epoch_num.append(stats["loss_num"])
-        avg = float(np.mean(epoch_losses)) if epoch_losses else 0.0
-        train_losses.append(avg)
-        print(
-            f"  Epoch [{epoch + 1}/{num_epochs}] "
-            f"Loss={avg:.4f} (CE={float(np.mean(epoch_cat)) if epoch_cat else 0.0:.4f}, "
-            f"MSE={float(np.mean(epoch_num)) if epoch_num else 0.0:.4f})"
+
+    # 显示总体列进度
+    print(f"\n开始逐列训练 ({num_cols} 列，每列 {num_epochs} epochs)...")
+    print("=" * 80)
+
+    for col_idx in tqdm(range(num_cols), desc="训练列进度", ncols=100):
+        col_dataset = per_column_datasets[col_idx]
+        col_name = column_names[col_idx] if column_names and col_idx < len(column_names) else f"Col{col_idx}"
+
+        # 为该列创建独立的DataLoader
+        col_loader = DataLoader(
+            col_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_fn_mcm,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
         )
 
+        print(f"\n📊 Column {col_idx+1}/{num_cols} ({col_name}):")
+        print(f"  Dataset size: {len(col_dataset)} rows, Batch size: {batch_size}")
+
+        # 训练该列的所有epochs
+        col_epoch_losses: List[float] = []
+
+        # 简单的epoch进度显示
+        for epoch in range(num_epochs):
+            epoch_losses: List[float] = []
+            epoch_cat: List[float] = []
+            epoch_num: List[float] = []
+
+            for batch_idx, batch in enumerate(col_loader):
+                stats = train_step_mcm(
+                    tabular_encoder,
+                    text_encoder,
+                    fusion_module,
+                    recon_heads,
+                    batch,
+                    optimizer,
+                    tabular_processor,
+                    mask_embedding,
+                    device=runtime_device,
+                    device_map=device_map,
+                    column_names=column_names,
+                    w_cat=w_cat,
+                    w_num=w_num,
+                )
+                epoch_losses.append(stats["loss"])
+                epoch_cat.append(stats["loss_cat"])
+                epoch_num.append(stats["loss_num"])
+
+            avg = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+            col_epoch_losses.append(avg)
+
+            # 打印epoch结果
+            # 前3个epoch详细显示，中间简化，最后几个详细显示
+            if epoch < 3 or epoch >= num_epochs - 3 or epoch % max(1, num_epochs // 5) == 0:
+                print(f"    ✅ Epoch {epoch+1}/{num_epochs}: "
+                      f"Loss={avg:.4f} (CE={float(np.mean(epoch_cat)) if epoch_cat else 0.0:.4f}, "
+                      f"MSE={float(np.mean(epoch_num)) if epoch_num else 0.0:.4f})")
+            else:
+                # 简化显示：只显示进度和总损失
+                print(f"    Epoch {epoch+1}/{num_epochs}: Loss={avg:.4f}")
+
+        # 记录该列的平均损失
+        col_avg_loss = float(np.mean(col_epoch_losses)) if col_epoch_losses else 0.0
+        train_losses.append(col_avg_loss)
+
+        # 完成该列训练
+        print(f"\n  ✅ Column {col_idx+1}/{num_cols} ({col_name}) Complete - Avg Loss: {col_avg_loss:.4f}")
+        print("=" * 80)
+
+    # 计算总体平均损失
+    overall_avg_loss = float(np.mean(train_losses)) if train_losses else 0.0
+    print(f"\n✓ MCM Per-Column Training Complete - Overall Avg Loss: {overall_avg_loss:.4f}")
+
     # Continue with scoring and evaluation
+    # Get column types from config (if specified)
+    column_types = exp_cfg.get("column_types", {})
+
     return _run_mcm_scoring_and_evaluation(
         exp_cfg, dirty_rows, text_descriptions, dataset_name, column_names,
         tabular_processor, text_processor, tabular_encoder, text_encoder,
         fusion_module, recon_heads, mask_embedding, train_dataset,
         cached_text_embeddings, train_losses, runtime_device, device_map,
-        config_dir, project_root, mcm_cfg, batch_size
+        config_dir, project_root, mcm_cfg, batch_size,
+        use_direct_comparison, numeric_tolerance, column_types
     )
 
 
@@ -653,6 +811,9 @@ def _run_mcm_scoring_and_evaluation(
     project_root: Path,
     mcm_cfg: Dict[str, Any],
     batch_size: int,
+    use_direct_comparison: bool,
+    numeric_tolerance: float,
+    column_types: Dict[str, str] = None,
 ) -> Dict[str, Any]:
     """Helper function for MCM scoring and evaluation."""
     from ..runtime import _move_batch_to_device
@@ -663,6 +824,10 @@ def _run_mcm_scoring_and_evaluation(
     score_batch_size = int(score_cfg.get("batch_size", batch_size))
     top_k = int(score_cfg.get("top_k", 50))
     return_full = bool(score_cfg.get("return_cell_scores", False))
+
+    # Add direct comparison parameters to score_cfg for use in scoring loop
+    score_cfg["use_direct_comparison"] = use_direct_comparison
+    score_cfg["numeric_tolerance"] = numeric_tolerance
 
     def _stable_hash_to_bucket(text: str, vocab_size: int) -> int:
         import hashlib
@@ -684,6 +849,8 @@ def _run_mcm_scoring_and_evaluation(
     fusion_module = fusion_module.to(runtime_device)
     recon_heads = recon_heads.to(runtime_device)
     mask_embedding = mask_embedding.to(runtime_device)
+    # 确保text_encoder也在正确的设备上
+    text_encoder = text_encoder.to(runtime_device)
 
     vocab_size = int(getattr(tabular_processor, "vocab_size", 10000))
     num_numeric_bins = int(getattr(tabular_processor, "num_numeric_bins", 1000))
@@ -696,6 +863,11 @@ def _run_mcm_scoring_and_evaluation(
     cell_scores: Optional[np.ndarray] = None
     if return_full and num_rows > 0 and num_cols > 0:
         cell_scores = np.zeros((num_rows, num_cols), dtype=np.float32)
+
+    # Store reconstructed values for analysis
+    reconstructed_values: Optional[np.ndarray] = None
+    if return_full and num_rows > 0 and num_cols > 0:
+        reconstructed_values = np.empty((num_rows, num_cols), dtype=object)
 
     topk_cells: List[Dict[str, Any]] = []
     per_column_stats: Dict[str, Dict[str, float]] = {}
@@ -725,9 +897,9 @@ def _run_mcm_scoring_and_evaluation(
                     ])
                     # Create per-column instruction prompt
                     col_prompt = (
-                        f"Instruction: Check the consistency of this record on column '{col_name}'. "
+                        f"Instruction: Check for errors (missing, typo, column pattern violations, rule violations) in column '{col_name}' for this record. "
                         f"Record: {row_serialized}. "
-                        f"The summary embedding representing the consistency check result is: [MASK]"
+                        f"The error checking analysis result is: [MASK]"
                     )
                     
                     cache_key = (row_idx, col_idx)
@@ -777,7 +949,15 @@ def _run_mcm_scoring_and_evaluation(
                 B = end - start
                 mask_indices = torch.full((B, 1), int(col_idx), dtype=torch.long, device=runtime_device)
 
-                is_num_col = bool(col_is_numeric[col_idx]) if col_idx < len(col_is_numeric) else False
+                # Use column type from config (all columns must be configured)
+                col_name = column_names[col_idx] if column_names and col_idx < len(column_names) else f"Col{col_idx}"
+                if column_types and col_name in column_types:
+                    col_type = column_types[col_name].lower()
+                    is_num_col = col_type in ["numeric", "numerical", "number", "int", "float"]
+                else:
+                    raise ValueError(f"Column '{col_name}' not found in column_types configuration. "
+                                   f"All columns must be explicitly configured in the 'column_types' section.")
+
                 target_types = torch.full((B, 1), 1 if is_num_col else 0, dtype=torch.long, device=runtime_device)
                 if is_num_col:
                     target_ids = torch.full((B, 1), -1, dtype=torch.long, device=runtime_device)
@@ -823,7 +1003,7 @@ def _run_mcm_scoring_and_evaluation(
 
                 H_table = tabular_encoder(tabular_inputs)  # [B, C, d_model]
                 
-                # Use per-column text encoding
+                # Use per-column text encoding with cell-level alignment
                 if "per_column" in text_inputs and col_idx in text_inputs["per_column"]:
                     col_text_input = text_inputs["per_column"][col_idx]
                     if "cached_embedding" in col_text_input:
@@ -837,9 +1017,42 @@ def _run_mcm_scoring_and_evaluation(
                         H_text_col = text_encoder(col_text_input_device)
                         if H_text_col.dim() == 3:
                             H_text_col = H_text_col[:, -1, :]  # [B, d_model]
-                    
+
                     B, C, d_model = H_table.shape
-                    H_text_expanded = H_text_col.unsqueeze(1).expand(-1, C, -1)  # [B, C, d_model]
+                    # Cell-level alignment: each cell uses its corresponding text embedding
+                    # H_text_col is [B, d_model] - cell-level embeddings for this column across all rows
+                    # We want H_text_expanded to have each row's text embedding for each column
+                    # For columns other than col_idx, we'll use a fallback strategy
+                    H_text_expanded = torch.zeros((B, C, d_model), device=runtime_device, dtype=H_table.dtype)
+
+                    # Fill in the current column's cell-level text embeddings
+                    # Each row uses its own text embedding for this column
+                    H_text_expanded[:, col_idx, :] = H_text_col
+
+                    # For other columns, we need to get their per-column embeddings if available
+                    # This is a simplified approach - in practice, we might want to cache all columns
+                    for other_col_idx in range(C):
+                        if other_col_idx != col_idx and "per_column" in text_inputs and other_col_idx in text_inputs["per_column"]:
+                            other_col_input = text_inputs["per_column"][other_col_idx]
+                            if "cached_embedding" in other_col_input:
+                                other_H_text = other_col_input["cached_embedding"].to(runtime_device)
+                                if other_H_text.dim() == 3:
+                                    other_H_text = other_H_text[:, -1, :]  # [B, d_model]
+                                H_text_expanded[:, other_col_idx, :] = other_H_text
+                            else:
+                                # Fallback to global text embedding for this column
+                                if "cached_embedding" in text_inputs:
+                                    global_H_text = text_inputs["cached_embedding"].to(runtime_device)
+                                    if global_H_text.dim() == 3:
+                                        global_H_text = global_H_text[:, -1, :]  # [B, d_model]
+                                    H_text_expanded[:, other_col_idx, :] = global_H_text
+                        else:
+                            # Fallback to global text embedding
+                            if "cached_embedding" in text_inputs:
+                                global_H_text = text_inputs["cached_embedding"].to(runtime_device)
+                                if global_H_text.dim() == 3:
+                                    global_H_text = global_H_text[:, -1, :]  # [B, d_model]
+                                H_text_expanded[:, other_col_idx, :] = global_H_text
                 else:
                     # Fallback to global text embedding
                     if "cached_embedding" in text_inputs:
@@ -857,10 +1070,36 @@ def _run_mcm_scoring_and_evaluation(
                         B, C, d_model = H_table.shape
                         H_text_expanded = H_text.unsqueeze(1).expand(-1, C, -1)  # [B, C, d_model]
                 
-                H_fuse = fusion_module(H_table, H_text_expanded)  # [B, C, d_model]
-                
-                # Use per-column reconstruction head: extract column embedding and use column-specific head
-                col_embedding = H_fuse[:, col_idx:col_idx+1, :]  # [B, 1, d_model]
+                # Use per-column fusion module: apply fusion only to the target column
+                if isinstance(fusion_module, nn.ModuleList):
+                    # Per-column fusion: use dedicated fusion module for this column
+                    col_table_embed = H_table[:, col_idx:col_idx+1, :]  # [B, 1, d_model]
+                    # Use per-column text embedding if available, otherwise use global
+                    if "per_column" in text_inputs and col_idx in text_inputs["per_column"]:
+                        col_text_input = text_inputs["per_column"][col_idx]
+                        if "cached_embedding" in col_text_input:
+                            col_text_emb = col_text_input["cached_embedding"].to(runtime_device)
+                            if col_text_emb.dim() == 2:
+                                col_text_emb = col_text_emb.unsqueeze(1)  # [B, 1, d_model]
+                            elif col_text_emb.dim() == 3:
+                                col_text_emb = col_text_emb[:, -1, :].unsqueeze(1)  # [B, 1, d_model]
+                        else:
+                            # Process through text encoder
+                            col_text_input_device = _move_batch_to_device(col_text_input, runtime_device)
+                            col_text_emb = text_encoder(col_text_input_device)
+                            if col_text_emb.dim() == 3:
+                                col_text_emb = col_text_emb[:, -1, :].unsqueeze(1)  # [B, 1, d_model]
+                    else:
+                        # Use global text embedding for this column
+                        col_text_emb = H_text_expanded[:, col_idx:col_idx+1, :]  # [B, 1, d_model]
+
+                    # Apply per-column fusion
+                    H_fuse = fusion_module[col_idx](col_table_embed, col_text_emb)  # [B, 1, d_model]
+                    col_embedding = H_fuse  # [B, 1, d_model]
+                else:
+                    # Shared fusion module: compute for all columns, then extract
+                    H_fuse = fusion_module(H_table, H_text_expanded)  # [B, C, d_model]
+                    col_embedding = H_fuse[:, col_idx:col_idx+1, :]  # [B, 1, d_model]
                 col_recon_head = recon_heads[col_idx]
                 cat_logits_col, num_pred_col = col_recon_head(col_embedding)  # [B, 1, vocab_size], [B, 1]
                 
@@ -869,18 +1108,63 @@ def _run_mcm_scoring_and_evaluation(
                 num_pred_col = num_pred_col.squeeze(1)  # [B]
 
                 # Compute per-row loss for this (row, col)
-                if is_num_col:
-                    preds = num_pred_col
-                    tgt = target_nums.squeeze(1).to(runtime_device)
-                    finite = torch.isfinite(tgt)
-                    per_row = torch.zeros((B,), dtype=torch.float32, device=runtime_device)
-                    per_row[finite] = (preds[finite] - tgt[finite]).pow(2)
+                if use_direct_comparison:
+                    # New method: direct comparison of reconstructed values
+                    if is_num_col:
+                        # Numeric data: compute L1 distance in normalized space
+                        preds = num_pred_col  # [B]
+                        tgt = target_nums.squeeze(1).to(runtime_device)  # [B]
+                        finite = torch.isfinite(tgt)
+                        per_row = torch.zeros((B,), dtype=torch.float32, device=runtime_device)
+                        # Use L1 distance instead of MSE
+                        per_row[finite] = torch.abs(preds[finite] - tgt[finite])
+                        # Apply tolerance threshold for numeric data
+                        errors = per_row > numeric_tolerance
+                        per_row = errors.float()
+                    else:
+                        # Categorical data: directly compare predicted category with ground truth
+                        predicted_ids = torch.argmax(cat_logits_col, dim=-1)  # [B]
+                        tgt = target_ids.squeeze(1).to(runtime_device)  # [B]
+                        # Direct comparison: 1 if different (error), 0 if same (correct)
+                        per_row = (predicted_ids != tgt).float()
                 else:
-                    logits = cat_logits_col
-                    tgt = target_ids.squeeze(1).to(runtime_device)
-                    per_row = F.cross_entropy(logits, tgt, reduction="none").to(torch.float32)
+                    # Original method: compute loss based scores
+                    if is_num_col:
+                        preds = num_pred_col
+                        tgt = target_nums.squeeze(1).to(runtime_device)
+                        finite = torch.isfinite(tgt)
+                        per_row = torch.zeros((B,), dtype=torch.float32, device=runtime_device)
+                        per_row[finite] = (preds[finite] - tgt[finite]).pow(2)
+                    else:
+                        logits = cat_logits_col
+                        tgt = target_ids.squeeze(1).to(runtime_device)
+                        per_row = F.cross_entropy(logits, tgt, reduction="none").to(torch.float32)
 
                 per_row_cpu = per_row.detach().cpu().numpy()
+
+                # Store reconstructed values for analysis
+                if reconstructed_values is not None:
+                    if is_num_col:
+                        # For numeric columns, store the predicted normalized value
+                        reconstructed_vals = num_pred_col.detach().cpu().numpy()
+                    else:
+                        # For categorical columns, convert predicted IDs back to actual values
+                        predicted_ids = torch.argmax(cat_logits_col, dim=-1).detach().cpu().numpy()
+                        # Create reverse mapping from ID to actual value
+                        id_to_value = {}
+                        if column_value_to_id and col_idx < len(column_value_to_id):
+                            mapping = column_value_to_id[col_idx] or {}
+                            for token, token_id in mapping.items():
+                                id_to_value[int(token_id)] = token
+
+                        # Get the actual values from the original data
+                        reconstructed_vals = []
+                        for pred_id in predicted_ids:
+                            if int(pred_id) in id_to_value:
+                                reconstructed_vals.append(id_to_value[int(pred_id)])
+                            else:
+                                reconstructed_vals.append(unknown_token)
+
                 for i in range(B):
                     row_idx = start + i
                     loss_val = float(per_row_cpu[i])
@@ -888,6 +1172,8 @@ def _run_mcm_scoring_and_evaluation(
                     col_items.append((loss_val, row_idx))
                     if cell_scores is not None:
                         cell_scores[row_idx, col_idx] = loss_val
+                    if reconstructed_values is not None:
+                        reconstructed_values[row_idx, col_idx] = reconstructed_vals[i] if is_num_col else reconstructed_vals[i]
 
             if col_losses:
                 per_column_stats[str(column_names[col_idx] if column_names else col_idx)] = {
@@ -962,87 +1248,18 @@ def _run_mcm_scoring_and_evaluation(
                 predictions = [0] * len(ground_truth)
                 num_rows_eval = len(dirty_rows_eval)
                 num_cols_eval = len(dirty_rows_eval[0]) if dirty_rows_eval else 0
-                
-                # Find optimal threshold per column to maximize F1-Score
-                best_thresholds = {}
-                best_f1_per_col = {}
-                
-                if cell_scores is not None and cell_scores.shape[0] >= num_rows_eval and cell_scores.shape[1] >= num_cols_eval:
-                    cell_scores_eval = cell_scores[:num_rows_eval, :num_cols_eval]
-                    
-                    # For each column, find the optimal threshold
-                    for col_idx in range(num_cols_eval):
-                        col_scores = cell_scores_eval[:, col_idx]  # [num_rows]
-                        col_ground_truth = [ground_truth[r * num_cols_eval + col_idx] for r in range(num_rows_eval)]
-                        
-                        # Get unique score values to use as candidate thresholds
-                        unique_scores = np.sort(np.unique(col_scores))[::-1]  # Descending order
-                        
-                        best_f1 = -1
-                        best_thresh = unique_scores[0] if len(unique_scores) > 0 else 0
-                        
-                        # Try each unique score as a threshold
-                        for threshold in unique_scores:
-                            col_preds = [1 if score >= threshold else 0 for score in col_scores]
-                            
-                            # Compute F1 for this threshold
-                            tp = sum(1 for i in range(len(col_preds)) if col_preds[i] == 1 and col_ground_truth[i] == 1)
-                            fp = sum(1 for i in range(len(col_preds)) if col_preds[i] == 1 and col_ground_truth[i] == 0)
-                            fn = sum(1 for i in range(len(col_preds)) if col_preds[i] == 0 and col_ground_truth[i] == 1)
-                            
-                            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-                            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-                            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-                            
-                            if f1 > best_f1:
-                                best_f1 = f1
-                                best_thresh = threshold
-                        
-                        best_thresholds[col_idx] = best_thresh
-                        best_f1_per_col[col_idx] = best_f1
-                    
-                    # Apply per-column thresholds to generate predictions
-                    for r in range(num_rows_eval):
-                        for c in range(num_cols_eval):
-                            flat_idx = r * num_cols_eval + c
-                            score = cell_scores_eval[r, c]
-                            threshold = best_thresholds.get(c, 0)
-                            if score >= threshold:
-                                predictions[flat_idx] = 1
-                    
-                    # Print per-column thresholds and F1 scores
-                    print(f"\n  每列最优阈值及F1-Score:")
-                    for col_idx in range(num_cols_eval):
-                        col_name = column_names[col_idx] if column_names and col_idx < len(column_names) else f"Col{col_idx}"
-                        print(f"    {col_name}: 阈值={best_thresholds[col_idx]:.4f}, 列级F1={best_f1_per_col[col_idx]:.4f}")
-                
-                else:
-                    # Fallback: use global threshold on all cell_scores
-                    if cell_scores is not None:
-                        print(f"⚠️  无法逐列计算阈值，使用全局阈值")
-                        flat_scores = cell_scores.flatten()
-                        unique_scores = np.sort(np.unique(flat_scores))[::-1]
-                        
-                        best_f1 = -1
-                        best_global_thresh = unique_scores[0] if len(unique_scores) > 0 else 0
-                        
-                        for threshold in unique_scores:
-                            global_preds = [1 if score >= threshold else 0 for score in flat_scores]
-                            tp = sum(1 for i in range(len(global_preds)) if global_preds[i] == 1 and ground_truth[i] == 1)
-                            fp = sum(1 for i in range(len(global_preds)) if global_preds[i] == 1 and ground_truth[i] == 0)
-                            fn = sum(1 for i in range(len(global_preds)) if global_preds[i] == 0 and ground_truth[i] == 1)
-                            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-                            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-                            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-                            if f1 > best_f1:
-                                best_f1 = f1
-                                best_global_thresh = threshold
-                        
-                        predictions = [1 if score >= best_global_thresh else 0 for score in flat_scores]
-                        print(f"    全局最优阈值={best_global_thresh:.4f}, 全局F1={best_f1:.4f}")
+
+                # Check if using direct comparison (scores are already binary)
+                if use_direct_comparison:
+                    print(f"  ✓ 使用直接比较模式，scores已经是二值化的")
+                    if cell_scores is not None and cell_scores.shape[0] >= num_rows_eval and cell_scores.shape[1] >= num_cols_eval:
+                        cell_scores_eval = cell_scores[:num_rows_eval, :num_cols_eval]
+                        # Scores are already binary (0 or 1), just flatten
+                        flat_scores = cell_scores_eval.flatten()
+                        predictions = [1 if score > 0.5 else 0 for score in flat_scores]
                     else:
-                        # Last resort: use topk_cells
-                        print(f"⚠️  没有cell_scores可用，使用TopK预测")
+                        print(f"  ⚠️  没有cell_scores，使用TopK预测")
+                        # Fallback to top-k
                         for cell in deduped[:top_k]:
                             row_idx = cell["row_idx"]
                             col_idx = cell["col_idx"]
@@ -1050,14 +1267,266 @@ def _run_mcm_scoring_and_evaluation(
                                 flat_idx = row_idx * num_cols_eval + col_idx
                                 if flat_idx < len(predictions):
                                     predictions[flat_idx] = 1
+                else:
+                    # Original method: find optimal threshold per column
+                    best_thresholds = {}
+                    best_f1_per_col = {}
+
+                    if cell_scores is not None and cell_scores.shape[0] >= num_rows_eval and cell_scores.shape[1] >= num_cols_eval:
+                        cell_scores_eval = cell_scores[:num_rows_eval, :num_cols_eval]
+
+                        # For each column, find the optimal threshold
+                        for col_idx in range(num_cols_eval):
+                            col_scores = cell_scores_eval[:, col_idx]  # [num_rows]
+                            col_ground_truth = [ground_truth[r * num_cols_eval + col_idx] for r in range(num_rows_eval)]
+
+                            # Get unique score values to use as candidate thresholds
+                            unique_scores = np.sort(np.unique(col_scores))[::-1]  # Descending order
+
+                            best_f1 = -1
+                            best_thresh = unique_scores[0] if len(unique_scores) > 0 else 0
+
+                            # Try each unique score as a threshold
+                            for threshold in unique_scores:
+                                col_preds = [1 if score >= threshold else 0 for score in col_scores]
+
+                                # Compute F1 for this threshold
+                                tp = sum(1 for i in range(len(col_preds)) if col_preds[i] == 1 and col_ground_truth[i] == 1)
+                                fp = sum(1 for i in range(len(col_preds)) if col_preds[i] == 1 and col_ground_truth[i] == 0)
+                                fn = sum(1 for i in range(len(col_preds)) if col_preds[i] == 0 and col_ground_truth[i] == 1)
+
+                                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+                                if f1 > best_f1:
+                                    best_f1 = f1
+                                    best_thresh = threshold
+
+                            best_thresholds[col_idx] = best_thresh
+                            best_f1_per_col[col_idx] = best_f1
+
+                        # Apply per-column thresholds to generate predictions
+                        for r in range(num_rows_eval):
+                            for c in range(num_cols_eval):
+                                flat_idx = r * num_cols_eval + c
+                                score = cell_scores_eval[r, c]
+                                threshold = best_thresholds.get(c, 0)
+                                if score >= threshold:
+                                    predictions[flat_idx] = 1
+
+                        # Print per-column thresholds and F1 scores
+                        print(f"\n  每列最优阈值及F1-Score:")
+                        for col_idx in range(num_cols_eval):
+                            col_name = column_names[col_idx] if column_names and col_idx < len(column_names) else f"Col{col_idx}"
+                            print(f"    {col_name}: 阈值={best_thresholds[col_idx]:.4f}, 列级F1={best_f1_per_col[col_idx]:.4f}")
+                    else:
+                        # Fallback: use global threshold on all cell_scores
+                        if cell_scores is not None:
+                            print(f"⚠️  无法逐列计算阈值，使用全局阈值")
+                            flat_scores = cell_scores.flatten()
+                            unique_scores = np.sort(np.unique(flat_scores))[::-1]
+
+                            best_f1 = -1
+                            best_global_thresh = unique_scores[0] if len(unique_scores) > 0 else 0
+
+                            for threshold in unique_scores:
+                                global_preds = [1 if score >= threshold else 0 for score in flat_scores]
+                                tp = sum(1 for i in range(len(global_preds)) if global_preds[i] == 1 and ground_truth[i] == 1)
+                                fp = sum(1 for i in range(len(global_preds)) if global_preds[i] == 1 and ground_truth[i] == 0)
+                                fn = sum(1 for i in range(len(global_preds)) if global_preds[i] == 0 and ground_truth[i] == 1)
+                                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+                                if f1 > best_f1:
+                                    best_f1 = f1
+                                    best_global_thresh = threshold
+
+                            predictions = [1 if score >= best_global_thresh else 0 for score in flat_scores]
+                            print(f"    全局最优阈值={best_global_thresh:.4f}, 全局F1={best_f1:.4f}")
+                        else:
+                            # Last resort: use topk_cells
+                            print(f"⚠️  没有cell_scores可用，使用TopK预测")
+                            for cell in deduped[:top_k]:
+                                row_idx = cell["row_idx"]
+                                col_idx = cell["col_idx"]
+                                if row_idx < num_rows_eval and col_idx < num_cols_eval:
+                                    flat_idx = row_idx * num_cols_eval + col_idx
+                                    if flat_idx < len(predictions):
+                                        predictions[flat_idx] = 1
                 
                 # Compute metrics
                 preds_tensor = torch.tensor(predictions, dtype=torch.int32)
                 targets_tensor = torch.tensor(ground_truth, dtype=torch.int32)
-                
+
                 mcm_eval_metrics = _compute_classification_metrics(preds_tensor, targets_tensor)
-                
-                print(f"\nMCM 评估结果:")
+
+                # ===== NEW: Compute per-column metrics =====
+                per_column_metrics: Dict[str, Dict[str, int]] = {}
+
+                # Print column type information
+                print(f"\n" + "=" * 80)
+                print("列类型统计:")
+                print("=" * 80)
+
+                numeric_cols = []
+                categorical_cols = []
+
+                for col_idx in range(num_cols_eval):
+                    col_name = column_names[col_idx] if column_names and col_idx < len(column_names) else f"Col{col_idx}"
+
+                    # Use column_types from config (all columns must be configured)
+                    if column_types and col_name in column_types:
+                        col_type = column_types[col_name].lower()
+                        is_num = col_type in ["numeric", "numerical", "number", "int", "float"]
+                    else:
+                        raise ValueError(f"Column '{col_name}' not found in column_types configuration. "
+                                       f"All columns must be explicitly configured in the 'column_types' section.")
+
+                    if is_num:
+                        numeric_cols.append(col_name)
+                    else:
+                        categorical_cols.append(col_name)
+
+                print(f"数值型列 ({len(numeric_cols)}个):")
+                for i, col in enumerate(numeric_cols):
+                    type_source = "(配置)" if (column_types and col in column_types) else "(自动检测)"
+                    print(f"  {i+1}. {col} {type_source}")
+
+                print(f"\n分类型列 ({len(categorical_cols)}个):")
+                for i, col in enumerate(categorical_cols):
+                    type_source = "(配置)" if (column_types and col in column_types) else "(自动检测)"
+                    print(f"  {i+1}. {col} {type_source}")
+
+                print(f"\n" + "=" * 80)
+                print("MCM 逐列评估结果:")
+                print("=" * 80)
+
+                for col_idx in range(num_cols_eval):
+                    col_name = column_names[col_idx] if column_names and col_idx < len(column_names) else f"Col{col_idx}"
+
+                    # Get predictions and ground truth for this column
+                    col_preds = [predictions[r * num_cols_eval + col_idx] for r in range(num_rows_eval)]
+                    col_gt = [ground_truth[r * num_cols_eval + col_idx] for r in range(num_rows_eval)]
+
+                    # Calculate TP, FP, FN, TN for this column
+                    tp = sum(1 for i in range(len(col_preds)) if col_preds[i] == 1 and col_gt[i] == 1)
+                    fp = sum(1 for i in range(len(col_preds)) if col_preds[i] == 1 and col_gt[i] == 0)
+                    fn = sum(1 for i in range(len(col_preds)) if col_preds[i] == 0 and col_gt[i] == 1)
+                    tn = sum(1 for i in range(len(col_preds)) if col_preds[i] == 0 and col_gt[i] == 0)
+
+                    # Calculate metrics
+                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+                    # Calculate cardinality (number of unique values in this column from dirty data)
+                    col_values = set()
+                    for r in range(num_rows_eval):
+                        if r < len(dirty_rows_eval) and col_idx < len(dirty_rows_eval[r]):
+                            cell_value = dirty_rows_eval[r][col_idx]
+                            col_values.add(str(cell_value) if cell_value is not None else "None")
+                    cardinality = len(col_values)
+
+                    per_column_metrics[col_name] = {
+                        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+                        "precision": precision, "recall": recall, "f1": f1,
+                        "total_cells": len(col_preds),
+                        "true_errors": sum(col_gt),
+                        "predicted_errors": sum(col_preds),
+                        "cardinality": cardinality
+                    }
+
+                # Print per-column results
+                print(f"\n{'列名':<20} {'Prec':<8} {'Rec':<8} {'F1':<8} {'TP':<6} {'FP':<6} {'FN':<6} {'TN':<6} {'真实错误':<8} {'预测错误':<8} {'Cardinality':<12}")
+                print("-" * 115)
+
+                for col_idx in range(num_cols_eval):
+                    col_name = column_names[col_idx] if column_names and col_idx < len(column_names) else f"Col{col_idx}"
+                    metrics = per_column_metrics[col_name]
+                    print(f"{col_name:<20} {metrics['precision']:<8.4f} {metrics['recall']:<8.4f} {metrics['f1']:<8.4f} "
+                          f"{metrics['tp']:<6} {metrics['fp']:<6} {metrics['fn']:<6} {metrics['tn']:<6} "
+                          f"{metrics['true_errors']:<8} {metrics['predicted_errors']:<8} {metrics['cardinality']:<12}")
+
+                # Store detailed analysis for later printing (after summary)
+                detailed_analysis: List[str] = []
+                detailed_analysis.append("\n" + "=" * 80)
+                detailed_analysis.append("逐列详细分析:")
+                detailed_analysis.append("=" * 80)
+
+                for col_idx in range(num_cols_eval):
+                    col_name = column_names[col_idx] if column_names and col_idx < len(column_names) else f"Col{col_idx}"
+                    metrics = per_column_metrics[col_name]
+
+                    # Get detailed error information for this column
+                    tp_details = []
+                    fp_details = []
+                    fn_details = []
+
+                    for r in range(num_rows_eval):
+                        row_idx = r
+                        col_pred = predictions[r * num_cols_eval + col_idx]
+                        col_gt = ground_truth[r * num_cols_eval + col_idx]
+
+                        cell_value = dirty_rows_eval[r][col_idx] if r < len(dirty_rows_eval) and col_idx < len(dirty_rows_eval[r]) else None
+                        cell_value_str = str(cell_value) if cell_value is not None else "None"
+
+                        # Get reconstructed value if available
+                        reconstructed_value_str = ""
+                        if reconstructed_values is not None and r < reconstructed_values.shape[0] and col_idx < reconstructed_values.shape[1]:
+                            recon_val = reconstructed_values[r, col_idx]
+                            reconstructed_value_str = str(recon_val) if recon_val is not None else "None"
+
+                        if col_pred == 1 and col_gt == 1:
+                            tp_details.append((row_idx, cell_value_str, reconstructed_value_str))
+                        elif col_pred == 1 and col_gt == 0:
+                            fp_details.append((row_idx, cell_value_str, reconstructed_value_str))
+                        elif col_pred == 0 and col_gt == 1:
+                            fn_details.append((row_idx, cell_value_str, reconstructed_value_str))
+
+                    # Build detailed analysis for this column
+                    col_analysis = []
+                    col_analysis.append(f"\n【{col_name}】:")
+                    col_analysis.append(f"  a) 正确识别的错误 (TP): {metrics['tp']}")
+                    if tp_details:
+                        col_analysis.append(f"     具体实例 (最多显示10个):")
+                        for i, (row_idx, original_val, recon_val) in enumerate(tp_details[:10]):
+                            if recon_val:
+                                col_analysis.append(f"       - 行{row_idx}: 原始值='{original_val}' → 重建值='{recon_val}'")
+                            else:
+                                col_analysis.append(f"       - 行{row_idx}: {original_val}")
+                        if len(tp_details) > 10:
+                            col_analysis.append(f"       ... 还有{len(tp_details) - 10}个")
+
+                    col_analysis.append(f"  b) 漏掉的错误 (FN): {metrics['fn']}")
+                    if fn_details:
+                        col_analysis.append(f"     具体实例 (最多显示10个):")
+                        for i, (row_idx, original_val, recon_val) in enumerate(fn_details[:10]):
+                            if recon_val:
+                                col_analysis.append(f"       - 行{row_idx}: 原始值='{original_val}' → 重建值='{recon_val}'")
+                            else:
+                                col_analysis.append(f"       - 行{row_idx}: {original_val}")
+                        if len(fn_details) > 10:
+                            col_analysis.append(f"       ... 还有{len(fn_details) - 10}个")
+
+                    col_analysis.append(f"  c) 误判的错误 (FP): {metrics['fp']}")
+                    if fp_details:
+                        col_analysis.append(f"     具体实例 (最多显示10个):")
+                        for i, (row_idx, original_val, recon_val) in enumerate(fp_details[:10]):
+                            if recon_val:
+                                col_analysis.append(f"       - 行{row_idx}: 原始值='{original_val}' → 重建值='{recon_val}'")
+                            else:
+                                col_analysis.append(f"       - 行{row_idx}: {original_val}")
+                        if len(fp_details) > 10:
+                            col_analysis.append(f"       ... 还有{len(fp_details) - 10}个")
+
+                    col_analysis.append(f"  整体指标: Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, F1={metrics['f1']:.4f}")
+
+                    detailed_analysis.extend(col_analysis)
+
+                print("\n" + "=" * 80)
+                print("MCM 整体评估结果:")
+                print("=" * 80)
                 print(f"  总cell数: {len(ground_truth)}")
                 print(f"  真实错误cell数: {sum(ground_truth)}")
                 print(f"  预测错误cell数: {sum(predictions)}")
@@ -1083,8 +1552,16 @@ def _run_mcm_scoring_and_evaluation(
     }
     if cell_scores is not None:
         result["mcm_cell_scores"] = cell_scores
+    if reconstructed_values is not None:
+        result["mcm_reconstructed_values"] = reconstructed_values
     if mcm_eval_metrics is not None:
         result["mcm_evaluation"] = mcm_eval_metrics
+        # Save per-column metrics to results
+        if 'per_column_metrics' in locals():
+            result["mcm_per_column_evaluation"] = per_column_metrics
+        # Save detailed analysis for printing after summary
+        if 'detailed_analysis' in locals():
+            result["mcm_detailed_analysis"] = detailed_analysis
     return result
 
 
@@ -1283,7 +1760,8 @@ def run_contrastive_two_stage_experiment(
 
     # Build fusion module (check if per-column fusion or single-column optimization is enabled)
     fusion_cfg = stage_b_cfg["fusion_module"]
-    use_per_column_fusion = fusion_cfg.get("params", {}).pop("per_column", False)
+    # Default to per-column fusion for better column-specific modeling
+    use_per_column_fusion = fusion_cfg.get("params", {}).pop("per_column", True)
     use_single_column_fusion = fusion_cfg.get("params", {}).pop("single_column", False)
 
     if use_per_column_fusion:
@@ -1453,7 +1931,7 @@ def run_contrastive_two_stage_experiment(
         print(f"  构建 cell value 相似度映射（top-{max_top_k}）...")
         cell_value_neighbor_map = {}
 
-        for col_idx in range(num_cols):
+        for col_idx in tqdm(range(num_cols), desc="构建cell相似度映射", ncols=100):
             try:
                 cell_value_neighbor_map[col_idx] = _build_cell_value_semantic_neighbor_map(
                     cached_row_embeddings, col_idx, max_top_k
@@ -1495,7 +1973,8 @@ def run_contrastive_two_stage_experiment(
     else:
         col_profiles = []
 
-    for col_idx in range(num_cols):
+    print(f"  构建训练样本 ({num_cols} 列)...")
+    for col_idx in tqdm(range(num_cols), desc="构建训练样本", ncols=100):
         # 正样本
         for row_idx in range(num_rows):
             samples_by_column[col_idx].append((row_idx, row_idx, col_idx, 1))  # (row_idx, text_idx, col_idx, label)
@@ -1554,7 +2033,7 @@ def run_contrastive_two_stage_experiment(
     for epoch in tqdm(range(num_epochs_b), desc=f"Stage B Training ({num_epochs_b} epochs)", ncols=100):
         epoch_losses = []
 
-        for col_idx in range(num_cols):
+        for col_idx in tqdm(range(num_cols), desc=f"Epoch {epoch+1} - 训练列", ncols=100):
             # Get samples for this column from new structure
             col_samples = samples_by_column[col_idx]
             if not col_samples:

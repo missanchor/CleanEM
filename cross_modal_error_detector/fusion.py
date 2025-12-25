@@ -135,6 +135,78 @@ class PerColumnFusionWrapper(BaseFusion):
         return torch.stack(fused_embeddings, dim=1)
 
 
-__all__ = ["CrossAttentionFusion", "SimpleConcatFusion", "PerColumnFusionWrapper", "SingleColumnFusion"]
+class CellLevelFusionWrapper(BaseFusion):
+    """
+    Wrapper that creates separate fusion modules for each column and supports cell-level text embeddings.
+    Each cell uses its corresponding text embedding for fusion, enabling true cell-level semantic alignment.
 
+    This is different from PerColumnFusionWrapper which still uses the same text embedding for all cells in a column.
+    Here, each (row, col) pair has its own text embedding.
+
+    Args:
+        fusion_type: Type of fusion to use ('CrossAttentionFusion' or 'SimpleConcatFusion')
+        d_model: Hidden dimension size
+        num_cols: Number of columns in the table
+        **kwargs: Additional parameters for the fusion module
+    """
+
+    def __init__(self, fusion_type: str, d_model: int, num_cols: int, **kwargs):
+        super().__init__()
+        # 创建num_cols个独立的fusion模块
+        self.fusion_modules = nn.ModuleList()
+
+        for _ in range(num_cols):
+            if fusion_type == "CrossAttentionFusion":
+                module = CrossAttentionFusion(d_model=d_model, **kwargs)
+            elif fusion_type == "SimpleConcatFusion":
+                module = SimpleConcatFusion(d_model=d_model)
+            else:
+                raise ValueError(f"Unknown fusion type: {fusion_type}")
+            self.fusion_modules.append(module)
+
+    def forward(self, H_table: torch.Tensor, H_text: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with cell-level text embeddings.
+
+        Args:
+            H_table: [batch, num_cols, d_model] - table cell embeddings
+            H_text: [batch, num_cols, d_model] - cell-level text embeddings
+                    Each H_text[b, c] corresponds to the text embedding for cell (b, c)
+
+        Returns:
+            H_fused: [batch, num_cols, d_model] - fused embeddings with cell-level alignment
+        """
+        batch_size, num_cols, d_model = H_table.shape
+
+        # Verify H_text has the expected shape
+        if H_text.shape != (batch_size, num_cols, d_model):
+            raise ValueError(
+                f"CellLevelFusionWrapper expects H_text with shape [{batch_size}, {num_cols}, {d_model}], "
+                f"got {H_text.shape}"
+            )
+
+        # 为每列应用对应的fusion模块，每个cell使用其对应的文本embedding
+        fused_embeddings = []
+        for col_idx in range(num_cols):
+            # 提取该列的所有cell embeddings
+            col_table_embedding = H_table[:, col_idx, :].unsqueeze(1)  # [batch, 1, d_model]
+
+            # 提取该列所有cell对应的文本embeddings
+            col_text_embedding = H_text[:, col_idx, :].unsqueeze(1)  # [batch, 1, d_model]
+
+            # 应用该列的fusion模块，每个cell使用其对应的文本embedding
+            fused = self.fusion_modules[col_idx](col_table_embedding, col_text_embedding)  # [batch, 1, d_model]
+            fused_embeddings.append(fused.squeeze(1))  # [batch, d_model]
+
+        # 重新堆叠为 [batch, num_cols, d_model]
+        return torch.stack(fused_embeddings, dim=1)
+
+
+__all__ = [
+    "CrossAttentionFusion",
+    "SimpleConcatFusion",
+    "PerColumnFusionWrapper",
+    "SingleColumnFusion",
+    "CellLevelFusionWrapper",
+]
 

@@ -1,14 +1,27 @@
 {
   "experiment": "mcm",
   "device_map": {
-    "default": "cuda:0"
+    "default": "cuda"
   },
   "seed": 42,
   "dataset": "beers_error-01",
   "data_path": "data/beers_error-01.csv",
+  "column_types": {
+    "id": "categorical",
+    "beer_name": "categorical",
+    "style": "categorical",
+    "ounces": "categorical",
+    "abv": "categorical",
+    "brewery_id": "categorical",
+    "brewery_name": "categorical",
+    "city": "categorical",
+    "state": "categorical"
+  },
   "mcm": {
+    "use_direct_comparison": true,        
+    "numeric_tolerance": 0.1,  
     "num_epochs": 200,
-    "batch_size": 32,
+    "batch_size": 64,
     "mask_ratio": 0.2,
     "numeric_ratio_threshold": 0.9,
     "use_text_output_last_token_embedding": true,

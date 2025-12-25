@@ -24,7 +24,7 @@ HOSPITAL_CFG="$BASE_DIR/configs/hospital_mcm_experiment.json"
 # 运行模式：sequential | parallel
 # - sequential: 串行跑 3 个实验（推荐，适配本地 vLLM）
 # - parallel:   并行跑（仅建议多 GPU 并手动设置 CUDA_VISIBLE_DEVICES 映射）
-RUN_MODE="${RUN_MODE:-parallel}"
+RUN_MODE="${RUN_MODE:-sequential}"
 
 # 切换到项目根目录
 cd "$BASE_DIR" || exit 1
