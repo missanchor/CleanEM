@@ -7,7 +7,6 @@ from typing import Dict, Any, List, Tuple
 from openai import OpenAI
 
 DEFAULT_MISSING_TOKENS = ["", "nan", "none", "null", "n/a", "na", "unknown", "empty", "xxxxx"]
-DEFAULT_MISSING_TOKEN_STR = str(DEFAULT_MISSING_TOKENS)
 
 
 class BaseLegislator:
@@ -70,14 +69,26 @@ Return ONLY the lambda functions, one per line. Each function should return True
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
         """Generate rules to detect missing values."""
         null_count = metadata.get('null_count', 0)
-        total_rows = metadata.get('total_rows', 0)
-        
-        # Missing value check is simple: value should not be null
-        rule = f"lambda value: pd.notna(value) if hasattr(pd, 'notna') else (str(value).strip().lower() not in ['', 'nan', 'none', 'empty'])"
-        
-        if null_count > 0:
-            return [rule]  # Only return if there are nulls
-        return []
+        missing_token_counts = metadata.get('missing_token_counts', {})
+        observed_missing = sum(
+            count for token, count in missing_token_counts.items()
+            if token != "<NA>"
+        )
+
+        if null_count == 0 and observed_missing == 0:
+            return []
+
+        dominant_tokens = metadata.get('dominant_missing_tokens') or []
+        token_pool = sorted(set(DEFAULT_MISSING_TOKENS + dominant_tokens))
+        token_literal = json.dumps(token_pool, ensure_ascii=False)
+
+        rule = (
+            "lambda value: ("
+            "(pd.notna(value) if hasattr(pd, 'notna') else value is not None)"
+            " and str(value).strip().lower() not in " + token_literal +
+            ")"
+        )
+        return [rule]
 
 
 class TypoLegislator(BaseLegislator):
@@ -93,20 +104,29 @@ Return ONLY the lambda functions, one per line. Each function should return Fals
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
         """Generate rules to detect typos based on frequency analysis."""
         top_values = metadata.get('top_values', {})
-        frequency_dist = metadata.get('frequency_distribution', {})
         unique_count = metadata.get('unique_count', 0)
         
         if not top_values or unique_count < 2:
             return []
 
         top_freq_values = list(top_values.keys())[:10]
+        normalized_top = metadata.get('normalized_top_values', [])[:10]
+        length_distribution = metadata.get('length_distribution', [])[:10]
+        shape_distribution = metadata.get('shape_distribution', [])[:8]
+        low_frequency_values = metadata.get('low_frequency_values', [])[:10]
+        singleton_count = metadata.get('singleton_count', 0)
         
         prompt = f"""
 For column '{column}', generate up to 3 Python lambda functions to detect potential typos.
 
 Column metadata:
 - Unique values: {unique_count}
-- Top 10 most frequent values: {json.dumps(top_freq_values)}
+- Top 10 most frequent raw values: {json.dumps(top_freq_values, ensure_ascii=False)}
+- Normalized high-frequency tokens: {json.dumps(normalized_top, ensure_ascii=False)}
+- Length distribution: {json.dumps(length_distribution, ensure_ascii=False)}
+- Shape distribution: {json.dumps(shape_distribution, ensure_ascii=False)}
+- Singleton value count: {singleton_count}
+- Rare/low-frequency samples: {json.dumps(low_frequency_values, ensure_ascii=False)}
 
 Rules should:
 1. Check if a value is rare (appears < 2 times) AND similar to a frequent value
@@ -130,14 +150,23 @@ lambda value: str(value).lower().strip() in {json.dumps([v.lower() for v in top_
 
     def _fallback_typo_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
         """Generate fallback typo detection rules."""
-        top_values = metadata.get('top_values', {})
-        top_freq_values = list(top_values.keys())[:5]
+        normalized_top = metadata.get('normalized_top_values') or []
+        if normalized_top:
+            safe_values = [entry['value'] for entry in normalized_top[:5] if entry.get('value')]
+        else:
+            top_values = metadata.get('top_values', {})
+            safe_values = [str(v).strip().lower() for v in list(top_values.keys())[:5] if str(v).strip()]
         
         rules = []
         # Rule 1: Value must be in frequent values (conservative)
-        if top_freq_values:
-            safe_values = "', '".join([str(v).replace("'", "\\'") for v in top_freq_values])
-            rules.append(f"lambda value: str(value).lower().strip() in ['{safe_values}'] if value else True")
+        if safe_values:
+            rules.append(
+                "lambda value: ("
+                "True if value in [None, ''] else "
+                "str(value).lower().strip() in "
+                f"{json.dumps(safe_values, ensure_ascii=False)}"
+                ")"
+            )
         
         # Rule 2: Check for common typo characters
         rules.append("lambda value: 'x' not in str(value).lower() if value else True")
@@ -159,6 +188,9 @@ Return ONLY the lambda functions, one per line. Each function should return True
         """Generate rules to validate patterns."""
         sample_values = metadata.get('sample_values', [])
         pattern_analysis = metadata.get('pattern_analysis', '')
+        shape_distribution = metadata.get('shape_distribution', [])[:8]
+        regex_candidates = metadata.get('regex_candidates', [])[:3]
+        length_distribution = metadata.get('length_distribution', [])[:8]
         
         if not sample_values:
             return []
@@ -169,6 +201,9 @@ For column '{column}', generate up to 3 Python lambda functions to validate the 
 Column metadata:
 - Pattern analysis: {pattern_analysis}
 - Sample values: {json.dumps(sample_values[:10])}
+- Shape distribution: {json.dumps(shape_distribution, ensure_ascii=False)}
+- Length distribution: {json.dumps(length_distribution, ensure_ascii=False)}
+- Existing regex candidates (if any): {json.dumps(regex_candidates, ensure_ascii=False)}
 
 Rules should validate:
 1. Expected format (digits only, specific length, special characters)
@@ -217,9 +252,10 @@ class OutlierLegislator(BaseLegislator):
 
     def _get_system_prompt(self) -> str:
         """System prompt for numeric anomaly and outlier detection."""
-        return """You are a statistical analyst expert in detecting numeric outliers and anomalies.
-Your role is to generate Python lambda functions that identify values outside acceptable ranges or statistical norms.
-You understand domain constraints, statistical thresholds (mean, std dev), and reasonable value ranges for different data types.
+        return """You are a domain expert and data quality analyst.
+Your role is to generate Python lambda functions that identify numeric values that are logically or statistically impossible or highly improbable.
+PRIORITIZE business common sense and domain knowledge (e.g., ages shouldn't be 200, prices shouldn't be negative).
+Use statistical thresholds (mean, std dev, IQR) ONLY when clear business logic cannot be inferred from the column name and data samples.
 Return ONLY the lambda functions, one per line. Each function should return True for valid numeric values."""
 
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
@@ -228,6 +264,13 @@ Return ONLY the lambda functions, one per line. Each function should return True
         min_val = metadata.get('min')
         max_val = metadata.get('max')
         mean_val = metadata.get('mean')
+        std_val = metadata.get('std')
+        quantiles = metadata.get('quantiles', {})
+        iqr = metadata.get('iqr')
+        mad = metadata.get('mad')
+        extreme_values = metadata.get('extreme_numeric_values', {})
+        non_numeric_count = metadata.get('non_numeric_count', 0)
+        non_numeric_examples = metadata.get('non_numeric_examples', [])[:5]
         
         if numeric_count == 0 or min_val is None or max_val is None:
             return []
@@ -240,17 +283,24 @@ Column statistics:
 - Max: {max_val}
 - Mean: {mean_val}
 - Valid numeric values: {numeric_count}
+- Std Dev: {std_val}
+- Quantiles: {json.dumps(quantiles)}
+- IQR: {iqr}, MAD: {mad}
+- Extreme samples: {json.dumps(extreme_values)}
+- Non-numeric count: {non_numeric_count}, examples: {json.dumps(non_numeric_examples)}
 
-Rules should:
-1. Check for reasonable value ranges based on domain knowledge
-2. Flag extremely high or low values
-3. Validate against typical patterns for the field
+Instructions:
+1. PRIORITIZE business common sense: If the column name '{column}' implies a known domain (e.g., year, age, percentage), set hard logical bounds.
+2. Use statistics ONLY as a fallback: Use mean/std or IQR for generic numeric columns where business meaning is unclear.
+3. Avoid redundant rules: Don't just repeat the min/max if they look normal.
+4. Each rule should be a standalone lambda function returning True for VALID data.
 
 Return ONLY lambda functions, one per line.
 
 Examples:
-lambda value: float(value) <= 150 if value else True
-lambda value: float(value) >= 0 if value else True
+lambda value: 0 <= float(value) <= 120 if value else True  # for 'age'
+lambda value: float(value) > 0 if value else True          # for 'price'
+lambda value: abs(float(value) - {mean_val}) <= 3 * {std_val} if value else True # fallback statistical rule
 """
         rules_text = self._call_llm(prompt)
         
@@ -286,67 +336,308 @@ You understand domain logic, temporal constraints, and referential integrity req
 Return ONLY the lambda functions, one per line. Each function accepts a row (dict) and returns True for logically consistent data."""
 
     def generate_rules(self, row_data: Dict[str, Any], all_metadata: Dict[str, Any]) -> List[str]:
-        """Generate rules for logical consistency across columns."""
-        # This is a special agent that operates on entire rows, not single columns
+        """
+        Generate rules for logical consistency across columns.
+
+        This method can work in two modes:
+        1. If relationship_profiles exist in metadata, use them (backward compatibility)
+        2. If no relationship_profiles, intelligently infer relationships from metadata
+        """
         rules = []
-        
-        # Example: Check for date consistency (if applicable)
+        seen_constraints = set()
+        max_rules = 10
+
+        # Check if we have existing relationship profiles
+        has_existing_profiles = any(
+            metadata.get('relationship_profiles')
+            for metadata in all_metadata.values()
+        )
+
+        if has_existing_profiles:
+            # Use existing relationship profiles (backward compatibility)
+            for column, metadata in all_metadata.items():
+                profiles = metadata.get('relationship_profiles', [])
+                if not profiles:
+                    continue
+
+                for profile in profiles:
+                    constraint_key = (column, profile.get('other_column'), profile.get('type'))
+                    if constraint_key in seen_constraints:
+                        continue
+
+                    prompt = self._build_constraint_prompt(column, profile, all_metadata)
+                    rule_text = self._call_llm(prompt, max_tokens=400)
+                    lambda_rule = self._extract_lambda(rule_text)
+                    if lambda_rule:
+                        rules.append(lambda_rule)
+                        seen_constraints.add(constraint_key)
+
+                    if len(rules) >= max_rules:
+                        return rules
+        else:
+            # Intelligently infer relationships from metadata
+            inferred_rules = self._infer_relationships_from_metadata(all_metadata)
+            rules.extend(inferred_rules)
+
+        if not rules:
+            return self._default_temporal_rules(all_metadata)
+
+        return rules[:max_rules]
+
+    def _infer_relationships_from_metadata(self, all_metadata: Dict[str, Any]) -> List[str]:
+        """
+        Intelligently infer cross-column relationships from metadata using LLM.
+
+        Returns:
+            List of lambda functions for cross-column validation
+        """
+        rules = []
+
+        # Build a summary of all columns
+        column_summaries = []
+        for column, metadata in all_metadata.items():
+            col_type = metadata.get('type', 'unknown')
+            sample_values = metadata.get('sample_values', [])
+            top_values = metadata.get('top_values', {})
+            unique_count = metadata.get('unique_count', 0)
+
+            # Get a few representative values
+            if sample_values:
+                representative = sample_values[:5]
+            elif top_values:
+                representative = list(top_values.keys())[:5]
+            else:
+                representative = []
+
+            column_summaries.append({
+                'column': column,
+                'type': col_type,
+                'unique_count': unique_count,
+                'samples': representative
+            })
+
+        # Build prompt for LLM to analyze relationships
+        prompt_lines = [
+            "Analyze the following columns and identify logical relationships between them.",
+            "For each relationship you identify, generate a Python lambda function that validates it.",
+            "",
+            "Columns in the dataset:"
+        ]
+
+        for col in column_summaries:
+            prompt_lines.append(
+                f"- {col['column']} (type: {col['type']}, unique values: {col['unique_count']}, samples: {col['samples']})"
+            )
+
+        prompt_lines.extend([
+            "",
+            "Instructions:",
+            "1. Identify meaningful cross-column relationships (e.g., temporal ordering, geographic consistency, value dependencies)",
+            "2. For each relationship, generate a lambda function: lambda row: <validation_logic>",
+            "3. Return ONLY the lambda functions, one per line",
+            "4. Handle None/empty values gracefully",
+            "5. Focus on relationships that make domain sense",
+            "",
+            "Examples of valid relationships:",
+            "- If 'AdmissionDate' and 'DischargeDate' exist: check discharge >= admission",
+            "- If 'State' and 'StateAvg' exist: check StateAvg starts with State_",
+            "- If 'City' and 'CityInState' exist: check City appears in CityInState",
+            "",
+            "Return only lambda functions:"
+        ])
+
+        prompt = "\n".join(prompt_lines)
+
+        # Call LLM to get relationship rules
+        response = self._call_llm(prompt, max_tokens=800)
+
+        if not response or "lambda" not in response.lower():
+            return []
+
+        # Extract lambda functions from response
+        for line in response.splitlines():
+            line = line.strip()
+            if line.lower().startswith("lambda"):
+                rules.append(line)
+            elif "lambda" in line.lower():
+                # Extract lambda from the line
+                idx = line.lower().index("lambda")
+                candidate = line[idx:].strip()
+                if candidate.lower().startswith("lambda"):
+                    rules.append(candidate)
+
+        return rules
+
+    def _build_constraint_prompt(self, column: str, profile: Dict[str, Any],
+                                 metadata_map: Dict[str, Any]) -> str:
+        """Build an LLM prompt for a specific cross-column constraint."""
+        other_column = profile.get('other_column')
+        constraint_type = profile.get('type')
+        description = profile.get('description', '')
+        violation_rate = profile.get('violation_rate')
+        top_cooccurrences = profile.get('top_cooccurrences', [])[:5]
+
+        column_meta = metadata_map.get(column, {})
+        other_meta = metadata_map.get(other_column, {})
+
+        prompt_lines = [
+            f"Generate a Python lambda row function that enforces the constraint between '{column}' ({column_meta.get('type')})",
+            f"and '{other_column}' ({other_meta.get('type')}).",
+            f"Constraint type: {constraint_type}",
+            f"Description: {description}",
+            f"Violation rate observed in data: {violation_rate:.4f}" if violation_rate is not None else "",
+            "Top co-occurring value pairs (value ↔ other_value, ratio):"
+        ]
+
+        for pair in top_cooccurrences:
+            prompt_lines.append(
+                f"- {pair.get('value')} ↔ {pair.get('other_value')} ({pair.get('ratio', 0):.2%}, count={pair.get('count')})"
+            )
+
+        prompt_lines.append(
+            "\nRequirements:\n"
+            "1. Return True when the constraint holds or when required values are missing.\n"
+            "2. Return False only for confident violations based on the described constraint.\n"
+            "3. Handle None/empty strings without raising exceptions."
+        )
+        prompt_lines.append("\nReturn ONLY the lambda definition (e.g., lambda row: <expression>).")
+
+        return "\n".join([line for line in prompt_lines if line])
+
+    def _extract_lambda(self, response: str) -> str:
+        """Extract the first lambda expression from the LLM response."""
+        if not response or "lambda" not in response.lower():
+            return None
+
+        for line in response.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.lower().startswith("lambda"):
+                return line
+            if "lambda" in line.lower():
+                idx = line.lower().index("lambda")
+                candidate = line[idx:]
+                if candidate.lower().startswith("lambda"):
+                    return candidate
+        return None
+
+    def _default_temporal_rules(self, all_metadata: Dict[str, Any]) -> List[str]:
+        """Fallback temporal consistency rules (legacy behaviour)."""
+        rules = []
         if 'AdmissionDate' in all_metadata and 'DischargeDate' in all_metadata:
-            prompt = """
-Generate a Python lambda function to check if DischargeDate >= AdmissionDate for hospital records.
-
-Rule should:
-1. Handle date parsing
-2. Return True if dates are valid and ordered correctly
-3. Return False if discharge is before admission
-
-Format:
-lambda row: <expression>
-
-Example:
-lambda row: pd.to_datetime(row['DischargeDate']) >= pd.to_datetime(row['AdmissionDate']) if row.get('DischargeDate') and row.get('AdmissionDate') else True
-"""
-            rule_text = self._call_llm(prompt, max_tokens=300)
-            if rule_text and "lambda" in rule_text.lower():
-                rules.append(rule_text.strip())
-        
+            rules.append(
+                "lambda row: ("
+                "row.get('DischargeDate') is None or row.get('AdmissionDate') is None or ("
+                "pd.to_datetime(row['DischargeDate']) >= pd.to_datetime(row['AdmissionDate'])"
+                "))"
+            )
         return rules
 
 
-class CleanBaseRuleAgent:
-    """Base class for deterministic clean-rule agents (non-LLM)."""
-
-    pillar_name = "base"
-
-    def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
-        raise NotImplementedError
-
-
-class CleanCompletenessLegislator(CleanBaseRuleAgent):
-    """Ensure values are present (non-missing)."""
+class CleanCompletenessLegislator(BaseLegislator):
+    """Agent specialized in Completeness pillar - ensuring values are present and complete."""
 
     pillar_name = "completeness"
 
+    def _get_system_prompt(self) -> str:
+        """System prompt for completeness validation."""
+        return """You are a data completeness expert specializing in ensuring data completeness and presence.
+Your role is to generate Python lambda functions that confirm when a value is definitely COMPLETE (present and non-missing).
+You understand various representations of missing data (None, NaN, empty strings, 'N/A', 'null', etc.) and know that clean data should NOT contain these placeholders.
+Return ONLY the lambda functions, one per line. Each function should return True for complete/present values."""
+
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
+        """Generate rules to ensure data completeness."""
+        dominant_tokens = metadata.get('dominant_missing_tokens') or []
+        null_count = metadata.get('null_count', 0)
+        observed_missing = sum(
+            count for token, count in metadata.get('missing_token_counts', {}).items()
+            if token != "<NA>"
+        )
+
+        if null_count == 0 and observed_missing == 0:
+            # Still generate a completeness check rule
+            pass
+
+        token_pool = sorted(set(DEFAULT_MISSING_TOKENS + dominant_tokens))
+        token_literal = json.dumps(token_pool, ensure_ascii=False)
+
         rule = (
             "lambda value, row=None: ("
             "value is not None and "
-            "str(value).strip().lower() not in " + DEFAULT_MISSING_TOKEN_STR +
+            "str(value).strip().lower() not in " + token_literal +
             ")"
         )
         return [rule]
 
 
-class CleanAccuracyLegislator(CleanBaseRuleAgent):
-    """Ensure values fall into reasonable numeric/text ranges."""
+class CleanAccuracyLegislator(BaseLegislator):
+    """Agent specialized in Accuracy pillar - ensuring values fall into reasonable ranges."""
 
     pillar_name = "accuracy"
 
+    def _get_system_prompt(self) -> str:
+        """System prompt for accuracy validation."""
+        return """You are a data accuracy expert specializing in validating value accuracy and reasonableness.
+Your role is to generate Python lambda functions that confirm when a value is definitely ACCURATE (within reasonable domain constraints).
+You understand numeric ranges, enumerations, domain-specific thresholds, and typical value distributions.
+Return ONLY the lambda functions, one per line. Each function should return True for accurate/valid values."""
+
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
-        rules = []
+        """Generate rules to ensure data accuracy."""
         col_type = metadata.get('type', 'text')
         min_val = metadata.get('min')
         max_val = metadata.get('max')
+        mean_val = metadata.get('mean')
+        std_val = metadata.get('std')
+        sample_values = metadata.get('sample_values', [])
+        top_values = metadata.get('top_values', {})
+        unique_count = metadata.get('unique_count', 0)
+        numeric_count = metadata.get('numeric_count', 0)
+        categorical_values = list(top_values.keys())[:20] if top_values else []
+
+        prompt = f"""
+For column '{column}', generate up to 2 Python lambda functions to validate data ACCURACY.
+
+Column metadata:
+- Type: {col_type}
+- Unique count: {unique_count}
+- Sample values: {sample_values[:10]}
+- Top categorical values: {categorical_values}
+- Min: {min_val}, Max: {max_val}, Mean: {mean_val}, Std: {std_val}
+- Numeric count: {numeric_count}
+
+Rules should:
+1. For numeric: check reasonable value ranges based on statistics
+2. For categorical: check values against expected enumerations
+3. For text: check reasonable length and character constraints
+4. Be PERMISSIVE - only reject clearly inaccurate values
+
+Return ONLY lambda functions, one per line. Format:
+lambda value, row=None: <expression>
+
+Example for numeric 'age':
+lambda value, row=None: value is not None and str(value).strip() not in ['', 'nan', 'none', 'null', 'n/a', 'na', 'unknown'] and str(value).replace('.', '', 1).replace('-', '', 1).isdigit() and 0 <= float(value) <= 150
+
+Example for categorical 'status':
+lambda value, row=None: value is not None and str(value).strip().lower() in ['active', 'inactive', 'pending', 'completed'] if value else False
+"""
+
+        rules_text = self._call_llm(prompt)
+
+        if not rules_text or "lambda" not in rules_text.lower():
+            # Fallback to deterministic rules
+            return self._fallback_accuracy_rules(col_type, min_val, max_val, sample_values, top_values)
+
+        # Parse lambda functions from response
+        rules = [line.strip() for line in rules_text.split('\n') if line.strip().startswith('lambda')]
+        return rules if rules else self._fallback_accuracy_rules(col_type, min_val, max_val, sample_values, top_values)
+
+    def _fallback_accuracy_rules(self, col_type: str, min_val: float, max_val: float,
+                                  sample_values: List[Any], top_values: Dict) -> List[str]:
+        """Generate fallback accuracy validation rules."""
+        rules = []
 
         if col_type == 'numeric' and min_val is not None and max_val is not None:
             tolerance = max(1.0, abs(max_val - min_val) * 0.05 or 1.0)
@@ -354,13 +645,13 @@ class CleanAccuracyLegislator(CleanBaseRuleAgent):
             upper_bound = max_val + tolerance
             rules.append(
                 "lambda value, row=None: ("
-                "safe_float(value) is not None and "
+                "value is not None and "
                 f"{lower_bound} <= safe_float(value) <= {upper_bound}"
                 ")"
             )
         else:
-            sample_values = metadata.get('sample_values') or list((metadata.get('top_values') or {}).keys())
-            normalized = [len(str(val).strip()) for val in sample_values if val is not None and str(val).strip()]
+            sample_vals = sample_values or list(top_values.keys())
+            normalized = [len(str(val).strip()) for val in sample_vals if val is not None and str(val).strip()]
             if normalized:
                 min_len = max(1, min(normalized) - 2)
                 max_len = max(normalized) + 4
@@ -374,15 +665,67 @@ class CleanAccuracyLegislator(CleanBaseRuleAgent):
         return rules
 
 
-class CleanPatternLegislator(CleanBaseRuleAgent):
-    """Ensure values respect known patterns (IDs, codes)."""
+class CleanPatternLegislator(BaseLegislator):
+    """Agent specialized in Pattern Consistency pillar - ensuring values respect known patterns."""
 
     pillar_name = "pattern_consistency"
 
+    def _get_system_prompt(self) -> str:
+        """System prompt for pattern consistency validation."""
+        return """You are a data pattern validation expert specializing in format and pattern consistency.
+Your role is to generate Python lambda functions that confirm when a value follows the EXPECTED PATTERN/CONSISTENCY.
+You understand regex patterns, fixed-length codes, alphanumeric conventions, and structural constraints.
+Return ONLY the lambda functions, one per line. Each function should return True for values that match the expected pattern."""
+
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
+        """Generate rules to ensure pattern consistency."""
+        sample_values = metadata.get('sample_values', [])
+        pattern_analysis = metadata.get('pattern_analysis', '')
+        shape_distribution = metadata.get('shape_distribution', [])[:8]
+        length_distribution = metadata.get('length_distribution', [])[:8]
+        top_values = metadata.get('top_values', {})
+
+        prompt = f"""
+For column '{column}', generate up to 2 Python lambda functions to validate PATTERN CONSISTENCY.
+
+Column metadata:
+- Pattern analysis: {pattern_analysis}
+- Sample values: {sample_values[:10]}
+- Shape distribution: {shape_distribution}
+- Length distribution: {length_distribution}
+- Top values: {list(top_values.keys())[:10]}
+
+Rules should:
+1. Check expected format (digits only, specific length, special characters)
+2. Ensure consistent structure across values
+3. Validate character types for the field type
+4. Be PERMISSIVE - only reject values that clearly break patterns
+
+Return ONLY lambda functions, one per line. Format:
+lambda value, row=None: <expression>
+
+Example for ZIP code:
+lambda value, row=None: bool(re.match(r'^\\d{5}$', str(value).strip())) if value is not None else False
+
+Example for phone:
+lambda value, row=None: bool(re.match(r'^\\d{10}$', re.sub(r'\\D', '', str(value)))) if value is not None else False
+"""
+
+        rules_text = self._call_llm(prompt)
+
+        if not rules_text or "lambda" not in rules_text.lower():
+            return self._fallback_pattern_rules(column, metadata)
+
+        # Parse lambda functions from response
+        rules = [line.strip() for line in rules_text.split('\n') if line.strip().startswith('lambda')]
+        return rules if rules else self._fallback_pattern_rules(column, metadata)
+
+    def _fallback_pattern_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
+        """Generate fallback pattern validation rules."""
         rules = []
         pattern_hint = (metadata.get('pattern_analysis') or "").lower()
         column_lower = column.lower()
+        sample_values = metadata.get('sample_values') or list((metadata.get('top_values') or {}).keys())
 
         if 'zip' in column_lower or 'postal' in column_lower or '5-digit numeric' in pattern_hint:
             rules.append("lambda value, row=None: bool(re.match(r'^\\d{5}$', str(value).strip())) if value is not None else False")
@@ -391,7 +734,6 @@ class CleanPatternLegislator(CleanBaseRuleAgent):
         elif 'pattern' in pattern_hint and 'alphanumeric' in pattern_hint:
             rules.append("lambda value, row=None: bool(re.match(r'^[A-Za-z0-9\\-]+$', str(value).strip())) if value is not None else False")
         else:
-            sample_values = metadata.get('sample_values') or list((metadata.get('top_values') or {}).keys())
             if sample_values:
                 canonical_lengths = {len(str(val).strip()) for val in sample_values if val is not None and str(val).strip()}
                 if len(canonical_lengths) == 1:
@@ -407,16 +749,57 @@ class CleanPatternLegislator(CleanBaseRuleAgent):
         return rules
 
 
-class CleanRelationshipLegislator(CleanBaseRuleAgent):
-    """Ensure intra-row column relationship constraints."""
+class CleanRelationshipLegislator(BaseLegislator):
+    """Agent specialized in Column Relationship pillar - ensuring intra-row column relationship constraints."""
 
     pillar_name = "column_relationship"
 
-    def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
-        constraints = metadata.get('relationship_constraints') or []
-        if not constraints:
-            return []
+    def _get_system_prompt(self) -> str:
+        """System prompt for column relationship validation."""
+        return """You are a data relationship validation expert specializing in cross-column consistency and dependencies.
+Your role is to generate Python lambda functions that confirm when column values maintain their EXPECTED RELATIONSHIPS.
+You understand referential integrity, temporal ordering, prefix matching, and inter-column dependencies.
+Return ONLY the lambda functions, one per line. Each function should return True for values that satisfy relationship constraints.
+Note: Functions should accept (value, row) where row contains other column values."""
 
+    def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
+        """Generate rules to ensure column relationship consistency."""
+        constraints = metadata.get('relationship_constraints') or []
+        sample_values = metadata.get('sample_values', [])
+        top_values = metadata.get('top_values', {})
+
+        if not constraints:
+            # Try to infer relationships from metadata
+            prompt = f"""
+For column '{column}', generate up to 2 Python lambda functions to validate COLUMN RELATIONSHIPS.
+
+Column metadata:
+- Sample values: {sample_values[:10]}
+- Top values: {list(top_values.keys())[:10]}
+
+Look for hints about relationships in the column name or values (e.g., if column is 'CityAvg', there might be a 'City' column it relates to).
+Generate rules that validate inter-column dependencies using the 'row' parameter.
+
+Return ONLY lambda functions, one per line. Format:
+lambda value, row=None: <expression>
+
+Example for State/StateAvg:
+lambda value, row=None: (row is None or row.get('State') is None or str(value).strip().lower().startswith(str(row.get('State')).strip().lower() + '_'))
+
+Example for City/CityInState:
+lambda value, row=None: (row is None or row.get('City') is None or str(row.get('City')).strip().lower() in str(value).strip().lower())
+"""
+
+            rules_text = self._call_llm(prompt)
+
+            if not rules_text or "lambda" not in rules_text.lower():
+                return []
+
+            # Parse lambda functions from response
+            rules = [line.strip() for line in rules_text.split('\n') if line.strip().startswith('lambda')]
+            return rules
+
+        # Use explicit constraints
         rules = []
         for constraint in constraints:
             constraint_type = constraint.get('type')
@@ -519,61 +902,6 @@ lambda value: value is None or str(value).strip() in ['', 'nan', 'none', 'null',
 Be strict in what you flag as dirty - P_dirty's job is to catch clear errors, not to be permissive.
 """
 
-    def _looks_like_time_column(self, column: str, metadata: Dict[str, Any]) -> bool:
-        """Heuristic: detect time-like columns (e.g., flights *_time)."""
-        name = (column or "").lower()
-        if "time" in name:
-            return True
-
-        samples = metadata.get("sample_values") or []
-        top_values = list((metadata.get("top_values") or {}).keys())
-        candidates = [str(v) for v in (samples[:20] + top_values[:20]) if v is not None]
-        if not candidates:
-            return False
-
-        time_like = 0
-        for v in candidates[:40]:
-            s = str(v).strip().lower()
-            if ":" in s and ("a.m" in s or "p.m" in s or "am" in s or "pm" in s):
-                time_like += 1
-            elif re.search(r"\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}", s):
-                time_like += 1
-        return time_like >= 2
-
-    def _time_p_clean_rule(self) -> str:
-        """
-        Deterministic P_clean for time strings used in flights dataset.
-
-        Accepts:
-        - 'H:MM a.m.' / 'HH:MM p.m.' (with optional dots/casing)
-        - 'MM/DD/YYYY H:MM a.m.' (date + time)
-        Rejects:
-        - missing/placeholder tokens
-        """
-        missing_tokens = "['', 'nan', 'none', 'null', 'n/a', 'na', 'unknown']"
-        return (
-            "lambda value: ("
-            "value is not None and "
-            "str(value).strip().lower() not in " + missing_tokens + " and "
-            "("
-            "bool(re.match(r'^\\d{1,2}:\\d{2}\\s*(a\\.?m\\.?|p\\.?m\\.?)\\.?$', str(value).strip(), re.IGNORECASE))"
-            " or "
-            "bool(re.match(r'^\\d{1,2}/\\d{1,2}/\\d{4}\\s+\\d{1,2}:\\d{2}\\s*(a\\.?m\\.?|p\\.?m\\.?)\\.?$', str(value).strip(), re.IGNORECASE))"
-            ")"
-            ")"
-        )
-
-    @staticmethod
-    def _complement_dirty_rule(clean_rule_str: str) -> str:
-        """
-        Build P_dirty as the (safe) logical complement of P_clean to guarantee:
-        - No Grey Zone (coverage-by-design)
-        - No Conflict (mutual exclusivity)
-
-        Requires Judge.safe_dict to include `safe_not`.
-        """
-        return f"lambda value, row=None, _p=({clean_rule_str}): safe_not(_p, value, row)"
-
     def _combine_clean_base_rules(self, clean_base_rules: List[Tuple[str, str]] = None) -> str:
         """Combine deterministic clean base rules (per pillar) into a single predicate."""
         if not clean_base_rules:
@@ -600,10 +928,6 @@ Be strict in what you flag as dirty - P_dirty's job is to catch clear errors, no
         Returns:
             P_clean lambda function string
         """
-        # Deterministic fast-path for time-like columns
-        if self._looks_like_time_column(column, metadata):
-            return self._time_p_clean_rule()
-
         combined_clean = self._combine_clean_base_rules(clean_base_rules)
         if combined_clean:
             return combined_clean
@@ -766,7 +1090,21 @@ Be strict in what you flag as dirty - P_dirty's job is to catch clear errors, no
         if not dirty_rule:
             return self._fallback_p_dirty_rule(column, metadata)
 
+        # Validate syntax
+        if not self._validate_lambda_syntax(dirty_rule):
+            print(f"  ⚠ Invalid P_dirty rule syntax, using fallback")
+            return self._fallback_p_dirty_rule(column, metadata)
+
         return dirty_rule
+
+    def _validate_lambda_syntax(self, rule_str: str) -> bool:
+        """Validate that a lambda rule string has correct syntax."""
+        try:
+            # Try to compile the rule
+            compile(rule_str, '<string>', 'eval')
+            return True
+        except:
+            return False
 
     def generate_dual_rules(self, column: str, metadata: Dict[str, Any],
                            grey_samples: List[Dict[str, Any]] = None,
@@ -802,12 +1140,13 @@ Be strict in what you flag as dirty - P_dirty's job is to catch clear errors, no
         meta["_base_rules"] = base_rules or []
         meta["_clean_base_rules"] = clean_base_rules or []
 
-        # Generate P_clean, then derive P_dirty as safe complement (coverage-by-design).
+        # Generate P_clean and P_dirty independently (no complement rule)
         clean_rule = self.generate_p_clean_rule(column, meta, clean_base_rules=clean_base_rules)
         if not clean_rule:
             clean_rule = self._fallback_p_clean_rule(column, meta)
 
-        dirty_rule = self._complement_dirty_rule(clean_rule)
+        # Generate independent dirty rule (not complement of clean)
+        dirty_rule = self.generate_p_dirty_rule(column, meta)
 
         # Return as list of single candidate (can generate multiple in future)
         return [(self.__class__.__name__, clean_rule, dirty_rule)]
@@ -831,12 +1170,22 @@ Be strict in what you flag as dirty - P_dirty's job is to catch clear errors, no
         missing_tokens = "['', 'nan', 'none', 'null', 'n/a', 'na', 'unknown']"
 
         if col_type == 'numeric':
-            # Permissive numeric: accept most numbers within reasonable range
-            clean_rule = (
-                "lambda value: value is not None and str(value).strip() not in "
-                f"{missing_tokens} and str(value).replace('.', '', 1).replace('-', '', 1).replace('+', '', 1).replace('e', '', 1).replace('E', '', 1).isdigit() "
-                "and -100000 <= float(value) <= 1000000"
-            )
+            # For abv-like columns (alcohol by volume), be very permissive
+            if 'abv' in column.lower() or any('.' in str(v) and len(str(v)) <= 4 for v in sample_values[:10]):
+                # ABV: accept any numeric value (with or without %), including values > 1
+                # This is very permissive to reduce gap zone
+                clean_rule = (
+                    "lambda value: value is not None and str(value).strip() not in "
+                    f"{missing_tokens} and (str(value).replace('%', '').replace('.', '', 1).replace('-', '', 1).isdigit() or "
+                    "(isinstance(value, (int, float)) and 0 <= value <= 100))"
+                )
+            else:
+                # Permissive numeric: accept most numbers within reasonable range
+                clean_rule = (
+                    "lambda value: value is not None and str(value).strip() not in "
+                    f"{missing_tokens} and str(value).replace('.', '', 1).replace('-', '', 1).replace('+', '', 1).replace('e', '', 1).replace('E', '', 1).isdigit() "
+                    "and -100000 <= float(value) <= 1000000"
+                )
         elif col_type == 'categorical':
             # Permissive categorical: accept any non-empty string that doesn't look like missing value
             clean_rule = (
@@ -862,12 +1211,21 @@ Be strict in what you flag as dirty - P_dirty's job is to catch clear errors, no
         missing_tokens = "['', 'nan', 'none', 'null', 'n/a', 'na', 'unknown', 'xxxxx', 'asdf', 'test123']"
 
         if col_type == 'numeric':
-            # Strict numeric: only flag if clearly invalid format or extreme outlier
-            dirty_rule = (
-                "lambda value: value is None or str(value).strip() in "
-                f"{missing_tokens} or (str(value).replace('.', '', 1).replace('-', '', 1).replace('+', '', 1).replace('e', '', 1).replace('E', '', 1).isdigit() "
-                "and (float(value) < -100000 or float(value) > 1000000))"
-            )
+            # For abv-like columns, flag values with % symbol or invalid format
+            if 'abv' in column.lower() or any('.' in str(v) and len(str(v)) <= 4 for v in sample_values[:10]):
+                # ABV: flag values with % symbol or clearly invalid
+                dirty_rule = (
+                    "lambda value: value is None or str(value).strip() in "
+                    f"{missing_tokens} or ('%' in str(value)) or (str(value).replace('.', '', 1).replace('%', '', 1).isdigit() "
+                    "and (float(str(value).strip('%')) < 0 or float(str(value).strip('%')) > 100))"
+                )
+            else:
+                # Strict numeric: only flag if clearly invalid format or extreme outlier
+                dirty_rule = (
+                    "lambda value: value is None or str(value).strip() in "
+                    f"{missing_tokens} or (str(value).replace('.', '', 1).replace('-', '', 1).replace('+', '', 1).replace('e', '', 1).replace('E', '', 1).isdigit() "
+                    "and (float(value) < -100000 or float(value) > 1000000))"
+                )
         elif col_type == 'categorical':
             # Strict categorical: only flag if clearly missing or obviously invalid
             dirty_rule = (
@@ -952,6 +1310,7 @@ class LegislatorFactory:
         
         # All columns can have missing values
         agents.append(MissingLegislator(self.base_url, self.model))
+        agents.append(PatternLegislator(self.base_url, self.model))
         
         # Type-specific agents
         if column_type == 'categorical':
@@ -967,13 +1326,13 @@ class LegislatorFactory:
         
         return agents
 
-    def create_clean_agents(self, column: str, column_type: str) -> List[CleanBaseRuleAgent]:
+    def create_clean_agents(self, column: str, column_type: str) -> List[BaseLegislator]:
         """Create clean-rule agents that cover completeness/accuracy/relationships/patterns."""
         return [
-            CleanCompletenessLegislator(),
-            CleanAccuracyLegislator(),
-            CleanRelationshipLegislator(),
-            CleanPatternLegislator(),
+            CleanCompletenessLegislator(self.base_url, self.model),
+            CleanAccuracyLegislator(self.base_url, self.model),
+            CleanRelationshipLegislator(self.base_url, self.model),
+            CleanPatternLegislator(self.base_url, self.model),
         ]
 
     def generate_rules_per_column(self, metadata: Dict[str, Any]) -> Dict[str, List[Tuple[str, str]]]:
@@ -1120,3 +1479,143 @@ class LegislatorFactory:
                 print(f"✗ Error generating rules: {e}")
 
         return all_rules
+
+    def generate_p_clean_predicates_per_column(self, metadata: Dict[str, Any],
+                                              clean_base_rules: Dict[str, List[Tuple[str, str]]] = None,
+                                              base_rules: Dict[str, List[Tuple[str, str]]] = None,
+                                              refinement_context: Dict[str, Any] = None) -> Dict[str, str]:
+        """
+        Generate independent P_clean predicates for all columns (not as a complement of P_dirty).
+
+        Args:
+            metadata: Column metadata dictionary
+            clean_base_rules: Pre-generated clean rules per quality pillar
+            base_rules: Base error detection rules for reference
+            refinement_context: Optional refinement samples (conflict/gap)
+
+        Returns:
+            Dict[column] = P_clean rule string
+        """
+        print("\n" + "="*80)
+        print("GENERATING P_CLEAN PREDICATES (INDEPENDENT)")
+        print("="*80)
+
+        p_clean_rules = {}
+        dual_legislator = DualLegislator(self.base_url, self.model)
+
+        for column, col_metadata in metadata.items():
+            print(f"\n{'='*80}")
+            print(f"Column: {column}")
+            print(f"{'='*80}")
+
+            try:
+                # Prepare metadata with refinement context if provided
+                meta = dict(col_metadata or {})
+                if refinement_context and column in refinement_context:
+                    context = refinement_context[column]
+                    meta["_refine_grey_samples"] = context.get('gap_samples', [])
+                    meta["_refine_conflict_samples"] = context.get('conflict_samples', [])
+                    meta["_base_rules"] = base_rules.get(column, []) if base_rules else []
+
+                # Generate P_clean using DualLegislator
+                clean_rule = dual_legislator.generate_p_clean_rule(
+                    column,
+                    meta,
+                    clean_base_rules=clean_base_rules.get(column, []) if clean_base_rules else None
+                )
+
+                if clean_rule:
+                    p_clean_rules[column] = clean_rule
+                    print(f"✓ Generated P_clean:")
+                    print(f"  {clean_rule}")
+                else:
+                    print(f"✗ Failed to generate P_clean")
+
+            except Exception as e:
+                print(f"✗ Error generating P_clean: {e}")
+
+        return p_clean_rules
+
+    def generate_p_dirty_predicates_per_column(self, metadata: Dict[str, Any],
+                                              base_rules: Dict[str, List[Tuple[str, str]]] = None,
+                                              refinement_context: Dict[str, Any] = None) -> Dict[str, str]:
+        """
+        Generate independent P_dirty predicates for all columns.
+
+        Args:
+            metadata: Column metadata dictionary
+            base_rules: Base error detection rules for reference
+            refinement_context: Optional refinement samples (conflict/gap)
+
+        Returns:
+            Dict[column] = P_dirty rule string
+        """
+        print("\n" + "="*80)
+        print("GENERATING P_DIRTY PREDICATES (INDEPENDENT)")
+        print("="*80)
+
+        p_dirty_rules = {}
+        dual_legislator = DualLegislator(self.base_url, self.model)
+
+        for column, col_metadata in metadata.items():
+            print(f"\n{'='*80}")
+            print(f"Column: {column}")
+            print(f"{'='*80}")
+
+            try:
+                # Prepare metadata with refinement context if provided
+                meta = dict(col_metadata or {})
+                if refinement_context and column in refinement_context:
+                    context = refinement_context[column]
+                    meta["_refine_gap_samples"] = context.get('gap_samples', [])
+                    meta["_refine_conflict_samples"] = context.get('conflict_samples', [])
+                    meta["_base_rules"] = base_rules.get(column, []) if base_rules else []
+
+                # Generate P_dirty using DualLegislator
+                dirty_rule = dual_legislator.generate_p_dirty_rule(column, meta)
+
+                if dirty_rule:
+                    p_dirty_rules[column] = dirty_rule
+                    print(f"✓ Generated P_dirty:")
+                    print(f"  {dirty_rule}")
+                else:
+                    print(f"✗ Failed to generate P_dirty")
+
+            except Exception as e:
+                print(f"✗ Error generating P_dirty: {e}")
+
+        return p_dirty_rules
+
+    def pair_clean_dirty(self, p_clean_map: Dict[str, str],
+                        p_dirty_map: Dict[str, str]) -> Dict[str, List[Tuple[str, str, str]]]:
+        """
+        Pair up independent P_clean and P_dirty rules into dual rule format.
+
+        Args:
+            p_clean_map: Dict[column] = P_clean rule string
+            p_dirty_map: Dict[column] = P_dirty rule string
+
+        Returns:
+            Dict[column] = List[(agent_name, clean_rule_str, dirty_rule_str)]
+        """
+        print("\n" + "="*80)
+        print("PAIRING P_CLEAN AND P_DIRTY RULES")
+        print("="*80)
+
+        paired_rules = {}
+        all_columns = set(p_clean_map.keys()) | set(p_dirty_map.keys())
+
+        for column in all_columns:
+            clean_rule = p_clean_map.get(column)
+            dirty_rule = p_dirty_map.get(column)
+
+            if clean_rule and dirty_rule:
+                paired_rules[column] = [("DualLegislator", clean_rule, dirty_rule)]
+                print(f"\n✓ {column}: paired successfully")
+            else:
+                if not clean_rule:
+                    print(f"\n✗ {column}: missing P_clean")
+                if not dirty_rule:
+                    print(f"\n✗ {column}: missing P_dirty")
+
+        return paired_rules

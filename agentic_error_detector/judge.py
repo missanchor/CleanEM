@@ -3,7 +3,7 @@ Judge with VR (Violation Rate) based selection logic and Dual-Verification (P_cl
 """
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 import re
 from agentic_error_detector.dual_types import DualRule, DualEvaluationResult, RefinementRound
 
@@ -678,8 +678,8 @@ class Judge:
 
                     # Print evaluation summary
                     print(f"\n    Classification:")
-                    print(f"      Conflict: {conflict_count} ({conflict_rate:.4f})")
-                    print(f"      Grey Zone: {grey_count} ({grey_rate:.4f})")
+                    print(f"      Conflict (both true): {conflict_count} ({conflict_rate:.4f})")
+                    print(f"      Gap (both false): {grey_count} ({grey_rate:.4f})")
                     print(f"      Determined Clean: {determined_clean_count} ({clean_rate:.4f})")
                     print(f"      Determined Dirty: {determined_dirty_count} ({dirty_rate:.4f})")
                     print(f"    Status: {status}")
@@ -725,8 +725,8 @@ class Judge:
         Evaluate if dual rule pair meets hard constraints.
 
         Constraints:
-        1. conflict_rate == 0 (no conflicts)
-        2. grey_rate <= grey_tolerance
+        1. conflict_rate == 0 (no conflicts: P_clean and P_dirty both true)
+        2. grey_rate <= grey_tolerance (no gaps: at least one of P_clean/P_dirty true)
         3. dirty_rate < 1.0 (NOT all dirty)
         4. dirty_rate >= 0 (always true)
 
@@ -737,10 +737,10 @@ class Judge:
             return 'reject_all_dirty', f"Entire column marked dirty (dirty_rate={dirty_rate:.4f})"
 
         if conflict_rate > 0:
-            return 'reject_conflict', f"Predicates not mutually exclusive (conflict_rate={conflict_rate:.4f})"
+            return 'reject_conflict', f"Conflict zone exists: P_clean AND P_dirty both true (conflict_rate={conflict_rate:.4f})"
 
         if grey_rate > grey_tolerance:
-            return 'reject_grey', f"Too many uncertain values (grey_rate={grey_rate:.4f} > {grey_tolerance:.4f})"
+            return 'reject_gap', f"Gap zone too large: P_clean AND P_dirty both false (gap_rate={grey_rate:.4f} > {grey_tolerance:.4f})"
 
         if dirty_rate == 0:
             return 'accept_all_clean', f"Column is clean (dirty_rate={dirty_rate:.4f})"
@@ -794,6 +794,14 @@ class Judge:
             acceptable.sort(key=lambda x: x.dirty_rate)
 
             best_result = acceptable[0]
+
+            # Reject if dirty_rate > 0.5 (likely inverted logic or wrong rule type)
+            if best_result.dirty_rate > 0.5:
+                print(f"  ✗ Rejected: dirty_rate {best_result.dirty_rate:.4f} > 0.5")
+                print(f"    Rule likely has inverted logic or wrong type assumption")
+                print(f"    P_clean: {best_result.rule.clean_rule_str[:80]}...")
+                continue
+
             best_rules[column] = best_result.rule
 
             print(f"  ✓ Selected rule:")
@@ -809,23 +817,31 @@ class Judge:
                          metadata: Dict[str, Any],
                          dual_rules: Dict[str, List[Tuple[str, str, str]]],
                          max_rounds: int = 3,
-                         grey_tolerance: float = 0.0) -> Tuple[Dict[str, DualRule], Dict[str, List[RefinementRound]]]:
+                         grey_tolerance: float = 0.0,
+                         factory=None) -> Tuple[Dict[str, DualRule], Dict[str, List[RefinementRound]]]:
         """
         Iteratively refine dual rules to eliminate grey zones and conflicts.
+        For each problem, generate candidate fixes (modify clean or dirty independently)
+        and let Judge score and pick the best.
 
         Args:
             df: DataFrame to evaluate
-            metadata: Column metadata (for regenerating rules)
-            dual_rules: Initial dual rules
+            metadata: Column metadata
+            dual_rules: Initial dual rules {col: [(agent, clean_str, dirty_str), ...]}
             max_rounds: Maximum refinement rounds
-            grey_tolerance: Maximum acceptable grey zone rate
+            grey_tolerance: Maximum acceptable grey-zone (gap) rate
+            factory: LegislatorFactory instance with base_url/model (for LLM refinement)
 
         Returns:
             Tuple of (best_rules, refinement_history)
         """
         print("\n" + "="*80)
-        print("REFINING DUAL RULES - ITERATIVE IMPROVEMENT")
+        print("REFINING DUAL RULES - CONFLICT & GAP RESOLUTION")
         print("="*80)
+
+        from agentic_error_detector.legislator import LegislatorFactory
+        if factory is None:
+            factory = LegislatorFactory()
 
         current_rules = {col: list(rules) for col, rules in dual_rules.items()}
         refinement_history = {column: [] for column in current_rules.keys()}
@@ -854,47 +870,70 @@ class Judge:
                     best_result = self._select_refinement_candidate(results)
 
                     needs_refinement[column] = {
-                        'grey': best_result.grey_samples[:5],
-                        'conflict': best_result.conflict_samples[:5],
-                        'all_dirty': [s for s in best_result.determined_dirty_samples if s.get('count', 0) > len(df) * 0.5]
+                        'gap_samples': best_result.grey_samples[:5],  # Gap = both P_clean and P_dirty are false
+                        'conflict_samples': best_result.conflict_samples[:5],  # Conflict = both are true
                     }
 
                     print(f"\n  {column}: Needs refinement")
-                    print(f"    Grey samples: {len(needs_refinement[column]['grey'])}")
-                    print(f"    Conflict samples: {len(needs_refinement[column]['conflict'])}")
-                    print(f"    All-dirty samples: {len(needs_refinement[column]['all_dirty'])}")
+                    print(f"    Gap samples (both P_clean & P_dirty false): {len(needs_refinement[column]['gap_samples'])}")
+                    print(f"    Conflict samples (both P_clean & P_dirty true): {len(needs_refinement[column]['conflict_samples'])}")
 
             if all_acceptable:
                 print("\n✓ All columns have acceptable rules!")
                 break
 
-            # Generate refined rules
+            # Generate and evaluate candidate repairs for each problem column
             print(f"\n{'='*80}")
-            print(f"REFINING RULES FOR PROBLEMATIC COLUMNS")
+            print(f"GENERATING CANDIDATE REPAIRS FOR PROBLEMATIC COLUMNS")
             print(f"{'='*80}")
 
-            from agentic_error_detector.legislator import LegislatorFactory
-            factory = LegislatorFactory()
-
-            # Prepare refinement history for factory
             for column, samples in needs_refinement.items():
-                refinement_history[column].append({
-                    'round': round_number,
-                    'samples_used': samples
-                })
+                print(f"\n  Processing {column}...")
 
-            # Generate new rules with refinement samples
-            subset_metadata = {col: metadata.get(col, {}) for col in needs_refinement.keys()}
-            refined_rules = factory.generate_dual_rules_per_column(
-                subset_metadata,
-                refinement_history
-            )
+                # Collect current rules for this column
+                current_col_rules = current_rules.get(column, [])
+                if not current_col_rules:
+                    print(f"    ✗ No current rules found, skipping")
+                    continue
 
-            # Update current rules
-            for column in needs_refinement.keys():
-                if column in refined_rules:
-                    current_rules[column] = refined_rules[column]
-                    print(f"✓ Refined rules generated for {column}")
+                agent_name, clean_rule_str, dirty_rule_str = current_col_rules[0]
+
+                # Generate candidate repairs
+                candidates = self._generate_repair_candidates(
+                    column, clean_rule_str, dirty_rule_str,
+                    samples.get('conflict_samples', []), samples.get('gap_samples', []),
+                    df, metadata.get(column, {}), factory
+                )
+
+                if not candidates:
+                    print(f"    ✗ Failed to generate candidates")
+                    continue
+
+                print(f"    Generated {len(candidates)} candidates")
+
+                # Evaluate all candidates
+                candidate_results = {}
+                for cand_id, (cand_clean, cand_dirty) in candidates.items():
+                    cand_rules = {column: [(agent_name, cand_clean, cand_dirty)]}
+                    eval_result = self.evaluate_dual_rules(df, cand_rules, grey_tolerance)
+                    if column in eval_result and eval_result[column]:
+                        candidate_results[cand_id] = eval_result[column][0]
+
+                # Pick best candidate
+                best_candidate_id = self._score_candidates(candidate_results, grey_tolerance)
+                if best_candidate_id and best_candidate_id in candidates:
+                    best_clean, best_dirty = candidates[best_candidate_id]
+                    current_rules[column] = [(agent_name, best_clean, best_dirty)]
+                    print(f"    ✓ Selected candidate '{best_candidate_id}'")
+
+                    # Log refinement (gap_samples = both false, conflict_samples = both true)
+                    refinement_history[column].append({
+                        'round': round_number,
+                        'gap_samples': samples.get('gap_samples', []),
+                        'conflict_samples': samples.get('conflict_samples', []),
+                        'selected_candidate': best_candidate_id,
+                        'candidate_count': len(candidates)
+                    })
 
         # Final evaluation
         print(f"\n{'='*80}")
@@ -905,6 +944,118 @@ class Judge:
         best_rules = self.select_best_dual_rules(final_evaluation)
 
         return best_rules, refinement_history
+
+    def _generate_repair_candidates(self, column: str, clean_rule_str: str, dirty_rule_str: str,
+                                   conflict_samples: List[Dict[str, Any]],
+                                   gap_samples: List[Dict[str, Any]],
+                                   df: pd.DataFrame, col_metadata: Dict[str, Any],
+                                   factory) -> Dict[str, Tuple[str, str]]:
+        """
+        Generate multiple candidate repairs for a problematic column.
+
+        Returns:
+            Dict[candidate_id] = (new_clean_rule_str, new_dirty_rule_str)
+        """
+        candidates = {}
+
+        # Candidate 1: Modify P_clean for conflicts
+        if conflict_samples:
+            try:
+                new_clean = factory.generate_p_clean_predicates_per_column(
+                    {column: col_metadata},
+                    refinement_context={
+                        column: {'conflict_samples': conflict_samples, 'gap_samples': []}
+                    }
+                )
+                if column in new_clean and new_clean[column]:
+                    candidates['repair_clean_vs_conflict'] = (new_clean[column], dirty_rule_str)
+                    print(f"      Generated: repair_clean_vs_conflict")
+            except Exception as e:
+                print(f"      Failed to generate repair_clean_vs_conflict: {e}")
+
+        # Candidate 2: Modify P_dirty for conflicts
+        if conflict_samples:
+            try:
+                new_dirty = factory.generate_p_dirty_predicates_per_column(
+                    {column: col_metadata},
+                    refinement_context={
+                        column: {'conflict_samples': conflict_samples, 'gap_samples': []}
+                    }
+                )
+                if column in new_dirty and new_dirty[column]:
+                    candidates['repair_dirty_vs_conflict'] = (clean_rule_str, new_dirty[column])
+                    print(f"      Generated: repair_dirty_vs_conflict")
+            except Exception as e:
+                print(f"      Failed to generate repair_dirty_vs_conflict: {e}")
+
+        # Candidate 3: Expand P_clean for gaps
+        if gap_samples:
+            try:
+                new_clean = factory.generate_p_clean_predicates_per_column(
+                    {column: col_metadata},
+                    refinement_context={
+                        column: {'gap_samples': gap_samples, 'conflict_samples': []}
+                    }
+                )
+                if column in new_clean and new_clean[column]:
+                    candidates['expand_clean_for_gaps'] = (new_clean[column], dirty_rule_str)
+                    print(f"      Generated: expand_clean_for_gaps")
+            except Exception as e:
+                print(f"      Failed to generate expand_clean_for_gaps: {e}")
+
+        # Candidate 4: Expand P_dirty for gaps
+        if gap_samples:
+            try:
+                new_dirty = factory.generate_p_dirty_predicates_per_column(
+                    {column: col_metadata},
+                    refinement_context={
+                        column: {'gap_samples': gap_samples, 'conflict_samples': []}
+                    }
+                )
+                if column in new_dirty and new_dirty[column]:
+                    candidates['expand_dirty_for_gaps'] = (clean_rule_str, new_dirty[column])
+                    print(f"      Generated: expand_dirty_for_gaps")
+            except Exception as e:
+                print(f"      Failed to generate expand_dirty_for_gaps: {e}")
+
+        return candidates
+
+    def _score_candidates(self, candidate_results: Dict[str, DualEvaluationResult],
+                         grey_tolerance: float) -> str:
+        """
+        Score candidates and pick the best.
+
+        Scoring rules (in order):
+        1. conflict_rate == 0 (hard constraint)
+        2. grey_rate <= grey_tolerance (hard constraint)
+        3. Minimize dirty_rate (preference)
+
+        Returns:
+            Best candidate_id or None
+        """
+        if not candidate_results:
+            return None
+
+        # Filter by hard constraints
+        valid = {
+            cand_id: result for cand_id, result in candidate_results.items()
+            if result.conflict_rate == 0 and result.grey_rate <= grey_tolerance
+        }
+
+        if not valid:
+            # If no candidate meets constraints, pick the one closest to meeting them
+            print(f"      ⚠ No candidate fully meets constraints; picking least-bad option")
+            best_id = min(candidate_results.keys(),
+                         key=lambda cid: (
+                             candidate_results[cid].conflict_rate,
+                             candidate_results[cid].grey_rate - grey_tolerance,
+                             candidate_results[cid].dirty_rate
+                         ))
+            return best_id
+
+        # Among valid, prefer lowest dirty_rate
+        best_id = min(valid.keys(), key=lambda cid: valid[cid].dirty_rate)
+        return best_id
 
     def get_detected_dirty_values(self, best_rules: Dict[str, DualRule], df: pd.DataFrame) -> List[Dict[str, Any]]:
         """
@@ -985,8 +1136,8 @@ class Judge:
                 print(f"  Status: {result.status}")
                 print(f"  Dirty Rate: {result.dirty_rate:.4f} ({result.determined_dirty_count}/{result.total_rows})")
                 print(f"  Clean Rate: {result.clean_rate:.4f} ({result.determined_clean_count}/{result.total_rows})")
-                print(f"  Grey Rate: {result.grey_rate:.4f} ({result.grey_count}/{result.total_rows})")
-                print(f"  Conflict Rate: {result.conflict_rate:.4f} ({result.conflict_count}/{result.total_rows})")
+                print(f"  Gap Rate (both false): {result.grey_rate:.4f} ({result.grey_count}/{result.total_rows})")
+                print(f"  Conflict Rate (both true): {result.conflict_rate:.4f} ({result.conflict_count}/{result.total_rows})")
                 print(f"\n  P_clean: {rule.clean_rule_str}")
                 print(f"  P_dirty: {rule.dirty_rule_str}")
 
@@ -1062,3 +1213,7 @@ class Judge:
         print(f"  - refinement_history.json")
         print(f"  - detected_dirty_values.json")
         print(f"  - coverage_gaps.json")
+
+
+if __name__ == "__main__":
+    pass
