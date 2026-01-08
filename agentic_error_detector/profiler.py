@@ -424,13 +424,17 @@ class PandasProfiler:
 
     def _analyze_categorical(self, column: str) -> Dict[str, Any]:
         """Analyze categorical column for unique values and frequencies."""
-        value_counts = self.df[column].value_counts()
+        non_null_values = self.df[column].dropna().astype(str)
+        value_counts = non_null_values.value_counts()
         unique_count = len(value_counts)
+        sample_values = non_null_values.head(20).tolist()
 
         return {
             'unique_count': unique_count,
             'top_values': value_counts.head(10).to_dict(),
             'frequency_distribution': value_counts.to_dict(),
+            'sample_values': sample_values,
+            'pattern_analysis': self._guess_pattern(sample_values),
         }
 
     def _analyze_pattern(self, column: str) -> Dict[str, Any]:
@@ -541,10 +545,15 @@ class PandasProfiler:
 
     def _analyze_text(self, column: str) -> Dict[str, Any]:
         """Analyze text column."""
-        value_counts = self.df[column].value_counts()
+        non_null_values = self.df[column].dropna().astype(str)
+        value_counts = non_null_values.value_counts()
+        sample_values = non_null_values.head(20).tolist()
+
         return {
             'unique_count': len(value_counts),
             'top_values': value_counts.head(5).to_dict(),
+            'sample_values': sample_values,
+            'pattern_analysis': self._guess_pattern(sample_values),
         }
 
     def _guess_pattern(self, values: List[str]) -> str:

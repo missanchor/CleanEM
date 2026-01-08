@@ -69,3 +69,57 @@ class DualRuleSet:
     best_rules: Dict[str, DualRule]  # column -> best rule
     evaluation_results: Dict[str, DualEvaluationResult]  # column -> evaluation
     refinement_history: Dict[str, List[RefinementRound]]  # column -> refinement rounds
+
+
+@dataclass
+class RuleSetConflictAnalysis:
+    """分析 base_rules 和 clean_base_rules 之间的冲突.
+
+    冲突定义：clean_rules (AND逻辑) = true 且 detection_rules (OR逻辑) = true
+    缺口定义：clean_rules (AND逻辑) = false 且 detection_rules (OR逻辑) = false
+    """
+    column: str
+    total_rows: int
+
+    # 冲突样本：clean(AND)=true 且 dirty(OR)=true
+    conflict_samples: List[Dict[str, Any]]
+
+    # 缺口样本：clean(AND)=false 且 dirty(OR)=false
+    gap_samples: List[Dict[str, Any]]
+
+    # 指标
+    conflict_count: int
+    conflict_rate: float
+    gap_count: int
+    gap_rate: float
+
+    # 按冲突频率排序的数据点：(row_index, conflict_count)
+    sorted_conflict_points: List[Tuple[int, int]]
+
+    # 规则覆盖统计
+    base_coverage_rate: float  # base_rules 覆盖的数据点比例
+    clean_coverage_rate: float  # clean_rules 覆盖的数据点比例
+    combined_coverage_rate: float  # 任一规则集覆盖的数据点比例
+
+
+@dataclass
+class RuleSetRefinementResult:
+    """规则集细化结果."""
+    column: str
+    refined_base_rules: List[DualRule]
+    refined_clean_rules: List[DualRule]
+    refinement_history: List[RefinementRound]
+    final_conflicts: RuleSetConflictAnalysis
+    success: bool
+    final_message: str
+
+
+@dataclass
+class RuleSetRefinementContext:
+    """规则细化上下文，包含冲突和缺口样本."""
+    column: str
+    conflict_samples: List[Dict[str, Any]]
+    gap_samples: List[Dict[str, Any]]
+    priority_conflict_samples: List[Dict[str, Any]]  # 冲突最多的样本
+    instruction: str  # 'resolve_conflicts', 'expand_coverage', 'delete_conflicting'
+    conflict_frequency: Dict[int, int]  # row_index -> conflict_count
