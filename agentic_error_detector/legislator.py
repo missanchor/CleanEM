@@ -3,7 +3,7 @@ LLM-based Rule Generators using local vLLM (OpenAI-compatible API).
 """
 import json
 import re
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from openai import OpenAI
 
 DEFAULT_MISSING_TOKENS = ["", "nan", "none", "null", "n/a", "na", "unknown", "empty", "xxxxx"]
@@ -17,6 +17,9 @@ class BaseLegislator:
         self.client = OpenAI(base_url=base_url, api_key="EMPTY")
         self.model = model or self._get_available_model()
         self.base_url = base_url
+        self.last_prompt: Optional[str] = None
+        self.last_response: Optional[str] = None
+        self.last_system_prompt: Optional[str] = None
 
     def _get_available_model(self) -> str:
         """Fetch the available model from vLLM endpoint."""
@@ -37,23 +40,35 @@ class BaseLegislator:
         """Get the system prompt for this legislator. Override in subclasses."""
         return "You are a data quality expert. Generate Python lambda functions for data validation. Return ONLY the lambda functions, one per line."
 
-    def _call_llm(self, prompt: str, max_tokens: int = 500, system_prompt: str = None) -> str:
+    def _call_llm(self, prompt: str, max_tokens: int = 500, system_prompt: str = None, temperature: float = 0.1) -> str:
         """Call the LLM with a prompt."""
         try:
             system_msg = system_prompt if system_prompt else self._get_system_prompt()
+            self.last_prompt = prompt
+            self.last_system_prompt = system_msg
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.1,
+                temperature=temperature,
                 max_tokens=max_tokens
             )
-            return response.choices[0].message.content.strip()
+            self.last_response = response.choices[0].message.content.strip()
+            return self.last_response
         except Exception as e:
             print(f"  ⚠ Error calling LLM: {e}")
+            self.last_response = f"Error: {e}"
             return ""
+
+    def get_last_prompt_info(self) -> Dict[str, str]:
+        """Get the last prompt and response for logging."""
+        return {
+            'prompt': self.last_prompt or '',
+            'system_prompt': self.last_system_prompt or '',
+            'response': self.last_response or ''
+        }
 
 
 class MissingLegislator(BaseLegislator):
@@ -64,7 +79,7 @@ class MissingLegislator(BaseLegislator):
         return """You are a data completeness expert specializing in detecting missing, null, and empty values.
 Your role is to generate Python lambda functions that identify incomplete or absent data.
 You understand various representations of missing data (None, NaN, empty strings, 'N/A', 'null', etc.).
-Return ONLY the lambda functions, one per line. Each function should return True for valid (non-missing) values."""
+Return ONLY the lambda functions, one per line. Each function should return True when a value is missing/invalid, False otherwise."""
 
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
         """Generate rules to detect missing values."""
@@ -84,8 +99,8 @@ Return ONLY the lambda functions, one per line. Each function should return True
 
         rule = (
             "lambda value: ("
-            "(pd.notna(value) if hasattr(pd, 'notna') else value is not None)"
-            " and str(value).strip().lower() not in " + token_literal +
+            "(pd.isna(value) if hasattr(pd, 'isna') else value is None)"
+            " or str(value).strip().lower() in " + token_literal +
             ")"
         )
         return [rule]
@@ -99,7 +114,7 @@ class TypoLegislator(BaseLegislator):
         return """You are a spelling and data entry expert specializing in detecting typos and spelling errors.
 Your role is to generate Python lambda functions that identify misspellings, character substitutions, and data entry errors.
 You understand common typo patterns (character swaps, substitutions, extra/missing characters) and frequency-based anomalies.
-Return ONLY the lambda functions, one per line. Each function should return False (flagging an error) for suspected typos."""
+Return ONLY the lambda functions, one per line. Each function should return True when a value is clearly a typo (invalid), False otherwise."""
 
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
         """Generate rules to detect typos based on frequency analysis."""
@@ -115,63 +130,38 @@ Return ONLY the lambda functions, one per line. Each function should return Fals
         shape_distribution = metadata.get('shape_distribution', [])[:8]
         low_frequency_values = metadata.get('low_frequency_values', [])[:10]
         singleton_count = metadata.get('singleton_count', 0)
-        
+
         prompt = f"""
-For column '{column}', generate up to 3 Python lambda functions to detect potential typos.
+For column '{column}', generate up to 5 Python lambda functions to detect potential typos.
 
 Column metadata:
 - Unique values: {unique_count}
-- Top 10 most frequent raw values: {json.dumps(top_freq_values, ensure_ascii=False)}
+- Top 10 most frequent raw values (SAMPLES ONLY - not exhaustive): {json.dumps(top_freq_values, ensure_ascii=False)}
 - Normalized high-frequency tokens: {json.dumps(normalized_top, ensure_ascii=False)}
 - Length distribution: {json.dumps(length_distribution, ensure_ascii=False)}
 - Shape distribution: {json.dumps(shape_distribution, ensure_ascii=False)}
 - Singleton value count: {singleton_count}
 - Rare/low-frequency samples: {json.dumps(low_frequency_values, ensure_ascii=False)}
 
-Rules should:
-1. Check if a value is rare (appears < 2 times) AND similar to a frequent value
-2. Identify character-level anomalies (e.g., 'x' substitution in '{column}')
-3. Flag values not matching the majority pattern
+IMPORTANT GUIDELINES:
+1. Do NOT flag values just because they're not in top_values - these are SAMPLES
+2. Focus on DETECTING TYPOS: look for values that are SIMILAR to frequent values but have character-level anomalies
+3. For typo detection, check if a value is rare (appears < 2 times) AND similar to a frequent value
+4. Identify character-level anomalies (e.g., character swaps, extra/missing chars)
+5. Be PERMISSIVE - only flag values that are clearly typos, not just uncommon
+6. Each rule should return True when a value is clearly a TYPO/INVALID, False otherwise
 
 Return ONLY lambda functions, one per line. Format:
 lambda value: <expression>
-
-Example:
-lambda value: str(value).lower().strip() in {json.dumps([v.lower() for v in top_freq_values])} if value else True
 """
         rules_text = self._call_llm(prompt)
-        
+
         if not rules_text or "lambda" not in rules_text.lower():
-            return self._fallback_typo_rules(column, metadata)
-        
+            return []
+
         # Parse lambda functions from response
         rules = [line.strip() for line in rules_text.split('\n') if line.strip().startswith('lambda')]
-        return rules if rules else self._fallback_typo_rules(column, metadata)
-
-    def _fallback_typo_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
-        """Generate fallback typo detection rules."""
-        normalized_top = metadata.get('normalized_top_values') or []
-        if normalized_top:
-            safe_values = [entry['value'] for entry in normalized_top[:5] if entry.get('value')]
-        else:
-            top_values = metadata.get('top_values', {})
-            safe_values = [str(v).strip().lower() for v in list(top_values.keys())[:5] if str(v).strip()]
-        
-        rules = []
-        # Rule 1: Value must be in frequent values (conservative)
-        if safe_values:
-            rules.append(
-                "lambda value: ("
-                "True if value in [None, ''] else "
-                "str(value).lower().strip() in "
-                f"{json.dumps(safe_values, ensure_ascii=False)}"
-                ")"
-            )
-        
-        # Rule 2: Check for common typo characters
-        rules.append("lambda value: 'x' not in str(value).lower() if value else True")
-        
-        return rules
+        return rules if rules else []
 
 
 class PatternLegislator(BaseLegislator):
@@ -182,7 +172,7 @@ class PatternLegislator(BaseLegislator):
         return """You are a data format validation expert specializing in ID codes, phone numbers, ZIP codes, and structured patterns.
 Your role is to generate Python lambda functions that validate format compliance and pattern consistency.
 You understand regex patterns, fixed-length codes, alphanumeric conventions, and structural constraints.
-Return ONLY the lambda functions, one per line. Each function should return True for valid patterns."""
+Return ONLY the lambda functions, one per line. Each function should return True when a pattern is invalid, False otherwise."""
 
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
         """Generate rules to validate patterns."""
@@ -196,25 +186,24 @@ Return ONLY the lambda functions, one per line. Each function should return True
             return []
 
         prompt = f"""
-For column '{column}', generate up to 3 Python lambda functions to validate the format.
+For column '{column}', generate up to 5 Python lambda functions to validate the format.
 
 Column metadata:
 - Pattern analysis: {pattern_analysis}
-- Sample values: {json.dumps(sample_values[:10])}
 - Shape distribution: {json.dumps(shape_distribution, ensure_ascii=False)}
 - Length distribution: {json.dumps(length_distribution, ensure_ascii=False)}
 - Existing regex candidates (if any): {json.dumps(regex_candidates, ensure_ascii=False)}
 
-Rules should validate:
-1. Expected format (digits only, specific length, special characters)
-2. Consistent structure across values
-3. Valid characters for the field type
+Rules should flag INVALID patterns:
+1. Expected format violations (digits only, specific length, special characters)
+2. Inconsistent structure across values
+3. Invalid characters for the field type
 
 Return ONLY lambda functions, one per line. Include both strict and loose variations.
 
 Examples:
-lambda value: bool(re.match(r'^\\d{{5}}$', str(value))) if value else True
-lambda value: len(str(value).replace('-', '').replace(' ', '')) == 10 if value else True
+lambda value: not bool(re.match(r'^\\d{{5}}$', str(value))) if value else False
+lambda value: len(str(value).replace('-', '').replace(' ', '')) != 10 if value else False
 """
         rules_text = self._call_llm(prompt)
         
@@ -228,22 +217,22 @@ lambda value: len(str(value).replace('-', '').replace(' ', '')) == 10 if value e
         """Generate fallback pattern validation rules."""
         rules = []
         sample_values = metadata.get('sample_values', [])
-        
+
         if not sample_values:
             return []
-        
+
         # Analyze sample values for patterns
         sample_str = [str(v) for v in sample_values[:10]]
-        
-        # Check for digit-only pattern
+
+        # Check for digit-only pattern - flag values that DON'T match
         if all(v.isdigit() for v in sample_str):
             digit_len = len(sample_str[0]) if sample_str else 5
-            rules.append(f"lambda value: str(value).isdigit() and len(str(value)) == {digit_len} if value else True")
-        
-        # Check for mixed alphanumeric
+            rules.append(f"lambda value: not (str(value).isdigit() and len(str(value)) == {digit_len}) if value else False")
+
+        # Check for mixed alphanumeric - flag empty values
         if any(not v.isdigit() for v in sample_str):
-            rules.append("lambda value: len(str(value).strip()) > 0 if value else True")
-        
+            rules.append("lambda value: len(str(value).strip()) == 0 if value else True")
+
         return rules
 
 
@@ -256,7 +245,7 @@ class OutlierLegislator(BaseLegislator):
 Your role is to generate Python lambda functions that identify numeric values that are logically or statistically impossible or highly improbable.
 PRIORITIZE business common sense and domain knowledge (e.g., ages shouldn't be 200, prices shouldn't be negative).
 Use statistical thresholds (mean, std dev, IQR) ONLY when clear business logic cannot be inferred from the column name and data samples.
-Return ONLY the lambda functions, one per line. Each function should return True for valid numeric values."""
+Return ONLY the lambda functions, one per line. Each function should return True when a value is an outlier/invalid, False otherwise."""
 
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
         """Generate rules to detect numeric outliers."""
@@ -276,7 +265,7 @@ Return ONLY the lambda functions, one per line. Each function should return True
             return []
 
         prompt = f"""
-For column '{column}', generate up to 3 Python lambda functions to detect numeric outliers.
+For column '{column}', generate up to 5 Python lambda functions to detect numeric outliers.
 
 Column statistics:
 - Min: {min_val}
@@ -293,14 +282,14 @@ Instructions:
 1. PRIORITIZE business common sense: If the column name '{column}' implies a known domain (e.g., year, age, percentage), set hard logical bounds.
 2. Use statistics ONLY as a fallback: Use mean/std or IQR for generic numeric columns where business meaning is unclear.
 3. Avoid redundant rules: Don't just repeat the min/max if they look normal.
-4. Each rule should be a standalone lambda function returning True for VALID data.
+4. Each rule should be a standalone lambda function returning True when a value is an OUTLIER/INVALID.
 
 Return ONLY lambda functions, one per line.
 
 Examples:
-lambda value: 0 <= float(value) <= 120 if value else True  # for 'age'
-lambda value: float(value) > 0 if value else True          # for 'price'
-lambda value: abs(float(value) - {mean_val}) <= 3 * {std_val} if value else True # fallback statistical rule
+lambda value: not (0 <= float(value) <= 120) if value else False  # for 'age'
+lambda value: float(value) <= 0 if value else False               # for 'price'
+lambda value: abs(float(value) - {mean_val}) > 3 * {std_val} if value else False # fallback statistical rule
 """
         rules_text = self._call_llm(prompt)
         
@@ -313,15 +302,15 @@ lambda value: abs(float(value) - {mean_val}) <= 3 * {std_val} if value else True
     def _fallback_outlier_rules(self, min_val: float, max_val: float) -> List[str]:
         """Generate fallback outlier detection rules."""
         rules = []
-        
-        # Rule 1: Max value should be reasonable
+
+        # Rule 1: Flag values that exceed a reasonable threshold
         if max_val and max_val > 1000:  # Likely outliers
-            rules.append(f"lambda value: float(value) <= {max_val * 0.5} if value else True")
-        
-        # Rule 2: Min value should be non-negative for typical metrics
+            rules.append(f"lambda value: float(value) > {max_val * 0.5} if value else False")
+
+        # Rule 2: Flag negative values for typical metrics
         if min_val and min_val < 0:
-            rules.append("lambda value: float(value) >= 0 if value else True")
-        
+            rules.append("lambda value: float(value) < 0 if value else False")
+
         return rules
 
 
@@ -591,37 +580,33 @@ Return ONLY the lambda functions, one per line. Each function should return True
         max_val = metadata.get('max')
         mean_val = metadata.get('mean')
         std_val = metadata.get('std')
-        sample_values = metadata.get('sample_values', [])
         top_values = metadata.get('top_values', {})
         unique_count = metadata.get('unique_count', 0)
         numeric_count = metadata.get('numeric_count', 0)
-        categorical_values = list(top_values.keys())[:20] if top_values else []
+
+        # Build top values with frequencies
+        top_with_freq = [(str(k), v) for k, v in list(top_values.items())[:20]] if top_values else []
+        sample_values = metadata.get('sample_values', [])
 
         prompt = f"""
-For column '{column}', generate up to 2 Python lambda functions to validate data ACCURACY.
+For column '{column}', generate up to 5 Python lambda functions to validate data ACCURACY.
 
 Column metadata:
 - Type: {col_type}
 - Unique count: {unique_count}
-- Sample values: {sample_values[:10]}
-- Top categorical values: {categorical_values}
+- Top categorical values with frequencies: {json.dumps(top_with_freq, ensure_ascii=False)}
 - Min: {min_val}, Max: {max_val}, Mean: {mean_val}, Std: {std_val}
 - Numeric count: {numeric_count}
 
-Rules should:
-1. For numeric: check reasonable value ranges based on statistics
-2. For categorical: check values against expected enumerations
+IMPORTANT GUIDELINES:
+1. For categorical: look for characteristic patterns (value structure, format, typical values) - use frequency to identify dominant patterns
+2. For numeric: check reasonable value ranges based on statistics with tolerance
 3. For text: check reasonable length and character constraints
-4. Be PERMISSIVE - only reject clearly inaccurate values
+4. NOTE: Top categorical values are **not the only valid values**
+5. Be PERMISSIVE - only reject clearly **inaccurate** values
 
 Return ONLY lambda functions, one per line. Format:
 lambda value, row=None: <expression>
-
-Example for numeric 'age':
-lambda value, row=None: value is not None and str(value).strip() not in ['', 'nan', 'none', 'null', 'n/a', 'na', 'unknown'] and str(value).replace('.', '', 1).replace('-', '', 1).isdigit() and 0 <= float(value) <= 150
-
-Example for categorical 'status':
-lambda value, row=None: value is not None and str(value).strip().lower() in ['active', 'inactive', 'pending', 'completed'] if value else False
 """
 
         rules_text = self._call_llm(prompt)
@@ -686,17 +671,16 @@ Return ONLY the lambda functions, one per line. Each function should return True
         top_values = metadata.get('top_values', {})
 
         prompt = f"""
-For column '{column}', generate up to 2 Python lambda functions to validate PATTERN CONSISTENCY.
+For column '{column}', generate up to 5 Python lambda functions to validate PATTERN CONSISTENCY.
 
 Column metadata:
 - Pattern analysis: {pattern_analysis}
-- Sample values: {sample_values[:10]}
 - Shape distribution: {shape_distribution}
 - Length distribution: {length_distribution}
 - Top values: {list(top_values.keys())[:10]}
 
 Rules should:
-1. Check expected format (digits only, specific length, special characters)
+1. Check expected format
 2. Ensure consistent structure across values
 3. Validate character types for the field type
 4. Be PERMISSIVE - only reject values that clearly break patterns
@@ -771,23 +755,16 @@ Note: Functions should accept (value, row) where row contains other column value
         if not constraints:
             # Try to infer relationships from metadata
             prompt = f"""
-For column '{column}', generate up to 2 Python lambda functions to validate COLUMN RELATIONSHIPS.
+For column '{column}', generate up to 5 Python lambda functions to validate COLUMN RELATIONSHIPS.
 
 Column metadata:
-- Sample values: {sample_values[:10]}
 - Top values: {list(top_values.keys())[:10]}
 
-Look for hints about relationships in the column name or values (e.g., if column is 'CityAvg', there might be a 'City' column it relates to).
+Look for hints about relationships in the column name or values.
 Generate rules that validate inter-column dependencies using the 'row' parameter.
 
 Return ONLY lambda functions, one per line. Format:
 lambda value, row=None: <expression>
-
-Example for State/StateAvg:
-lambda value, row=None: (row is None or row.get('State') is None or str(value).strip().lower().startswith(str(row.get('State')).strip().lower() + '_'))
-
-Example for City/CityInState:
-lambda value, row=None: (row is None or row.get('City') is None or str(row.get('City')).strip().lower() in str(value).strip().lower())
 """
 
             rules_text = self._call_llm(prompt)
@@ -897,9 +874,63 @@ Example for a categorical column 'diagnosis':
 lambda value: value is None or str(value).strip().lower() in ['', 'nan', 'none', 'null', 'n/a', 'na', 'unknown', 'xxxxx', 'asdf', '123'] or len(str(value).strip()) > 50
 
 Example for numeric column 'age':
-lambda value: value is None or str(value).strip() in ['', 'nan', 'none', 'null', 'n/a', 'na', 'unknown'] or (str(value).replace('.', '', 1).replace('-', '', 1).isdigit() and (float(value) < 0 or float(value) > 150))
+lambda value: value is None or str(value).strip() in ['', 'nan', 'none', 'null', 'n/a', 'na', 'unknown'] or (str(value).replace('.', '',1).replace('-', '', 1).isdigit() and (float(value) < 0 or float(value) > 150))
 
 Be strict in what you flag as dirty - P_dirty's job is to catch clear errors, not to be permissive.
+"""
+
+    def get_p_clean_disjointness_prompt(self) -> str:
+        """System prompt for P_clean refinement with disjointness constraint (low temperature)."""
+        return """You are a data quality expert specializing in refining CLEAN data predicates.
+
+Your role is to refine P_clean(x) to be DISJOINT from P_dirty(x).
+
+CRITICAL DISJOINTNESS REQUIREMENT:
+- P_clean(x) and P_dirty(x) MUST NEVER both be True for the same value
+- You must EXCLUDE values that P_dirty would flag as dirty
+
+SAMPLING FEEDBACK:
+- Review conflict samples (values where both P_clean and P_dirty were True)
+- These values MUST return False in your refined P_clean
+- Review gap samples (values where both P_clean and P_dirty were False)
+- Consider if these should return True in your refined P_clean
+
+Return ONLY the lambda function:
+lambda value: <expression>
+
+Example refinement:
+If conflict samples show '12345' triggered both rules:
+OLD: lambda value: value is not None and str(value).isdigit()
+NEW: lambda value: value is not None and str(value).isdigit() and len(str(value)) == 5
+
+Be PRECISE and CONTRACT-ONLY - minimize creative interpretation to avoid new conflicts.
+"""
+
+    def get_p_dirty_disjointness_prompt(self) -> str:
+        """System prompt for P_dirty refinement with disjointness constraint (low temperature)."""
+        return """You are a data quality expert specializing in refining DIRTY data predicates.
+
+Your role is to refine P_dirty(x) to be DISJOINT from P_clean(x).
+
+CRITICAL DISJOINTNESS REQUIREMENT:
+- P_clean(x) and P_dirty(x) MUST NEVER both be True for the same value
+- You must EXCLUDE values that P_clean would flag as clean
+
+SAMPLING FEEDBACK:
+- Review conflict samples (values where both P_clean and P_dirty were True)
+- These values MUST return False in your refined P_dirty (let P_dirty handle them)
+- Review gap samples (values where both P_clean and P_dirty were False)
+- Consider if these should return True in your refined P_dirty
+
+Return ONLY the lambda function:
+lambda value: <expression>
+
+Example refinement:
+If conflict samples show valid codes like 'NYC' triggered both rules:
+OLD: lambda value: value is None or str(value).lower() in ['n/a', 'unknown']
+NEW: lambda value: value is None or str(value).lower() in ['n/a', 'unknown', 'xxxxx', 'asdf']
+
+Be PRECISE and CONTRACT-ONLY - minimize creative interpretation to avoid new conflicts.
 """
 
     def _combine_clean_base_rules(self, clean_base_rules: List[Tuple[str, str]] = None) -> str:
@@ -989,7 +1020,25 @@ Be strict in what you flag as dirty - P_dirty's job is to catch clear errors, no
         prompt_parts.append("lambda value: <expression>")
 
         prompt = "\n".join(prompt_parts)
-        rules_text = self._call_llm(prompt, max_tokens=400, system_prompt=self.get_p_clean_system_prompt())
+        
+        # Check if disjointness mode is active
+        disjointness_mode = metadata.get('disjointness_mode', False)
+        
+        if disjointness_mode:
+            # Use disjointness prompt with lower temperature for precision
+            rules_text = self._call_llm(
+                prompt, 
+                max_tokens=400, 
+                system_prompt=self.get_p_clean_disjointness_prompt(),
+                temperature=0.2
+            )
+        else:
+            # Use standard prompt with default temperature
+            rules_text = self._call_llm(
+                prompt, 
+                max_tokens=400, 
+                system_prompt=self.get_p_clean_system_prompt()
+            )
 
         if not rules_text or "lambda" not in rules_text.lower():
             return self._fallback_p_clean_rule(column, metadata)
@@ -1056,7 +1105,25 @@ Be strict in what you flag as dirty - P_dirty's job is to catch clear errors, no
         prompt_parts.append("lambda value: <expression>")
 
         prompt = "\n".join(prompt_parts)
-        rules_text = self._call_llm(prompt, max_tokens=400, system_prompt=self.get_p_dirty_system_prompt())
+        
+        # Check if disjointness mode is active
+        disjointness_mode = metadata.get('disjointness_mode', False)
+        
+        if disjointness_mode:
+            # Use disjointness prompt with lower temperature for precision
+            rules_text = self._call_llm(
+                prompt, 
+                max_tokens=400, 
+                system_prompt=self.get_p_dirty_disjointness_prompt(),
+                temperature=0.2
+            )
+        else:
+            # Use standard prompt with default temperature
+            rules_text = self._call_llm(
+                prompt, 
+                max_tokens=400, 
+                system_prompt=self.get_p_dirty_system_prompt()
+            )
 
         if not rules_text or "lambda" not in rules_text.lower():
             return self._fallback_p_dirty_rule(column, metadata)
@@ -1315,8 +1382,6 @@ class LegislatorFactory:
         # Type-specific agents
         if column_type == 'categorical':
             agents.append(TypoLegislator(self.base_url, self.model))
-        elif column_type == 'pattern':
-            agents.append(PatternLegislator(self.base_url, self.model))
         elif column_type == 'numeric':
             agents.append(OutlierLegislator(self.base_url, self.model))
         
@@ -1335,63 +1400,83 @@ class LegislatorFactory:
             CleanPatternLegislator(self.base_url, self.model),
         ]
 
-    def generate_rules_per_column(self, metadata: Dict[str, Any]) -> Dict[str, List[Tuple[str, str]]]:
+    def generate_rules_per_column(self, metadata: Dict[str, Any]) -> Tuple[Dict[str, List[Tuple[str, str]]], Dict[str, Dict[str, Dict[str, str]]]]:
         """
         Generate rules for all columns in metadata.
-        
+
         Returns:
-            Dict[column_name] = List[(agent_name, rule_string)]
+            Tuple of:
+            - Dict[column_name] = List[(agent_name, rule_string)]
+            - Dict[column_name] = Dict[agent_name] = {'prompt': ..., 'response': ...}
         """
         all_rules = {}
+        all_prompts = {}
 
         for column, col_metadata in metadata.items():
             col_type = col_metadata.get('type', 'text')
             agents = self.create_agents(column, col_type)
-            
+
             col_rules = []
+            col_prompts = {}
             for agent in agents:
                 agent_name = agent.__class__.__name__
                 print(f"  → {agent_name} for {column}...")
-                
+
                 try:
                     rules = agent.generate_rules(column, col_metadata)
                     for rule in rules:
                         col_rules.append((agent_name, rule))
                         print(f"    ✓ Generated rule: {rule}")
+                    # Capture prompt info after generation
+                    prompt_info = agent.get_last_prompt_info()
+                    if prompt_info['prompt']:
+                        col_prompts[agent_name] = prompt_info
                 except Exception as e:
                     print(f"    ✗ Error: {e}")
-            
+
             if col_rules:
                 all_rules[column] = col_rules
-        
-        return all_rules
+            if col_prompts:
+                all_prompts[column] = col_prompts
 
-    def generate_clean_rules_per_column(self, metadata: Dict[str, Any]) -> Dict[str, List[Tuple[str, str]]]:
+        return all_rules, all_prompts
+
+    def generate_clean_rules_per_column(self, metadata: Dict[str, Any]) -> Tuple[Dict[str, List[Tuple[str, str]]], Dict[str, Dict[str, Dict[str, str]]]]:
         """
         Generate clean base rules per column (four quality pillars).
 
         Returns:
-            Dict[column_name] = List[(pillar_name, rule_string)]
+            Tuple of:
+            - Dict[column_name] = List[(pillar_name, rule_string)]
+            - Dict[column_name] = Dict[pillar_name] = {'prompt': ..., 'response': ...}
         """
         clean_rules = {}
+        clean_prompts = {}
 
         for column, col_metadata in metadata.items():
             column_type = col_metadata.get('type', 'text')
             agents = self.create_clean_agents(column, column_type)
             column_rules = []
+            column_prompts = {}
 
             for agent in agents:
                 try:
                     pillar_rules = agent.generate_rules(column, col_metadata)
                     for rule in pillar_rules:
                         column_rules.append((agent.pillar_name, rule))
+                    # Capture prompt info after generation
+                    prompt_info = agent.get_last_prompt_info()
+                    if prompt_info['prompt']:
+                        column_prompts[agent.pillar_name] = prompt_info
                 except Exception as e:
                     print(f"    ✗ Clean agent {agent.pillar_name} error on {column}: {e}")
 
             if column_rules:
                 clean_rules[column] = column_rules
+            if column_prompts:
+                clean_prompts[column] = column_prompts
 
-        return clean_rules
+        return clean_rules, clean_prompts
 
     def generate_cross_column_rules(self, metadata: Dict[str, Any]) -> List[Tuple[str, str]]:
         """
@@ -1619,3 +1704,68 @@ class LegislatorFactory:
                     print(f"\n✗ {column}: missing P_dirty")
 
         return paired_rules
+
+
+class RuleFixerLegislator(BaseLegislator):
+    """Legislator specialized in fixing syntax errors in lambda rules."""
+
+    def _get_system_prompt(self) -> str:
+        """System prompt for fixing syntax errors in rules."""
+        return """You are a Python syntax expert specializing in fixing broken lambda functions.
+Your task is to fix syntax errors in lambda rules while preserving their semantic meaning.
+Common issues to fix:
+- Unterminated strings (missing closing quote)
+- Unbalanced parentheses
+- Invalid escape sequences
+- Incorrect indentation
+- Reserved keyword conflicts
+
+Return ONLY the fixed lambda function, no explanation.
+"""
+
+    def fix_syntax_error(self, broken_rule: str, error_msg: str,
+                         context: str = None) -> str:
+        """Fix a broken lambda rule given the syntax error.
+
+        Args:
+            broken_rule: The original broken rule string
+            error_msg: The syntax error message
+            context: Optional context about the rule (column name, purpose)
+
+        Returns:
+            The fixed lambda function string
+        """
+        prompt = f"""Fix this broken Python lambda rule:
+
+**Original Rule:**
+{broken_rule}
+
+**Syntax Error:**
+{error_msg}
+
+{f"**Context:** {context}" if context else ""}
+
+**Requirements:**
+1. Fix the syntax error while preserving the rule's semantic meaning
+2. Handle any special characters or strings properly
+3. Return ONLY the corrected lambda function, no explanation
+4. The lambda should have format: lambda value, row=None: <expression>
+
+Examples of fixes:
+- If string is unterminated: add the missing closing quote
+- If parentheses are unbalanced: add missing )
+- If invalid escape: use raw strings or proper escaping
+
+Return ONLY the fixed lambda:
+"""
+
+        response = self._call_llm(prompt, max_tokens=300, temperature=0.1)
+
+        # Extract the lambda from response
+        for line in response.split('\n'):
+            line = line.strip()
+            if line.lower().startswith('lambda'):
+                return line
+
+        # If no lambda found, return None
+        return None

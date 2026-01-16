@@ -46,6 +46,7 @@ class PandasProfiler:
                                     If False (default), only use numeric/categorical/text.
         """
         self.df = pd.read_csv(data_path)
+        self.data_path = data_path
         self.metadata = {}
         self._clean_and_analyze(enable_pattern_detection)
 
@@ -69,7 +70,7 @@ class PandasProfiler:
                                     If False (default), only use numeric/categorical/text.
         """
         for column in self.df.columns:
-            col_type = self._determine_column_type(column, enable_pattern_detection)
+            col_type = self._determine_column_type(column, enable_pattern_detection, self.data_path)
             metadata = {
                 'type': col_type,
                 'total_rows': len(self.df),
@@ -96,15 +97,22 @@ class PandasProfiler:
         self._infer_relationship_constraints()
         self._attach_relationship_profiles()
 
-    def _determine_column_type(self, column: str, enable_pattern_detection: bool = False) -> str:
+    def _determine_column_type(self, column: str, enable_pattern_detection: bool = False, csv_path: str = None) -> str:
         """
-        Determine the type of column based on heuristics.
+        Determine the type of column based on heuristics or config file.
 
         Args:
             column: Column name
             enable_pattern_detection: If False, only return numeric/categorical/text (default).
                                     If True, may also return 'pattern' for structured values.
+            csv_path: Path to CSV file (used for config lookup)
         """
+        # Try to load from config first
+        if csv_path:
+            config_types = self._load_col_type_from_config(csv_path)
+            if config_types and column in config_types:
+                return config_types[column]
+
         series = self.df[column].dropna()
         if series.empty:
             return 'text'
@@ -132,6 +140,63 @@ class PandasProfiler:
             return 'categorical'
 
         return 'text'
+
+    def _load_col_type_from_config(self, csv_path: str) -> Dict[str, str]:
+        """
+        Load column types from config file.
+
+        Lookup order:
+        1. <csv_path>.config.json (e.g., data/hospital_error-01.csv.config.json)
+        2. data/<dataset_name>_config.json (e.g., data/hospital_config.json)
+
+        Args:
+            csv_path: Path to the CSV file
+
+        Returns:
+            Dict[column_name] -> type, or empty dict if not found
+        """
+        import os
+        import json
+
+        # Try <csv_path>.config.json first
+        config_path = csv_path + ".config.json"
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    if 'col_type' in config:
+                        return config['col_type']
+            except Exception:
+                pass
+
+        # Try data/<dataset_name>_config.json
+        # Extract dataset name from csv_path
+        base_name = os.path.basename(csv_path)
+        # Remove common suffixes - check longer suffixes first
+        for suffix in ['_error-01', '_clean_missing', '_clean_mixed', '_clean_pattern', '_clean_rule', '_clean_outliers', '_clean_typos', '_clean', '_error']:
+            if base_name == suffix + '.csv' or base_name.startswith(suffix + '.'):
+                # Full match like hospital_clean.csv or hospital_clean.csv.something
+                dataset_name = base_name[len(suffix):].lstrip('.').rsplit('.', 1)[0] if '.' in base_name[len(suffix):] else ''
+                break
+            elif base_name.endswith(suffix + '.csv'):
+                # Normal case: hospital_clean.csv -> hospital
+                dataset_name = base_name[:-len(suffix) - 4]  # -4 for .csv
+                break
+        else:
+            # Remove .csv extension
+            dataset_name = base_name[:-4] if base_name.endswith('.csv') else base_name
+
+        config_path = os.path.join(os.path.dirname(csv_path), f"{dataset_name}_config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    if 'col_type' in config:
+                        return config['col_type']
+            except Exception:
+                pass
+
+        return {}
 
     def _calculate_numeric_character_ratio(self, values: List[str]) -> float:
         """
@@ -226,7 +291,7 @@ class PandasProfiler:
             normalized_top_values.append({
                 'value': value,
                 'count': int(count),
-                'ratio': float(count) / total,
+                'ratio': round(float(count) / total, 3),
                 'example': examples.get(value, value)
             })
 
@@ -247,7 +312,7 @@ class PandasProfiler:
             length_distribution.append({
                 'length': int(length),
                 'count': int(count),
-                'ratio': float(count) / total
+                'ratio': round(float(count) / total, 3)
             })
 
         shape_distribution = self._shape_distribution(str_series)
@@ -275,7 +340,7 @@ class PandasProfiler:
             distribution.append({
                 'shape': signature,
                 'count': int(count),
-                'ratio': float(count) / total
+                'ratio': round(float(count) / total, 3)
             })
         return distribution
 
@@ -503,7 +568,7 @@ class PandasProfiler:
             normalized_top_values.append({
                 'value': value,
                 'count': int(count),
-                'ratio': float(count) / total,
+                'ratio': round(float(count) / total, 3),
                 'example': examples.get(value, value)
             })
 
@@ -527,7 +592,7 @@ class PandasProfiler:
             length_distribution.append({
                 'length': int(length),
                 'count': int(count),
-                'ratio': float(count) / total
+                'ratio': round(float(count) / total, 3)
             })
 
         # Shape distribution for numeric columns
@@ -724,7 +789,7 @@ class PandasProfiler:
                     'value': row[column],
                     'other_value': row[other_column],
                     'count': int(row['count']),
-                    'ratio': float(row['count']) / total_pairs if total_pairs else 0.0
+                    'ratio': round(float(row['count']) / total_pairs, 3) if total_pairs else 0.0
                 })
 
         return {
