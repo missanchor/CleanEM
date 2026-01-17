@@ -4,13 +4,46 @@ LLM-based Rule Generators using local vLLM (OpenAI-compatible API).
 import json
 import re
 from typing import Dict, Any, List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
+
+import pandas as pd
+
+from agentic_error_detector.core.pattern_types import PatternSpec
+from agentic_error_detector.core.pattern_explorer import PatternExplorer
 
 DEFAULT_MISSING_TOKENS = ["", "nan", "none", "null", "n/a", "na", "unknown", "empty", "xxxxx"]
 
+# Configuration for batch processing and pattern exploration
+VALUE_BATCH_SIZE = 30  # Number of unique values per batch for LLM annotation
+MAX_BATCHES_PER_COLUMN = 20  # Maximum batches per column to prevent infinite loops
+PATTERN_COVERAGE_THRESHOLD = 0.05  # Minimum coverage to keep a pattern
+TARGET_COVERAGE = 0.98  # Target coverage to stop pattern exploration
+MIN_IMPROVEMENT_TO_CONTINUE = 0.02  # Minimum improvement to continue exploration
 
-class BaseLegislator:
-    """Base class for all legislators."""
+
+def _batch_unique_values(values_with_counts: List[Tuple[str, int]],
+                          batch_size: int = VALUE_BATCH_SIZE) -> List[List[Tuple[str, int]]]:
+    """Split unique values into batches for LLM processing.
+
+    Args:
+        values_with_counts: List of (value, count) tuples, sorted by frequency
+        batch_size: Number of values per batch
+
+    Returns:
+        List of batches, each batch is a list of (value, count) tuples
+    """
+    if not values_with_counts:
+        return []
+
+    batches = []
+    for i in range(0, len(values_with_counts), batch_size):
+        batches.append(values_with_counts[i:i + batch_size])
+    return batches
+
+
+class BaseAgent:
+    """Base class for all agents."""
 
     def __init__(self, base_url: str = "http://localhost:8000/v1", model: str = None):
         """Initialize with local vLLM endpoint."""
@@ -37,7 +70,7 @@ class BaseLegislator:
         raise NotImplementedError
 
     def _get_system_prompt(self) -> str:
-        """Get the system prompt for this legislator. Override in subclasses."""
+        """Get the system prompt for this agent. Override in subclasses."""
         return "You are a data quality expert. Generate Python lambda functions for data validation. Return ONLY the lambda functions, one per line."
 
     def _call_llm(self, prompt: str, max_tokens: int = 500, system_prompt: str = None, temperature: float = 0.1) -> str:
@@ -71,18 +104,17 @@ class BaseLegislator:
         }
 
 
-class MissingLegislator(BaseLegislator):
-    """Agent focused on detecting missing/null values."""
+class MissingAgent(BaseAgent):
+    """Agent focused on detecting missing/null values with batch annotation."""
 
     def _get_system_prompt(self) -> str:
-        """System prompt for missing value detection."""
-        return """You are a data completeness expert specializing in detecting missing, null, and empty values.
-Your role is to generate Python lambda functions that identify incomplete or absent data.
-You understand various representations of missing data (None, NaN, empty strings, 'N/A', 'null', etc.).
-Return ONLY the lambda functions, one per line. Each function should return True when a value is missing/invalid, False otherwise."""
+        """System prompt for missing value annotation."""
+        return """You are a data completeness expert. Given a list of values from a column,
+classify each as either MISSING_TOKEN (represents missing/empty data) or VALID (normal data value).
+Common missing tokens include: "", "nan", "null", "none", "n/a", "na", "unknown", "empty", "xxxxx", "--", "-", "?"."""
 
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
-        """Generate rules to detect missing values."""
+        """Generate rules to detect missing values using batch annotation."""
         null_count = metadata.get('null_count', 0)
         missing_token_counts = metadata.get('missing_token_counts', {})
         observed_missing = sum(
@@ -93,10 +125,20 @@ Return ONLY the lambda functions, one per line. Each function should return True
         if null_count == 0 and observed_missing == 0:
             return []
 
-        dominant_tokens = metadata.get('dominant_missing_tokens') or []
-        token_pool = sorted(set(DEFAULT_MISSING_TOKENS + dominant_tokens))
-        token_literal = json.dumps(token_pool, ensure_ascii=False)
+        # Step 1: Annotate all unique values in batches
+        annotations = self._annotate_all_values(column, metadata)
 
+        # Step 2: Extract values labeled as MISSING_TOKEN
+        missing_tokens = [v for v, label in annotations.items()
+                          if label == "MISSING_TOKEN"]
+
+        # Step 3: Build token pool (defaults + dominant + annotated)
+        dominant_tokens = metadata.get('dominant_missing_tokens') or []
+        token_pool = sorted(set(DEFAULT_MISSING_TOKENS + dominant_tokens + missing_tokens))
+
+        # Step 4: Generate lambda rule
+        # Use repr to ensure valid Python literal for list of strings
+        token_literal = repr(token_pool)
         rule = (
             "lambda value: ("
             "(pd.isna(value) if hasattr(pd, 'isna') else value is None)"
@@ -105,116 +147,300 @@ Return ONLY the lambda functions, one per line. Each function should return True
         )
         return [rule]
 
+    def _annotate_all_values(self, column: str, metadata: Dict[str, Any]) -> Dict[str, str]:
+        """Annotate all unique values in batches using LLM.
 
-class TypoLegislator(BaseLegislator):
-    """Legislator focused on detecting typos in string columns."""
+        Returns:
+            Dict mapping normalized value -> label ("MISSING_TOKEN" or "VALID")
+        """
+        # Build unique value -> count mapping
+        unique_mapping = self._build_unique_value_mapping(metadata)
 
-    def _get_system_prompt(self) -> str:
-        """System prompt for typo and spelling error detection."""
-        return """You are a spelling and data entry expert specializing in detecting typos and spelling errors.
-Your role is to generate Python lambda functions that identify misspellings, character substitutions, and data entry errors.
-You understand common typo patterns (character swaps, substitutions, extra/missing characters) and frequency-based anomalies.
-Return ONLY the lambda functions, one per line. Each function should return True when a value is clearly a typo (invalid), False otherwise."""
+        if not unique_mapping:
+            return {}
+
+        # Sort by frequency (descending) and batch
+        sorted_values = sorted(unique_mapping.items(), key=lambda x: -x[1])
+        batches = _batch_unique_values(sorted_values, VALUE_BATCH_SIZE)
+
+        # Limit number of batches
+        batches = batches[:MAX_BATCHES_PER_COLUMN]
+
+        # Annotate each batch
+        all_labels = {}
+        for batch in batches:
+            batch_labels = self._annotate_batch(column, batch, metadata)
+            all_labels.update(batch_labels)
+
+        return all_labels
+
+    def _build_unique_value_mapping(self, metadata: Dict[str, Any]) -> Dict[str, int]:
+        """Build mapping of normalized unique values to their counts."""
+        mapping = {}
+
+        # Add from missing_token_counts (excluding <NA>)
+        missing_counts = metadata.get('missing_token_counts', {})
+        for token, count in missing_counts.items():
+            if token != "<NA>":
+                mapping[token] = count
+
+        # Add from normalized_top_values
+        normalized_top = metadata.get('normalized_top_values', [])
+        for item in normalized_top:
+            val = item.get('value', '')
+            count = item.get('count', 1)
+            if val and val not in mapping:
+                mapping[val] = count
+
+        return mapping
+
+    def _annotate_batch(self, column: str, batch: List[Tuple[str, int]],
+                        metadata: Dict[str, Any]) -> Dict[str, str]:
+        """Annotate a single batch of values."""
+        dominant = metadata.get('dominant_missing_tokens', [])
+        null_count = metadata.get('null_count', 0)
+
+        batch_data = [{"value": v, "count": c} for v, c in batch]
+
+        prompt = f"""
+For column '{column}', classify each value as MISSING_TOKEN or VALID.
+
+Column info:
+- null_count: {null_count}
+- known_missing_tokens: {json.dumps(dominant, ensure_ascii=False)}
+
+Batch values to classify:
+{json.dumps(batch_data, ensure_ascii=False)}
+
+Rules:
+- MISSING_TOKEN: empty string, null, "nan", "none", "n/a", "na", "unknown", etc.
+- VALID: any legitimate data value
+
+Output JSON array:
+[{{"value": "...", "label": "MISSING_TOKEN"}}, {{"value": "...", "label": "VALID"}}]
+"""
+        response = self._call_llm(prompt, max_tokens=800)
+
+        try:
+            # Extract JSON from response
+            json_match = re.search(r'\[[\s\S]*\]', response)
+            if json_match:
+                items = json.loads(json_match.group())
+                return {item.get('value', ''): item.get('label', 'VALID')
+                        for item in items if item.get('value')}
+        except json.JSONDecodeError:
+            pass
+
+        return {}
+
+
+class TypoAgent(BaseAgent):
+    """Agent focused on detecting typos in string columns with batch annotation."""
 
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
-        """Generate rules to detect typos based on frequency analysis."""
-        top_values = metadata.get('top_values', {})
+        """Generate rules to detect typos using batch annotation."""
         unique_count = metadata.get('unique_count', 0)
-        
-        if not top_values or unique_count < 2:
+
+        if unique_count < 2:
             return []
 
-        top_freq_values = list(top_values.keys())[:10]
-        normalized_top = metadata.get('normalized_top_values', [])[:10]
-        length_distribution = metadata.get('length_distribution', [])[:10]
-        shape_distribution = metadata.get('shape_distribution', [])[:8]
-        low_frequency_values = metadata.get('low_frequency_values', [])[:10]
+        # Step 1: Annotate low-frequency values in batches
+        annotations = self._annotate_low_frequency_values(column, metadata)
+
+        # Step 2: Extract values labeled as LIKELY_TYPO
+        typo_values = [v for v, label in annotations.items()
+                       if label == "LIKELY_TYPO"]
+
+        if not typo_values:
+            return []
+
+        # Step 3: Generate typo detection rules
+        # Group typos by similarity to generate general rules
+        rules = self._generate_typo_rules(typo_values, annotations, metadata)
+        return rules
+
+    def _annotate_low_frequency_values(self, column: str,
+                                        metadata: Dict[str, Any]) -> Dict[str, str]:
+        """Annotate low-frequency values to identify potential typos.
+
+        Returns:
+            Dict mapping value -> label ("LIKELY_TYPO" or "VALID_RARE")
+        """
+        # Get low-frequency unique values (count <= 3)
+        low_freq_items = self._get_low_frequency_values(metadata)
+
+        if not low_freq_items:
+            return {}
+
+        # Sort by frequency and batch
+        sorted_values = sorted(low_freq_items, key=lambda x: -x[1])
+        batches = _batch_unique_values(sorted_values, VALUE_BATCH_SIZE)
+        batches = batches[:MAX_BATCHES_PER_COLUMN]
+
+        # Annotate each batch
+        all_labels = {}
+        for batch in batches:
+            batch_labels = self._annotate_typo_batch(column, batch, metadata)
+            all_labels.update(batch_labels)
+
+        return all_labels
+
+    def _get_low_frequency_values(self, metadata: Dict[str, Any]) -> List[Tuple[str, int]]:
+        """Extract low-frequency values from metadata."""
+        low_freq = []
+
+        # From low_frequency_values
+        low_freq_metadata = metadata.get('low_frequency_values', [])
+        for item in low_freq_metadata:
+            val = item.get('value', '')
+            count = item.get('count', 1)
+            if val and count <= 3:
+                low_freq.append((val, count))
+
+        # Also include singletons if not already there
         singleton_count = metadata.get('singleton_count', 0)
+        normalized_top = metadata.get('normalized_top_values', [])
+        for item in normalized_top:
+            val = item.get('value', '')
+            count = item.get('count', 1)
+            if val and count == 1 and val not in [v for v, _ in low_freq]:
+                low_freq.append((val, 1))
+
+        return low_freq
+
+    def _annotate_typo_batch(self, column: str, batch: List[Tuple[str, int]],
+                              metadata: Dict[str, Any]) -> Dict[str, str]:
+        """Annotate a single batch for potential typos."""
+        top_values = list(metadata.get('top_values', {}).keys())[:10]
+        normalized_top = [item.get('value', '') for item in metadata.get('normalized_top_values', [])[:10]]
+
+        batch_data = [{"value": v, "count": c} for v, c in batch]
 
         prompt = f"""
-For column '{column}', generate up to 5 Python lambda functions to detect potential typos.
+对于列 '{column}'，请标注以下低频值是否为拼写错误。
 
-Column metadata:
-- Unique values: {unique_count}
-- Top 10 most frequent raw values (SAMPLES ONLY - not exhaustive): {json.dumps(top_freq_values, ensure_ascii=False)}
-- Normalized high-frequency tokens: {json.dumps(normalized_top, ensure_ascii=False)}
-- Length distribution: {json.dumps(length_distribution, ensure_ascii=False)}
-- Shape distribution: {json.dumps(shape_distribution, ensure_ascii=False)}
-- Singleton value count: {singleton_count}
-- Rare/low-frequency samples: {json.dumps(low_frequency_values, ensure_ascii=False)}
+高频值参考: {json.dumps(top_values, ensure_ascii=False)}
+高频值的标准化形式: {json.dumps(normalized_top, ensure_ascii=False)}
 
-IMPORTANT GUIDELINES:
-1. Do NOT flag values just because they're not in top_values - these are SAMPLES
-2. Focus on DETECTING TYPOS: look for values that are SIMILAR to frequent values but have character-level anomalies
-3. For typo detection, check if a value is rare (appears < 2 times) AND similar to a frequent value
-4. Identify character-level anomalies (e.g., character swaps, extra/missing chars)
-5. Be PERMISSIVE - only flag values that are clearly typos, not just uncommon
-6. Each rule should return True when a value is clearly a TYPO/INVALID, False otherwise
+本批次待标注的低频值:
+{json.dumps(batch_data, ensure_ascii=False)}
 
-Return ONLY lambda functions, one per line. Format:
-lambda value: <expression>
+标注规则:
+- "LIKELY_TYPO": 值与高频值相似但有明显拼写特征（字符替换、增删、颠倒、大小写错误）
+- "VALID_RARE": 值是合法的、合理的值，只是出现频率低
+
+输出JSON数组:
+[{{"value": "...", "label": "LIKELY_TYPO"}}, {{"value": "...", "label": "VALID_RARE"}}]
 """
-        rules_text = self._call_llm(prompt)
+        response = self._call_llm(prompt, max_tokens=1000)
 
-        if not rules_text or "lambda" not in rules_text.lower():
-            return []
+        try:
+            json_match = re.search(r'\[[\s\S]*\]', response)
+            if json_match:
+                items = json.loads(json_match.group())
+                return {item.get('value', ''): item.get('label', 'VALID_RARE')
+                        for item in items if item.get('value')}
+        except json.JSONDecodeError:
+            pass
 
-        # Parse lambda functions from response
-        rules = [line.strip() for line in rules_text.split('\n') if line.strip().startswith('lambda')]
-        return rules if rules else []
+        return {}
+
+    def _generate_typo_rules(self, typo_values: List[str],
+                              annotations: Dict[str, str],
+                              metadata: Dict[str, Any]) -> List[str]:
+        """Generate typo detection rules from annotated values."""
+        rules = []
+
+        if not typo_values:
+            return rules
+
+        # Group typos by length first
+        length_groups: Dict[int, List[str]] = {}
+        for v in typo_values:
+            length_groups.setdefault(len(v), []).append(v)
+
+        # Generate rules for each length group
+        for length, values in length_groups.items():
+            if len(values) >= 1:
+                # Create a pattern-based rule for this length
+                # Try to identify common character patterns
+                rule = self._build_typo_rule_for_values(values, length)
+                if rule:
+                    rules.append(rule)
+
+        # Also add a general rarity rule for very rare values
+        if len(typo_values) > 0:
+            rare_values_literal = repr(typo_values[:20])
+            rule = f"lambda value: str(value).strip().lower() in {rare_values_literal}"
+            rules.append(rule)
+
+        return rules[:5]  # Limit to 5 rules
+
+    def _build_typo_rule_for_values(self, values: List[str], target_length: int) -> str:
+        """Build a typo detection rule for a group of values with same length."""
+        if not values:
+            return ""
+
+        # Check if all values have similar structure
+        all_digit = all(v.isdigit() for v in values if v)
+        all_alpha = all(v.isalpha() for v in values if v)
+        
+        values_literal = repr(values)
+
+        if all_digit:
+            return f"lambda value: (str(value).isdigit() and len(str(value)) == {target_length} and str(value).strip().lower() in {values_literal})"
+        elif all_alpha:
+            return f"lambda value: (str(value).isalpha() and len(str(value)) == {target_length} and str(value).strip().lower() in {values_literal})"
+
+        return f"lambda value: str(value).strip().lower() in {values_literal}"
 
 
-class PatternLegislator(BaseLegislator):
-    """Agent focused on detecting pattern violations (IDs, codes, etc.)."""
-
-    def _get_system_prompt(self) -> str:
-        """System prompt for format and pattern validation."""
-        return """You are a data format validation expert specializing in ID codes, phone numbers, ZIP codes, and structured patterns.
-Your role is to generate Python lambda functions that validate format compliance and pattern consistency.
-You understand regex patterns, fixed-length codes, alphanumeric conventions, and structural constraints.
-Return ONLY the lambda functions, one per line. Each function should return True when a pattern is invalid, False otherwise."""
+class PatternAgent(BaseAgent):
+    """Agent focused on detecting pattern violations using PatternExplorer."""
 
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
-        """Generate rules to validate patterns."""
-        sample_values = metadata.get('sample_values', [])
-        pattern_analysis = metadata.get('pattern_analysis', '')
-        shape_distribution = metadata.get('shape_distribution', [])[:8]
-        regex_candidates = metadata.get('regex_candidates', [])[:3]
-        length_distribution = metadata.get('length_distribution', [])[:8]
-        
-        if not sample_values:
+        """Generate rules to validate patterns using PatternExplorer."""
+        # Check if we have a DataFrame (needed for PatternExplorer)
+        if not hasattr(self, 'df') or self.df is None:
+            return self._fallback_pattern_rules(column, metadata)
+
+        try:
+            # Use PatternExplorer to get PatternSpec
+            explorer = PatternExplorer(base_url=self.base_url, model=self.model)
+            spec = explorer.explore(column, self.df, metadata)
+
+            # Cache spec in metadata for CleanPatternLegislator to reuse
+            metadata['_cached_pattern_spec'] = spec
+
+            # Generate P_dirty rule (value does NOT match any pattern)
+            rules = self._generate_dirty_rule_from_spec(column, spec)
+            return rules
+        except Exception as e:
+            print(f"  [PatternLegislator] PatternExplorer failed: {e}")
+            return self._fallback_pattern_rules(column, metadata)
+
+    def _generate_dirty_rule_from_spec(self, column: str, spec: PatternSpec) -> List[str]:
+        """Generate P_dirty rule from PatternSpec."""
+        # Filter high-quality patterns
+        high_quality = spec.get_high_quality_patterns(PATTERN_COVERAGE_THRESHOLD)
+
+        if not high_quality:
             return []
 
-        prompt = f"""
-For column '{column}', generate up to 5 Python lambda functions to validate the format.
+        # Build combined regex
+        regex_patterns = [p.regex for p in high_quality]
+        combined_regex = "|".join(f"(?:{r})" for r in regex_patterns)
 
-Column metadata:
-- Pattern analysis: {pattern_analysis}
-- Shape distribution: {json.dumps(shape_distribution, ensure_ascii=False)}
-- Length distribution: {json.dumps(length_distribution, ensure_ascii=False)}
-- Existing regex candidates (if any): {json.dumps(regex_candidates, ensure_ascii=False)}
-
-Rules should flag INVALID patterns:
-1. Expected format violations (digits only, specific length, special characters)
-2. Inconsistent structure across values
-3. Invalid characters for the field type
-
-Return ONLY lambda functions, one per line. Include both strict and loose variations.
-
-Examples:
-lambda value: not bool(re.match(r'^\\d{{5}}$', str(value))) if value else False
-lambda value: len(str(value).replace('-', '').replace(' ', '')) != 10 if value else False
-"""
-        rules_text = self._call_llm(prompt)
-        
-        if not rules_text or "lambda" not in rules_text.lower():
-            return self._fallback_pattern_rules(column, metadata)
-        
-        rules = [line.strip() for line in rules_text.split('\n') if line.strip().startswith('lambda')]
-        return rules if rules else self._fallback_pattern_rules(column, metadata)
+        # Generate P_dirty rule: value does NOT match any pattern
+        rule = (
+            f"lambda value: (value is not None and "
+            f"not bool(re.match(r'^{combined_regex}$', str(value).strip()))"
+            f")"
+        )
+        return [rule]
 
     def _fallback_pattern_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
-        """Generate fallback pattern validation rules."""
+        """Generate fallback pattern validation rules (existing implementation)."""
         rules = []
         sample_values = metadata.get('sample_values', [])
 
@@ -236,7 +462,7 @@ lambda value: len(str(value).replace('-', '').replace(' ', '')) != 10 if value e
         return rules
 
 
-class OutlierLegislator(BaseLegislator):
+class OutlierAgent(BaseAgent):
     """Agent focused on detecting numeric outliers."""
 
     def _get_system_prompt(self) -> str:
@@ -314,7 +540,7 @@ lambda value: abs(float(value) - {mean_val}) > 3 * {std_val} if value else False
         return rules
 
 
-class LogicLegislator(BaseLegislator):
+class LogicAgent(BaseAgent):
     """Agent focused on logical consistency checks (cross-column rules)."""
 
     def _get_system_prompt(self) -> str:
@@ -524,7 +750,7 @@ Return ONLY the lambda functions, one per line. Each function accepts a row (dic
         return rules
 
 
-class CleanCompletenessLegislator(BaseLegislator):
+class CleanCompletenessAgent(BaseAgent):
     """Agent specialized in Completeness pillar - ensuring values are present and complete."""
 
     pillar_name = "completeness"
@@ -550,7 +776,7 @@ Return ONLY the lambda functions, one per line. Each function should return True
             pass
 
         token_pool = sorted(set(DEFAULT_MISSING_TOKENS + dominant_tokens))
-        token_literal = json.dumps(token_pool, ensure_ascii=False)
+        token_literal = repr(token_pool)
 
         rule = (
             "lambda value, row=None: ("
@@ -561,7 +787,7 @@ Return ONLY the lambda functions, one per line. Each function should return True
         return [rule]
 
 
-class CleanAccuracyLegislator(BaseLegislator):
+class CleanAccuracyAgent(BaseAgent):
     """Agent specialized in Accuracy pillar - ensuring values fall into reasonable ranges."""
 
     pillar_name = "accuracy"
@@ -650,20 +876,38 @@ lambda value, row=None: <expression>
         return rules
 
 
-class CleanPatternLegislator(BaseLegislator):
+class CleanPatternAgent(BaseAgent):
     """Agent specialized in Pattern Consistency pillar - ensuring values respect known patterns."""
 
     pillar_name = "pattern_consistency"
 
-    def _get_system_prompt(self) -> str:
-        """System prompt for pattern consistency validation."""
-        return """You are a data pattern validation expert specializing in format and pattern consistency.
-Your role is to generate Python lambda functions that confirm when a value follows the EXPECTED PATTERN/CONSISTENCY.
-You understand regex patterns, fixed-length codes, alphanumeric conventions, and structural constraints.
-Return ONLY the lambda functions, one per line. Each function should return True for values that match the expected pattern."""
-
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
-        """Generate rules to ensure pattern consistency."""
+        """Generate rules to ensure pattern consistency using PatternExplorer."""
+        # Check if we have a DataFrame (needed for PatternExplorer)
+        if not hasattr(self, 'df') or self.df is None:
+            return self._generate_rules_via_llm(column, metadata)
+
+        try:
+            # Use cached PatternSpec if available (shared from PatternLegislator)
+            if '_cached_pattern_spec' in metadata:
+                spec = metadata['_cached_pattern_spec']
+            else:
+                # Use PatternExplorer to get PatternSpec
+                explorer = PatternExplorer(base_url=self.base_url, model=self.model)
+                spec = explorer.explore(column, self.df, metadata)
+
+            # Generate P_clean rule (value matches known patterns)
+            rules = self._generate_clean_rule_from_spec(column, spec)
+            if rules:
+                return rules
+        except Exception as e:
+            print(f"  [CleanPatternLegislator] PatternExplorer failed: {e}")
+
+        # Fallback to LLM-based generation
+        return self._generate_rules_via_llm(column, metadata)
+
+    def _generate_rules_via_llm(self, column: str, metadata: Dict[str, Any]) -> List[str]:
+        """Generate rules via LLM (fallback when PatternExplorer unavailable)."""
         sample_values = metadata.get('sample_values', [])
         pattern_analysis = metadata.get('pattern_analysis', '')
         shape_distribution = metadata.get('shape_distribution', [])[:8]
@@ -704,6 +948,26 @@ lambda value, row=None: bool(re.match(r'^\\d{10}$', re.sub(r'\\D', '', str(value
         rules = [line.strip() for line in rules_text.split('\n') if line.strip().startswith('lambda')]
         return rules if rules else self._fallback_pattern_rules(column, metadata)
 
+    def _generate_clean_rule_from_spec(self, column: str, spec: PatternSpec) -> List[str]:
+        """Generate P_clean rule from PatternSpec."""
+        # Filter high-quality patterns
+        high_quality = spec.get_high_quality_patterns(PATTERN_COVERAGE_THRESHOLD)
+
+        if not high_quality:
+            return []
+
+        # Build combined regex
+        regex_patterns = [p.regex for p in high_quality]
+        combined_regex = "|".join(f"(?:{r})" for r in regex_patterns)
+
+        # Generate P_clean rule: value matches expected pattern
+        rule = (
+            f"lambda value, row=None: (value is not None and "
+            f"bool(re.match(r'^{combined_regex}$', str(value).strip()))"
+            f")"
+        )
+        return [rule]
+
     def _fallback_pattern_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
         """Generate fallback pattern validation rules."""
         rules = []
@@ -733,7 +997,7 @@ lambda value, row=None: bool(re.match(r'^\\d{10}$', re.sub(r'\\D', '', str(value
         return rules
 
 
-class CleanRelationshipLegislator(BaseLegislator):
+class CleanRelationshipAgent(BaseAgent):
     """Agent specialized in Column Relationship pillar - ensuring intra-row column relationship constraints."""
 
     pillar_name = "column_relationship"
@@ -821,11 +1085,11 @@ lambda value, row=None: <expression>
         return rules
 
 
-class DualLegislator(BaseLegislator):
-    """Legislator that generates paired clean/dirty rules for dual verification."""
+class DualAgent(BaseAgent):
+    """Agent that generates paired clean/dirty rules for dual verification."""
 
     def __init__(self, base_url: str = "http://localhost:8000/v1", model: str = None):
-        """Initialize dual legislator."""
+        """Initialize dual agent."""
         super().__init__(base_url, model)
 
     def get_p_clean_system_prompt(self) -> str:
@@ -1363,13 +1627,14 @@ Be PRECISE and CONTRACT-ONLY - minimize creative interpretation to avoid new con
         return [(self.__class__.__name__, clean_rule, dirty_rule)]
 
 
-class LegislatorFactory:
-    """Factory to create appropriate legislators based on column type."""
+class AgentFactory:
+    """Factory to create appropriate agents based on column type."""
 
-    def __init__(self, base_url: str = "http://localhost:8000/v1", model: str = None):
+    def __init__(self, base_url: str = "http://localhost:8000/v1", model: str = None, max_workers: int = 1):
         """Initialize factory with base URL and model."""
         self.base_url = base_url
         self.model = model
+        self.max_workers = max_workers or 1
 
     def create_agents(self, column: str, column_type: str) -> List[BaseLegislator]:
         """Create appropriate agents for a column based on its type."""
@@ -1396,9 +1661,30 @@ class LegislatorFactory:
         return [
             CleanCompletenessLegislator(self.base_url, self.model),
             CleanAccuracyLegislator(self.base_url, self.model),
-            CleanRelationshipLegislator(self.base_url, self.model),
+            # CleanRelationshipLegislator(self.base_url, self.model),
             CleanPatternLegislator(self.base_url, self.model),
         ]
+
+    def _generate_rules_for_single_column(self, column: str, col_metadata: Dict[str, Any]) -> Tuple[str, List[Tuple[str, str]], Dict[str, Dict[str, str]], List[str]]:
+        col_type = col_metadata.get('type', 'text')
+        agents = self.create_agents(column, col_type)
+        col_rules: List[Tuple[str, str]] = []
+        col_prompts: Dict[str, Dict[str, str]] = {}
+        log_lines: List[str] = []
+        for agent in agents:
+            agent_name = agent.__class__.__name__
+            log_lines.append(f"  → {agent_name} for {column}...")
+            try:
+                rules = agent.generate_rules(column, col_metadata)
+                for rule in rules:
+                    col_rules.append((agent_name, rule))
+                    log_lines.append(f"    ✓ Generated rule: {rule}")
+                prompt_info = agent.get_last_prompt_info()
+                if prompt_info['prompt']:
+                    col_prompts[agent_name] = prompt_info
+            except Exception as e:
+                log_lines.append(f"    ✗ Error: {e}")
+        return column, col_rules, col_prompts, log_lines
 
     def generate_rules_per_column(self, metadata: Dict[str, Any]) -> Tuple[Dict[str, List[Tuple[str, str]]], Dict[str, Dict[str, Dict[str, str]]]]:
         """
@@ -1409,37 +1695,57 @@ class LegislatorFactory:
             - Dict[column_name] = List[(agent_name, rule_string)]
             - Dict[column_name] = Dict[agent_name] = {'prompt': ..., 'response': ...}
         """
-        all_rules = {}
-        all_prompts = {}
-
-        for column, col_metadata in metadata.items():
-            col_type = col_metadata.get('type', 'text')
-            agents = self.create_agents(column, col_type)
-
-            col_rules = []
-            col_prompts = {}
-            for agent in agents:
-                agent_name = agent.__class__.__name__
-                print(f"  → {agent_name} for {column}...")
-
-                try:
-                    rules = agent.generate_rules(column, col_metadata)
-                    for rule in rules:
-                        col_rules.append((agent_name, rule))
-                        print(f"    ✓ Generated rule: {rule}")
-                    # Capture prompt info after generation
-                    prompt_info = agent.get_last_prompt_info()
-                    if prompt_info['prompt']:
-                        col_prompts[agent_name] = prompt_info
-                except Exception as e:
-                    print(f"    ✗ Error: {e}")
-
+        all_rules: Dict[str, List[Tuple[str, str]]] = {}
+        all_prompts: Dict[str, Dict[str, Dict[str, str]]] = {}
+        items = list(metadata.items())
+        max_workers = self.max_workers if hasattr(self, "max_workers") else 1
+        if max_workers <= 1 or len(items) <= 1:
+            for column, col_metadata in items:
+                _, col_rules, col_prompts, log_lines = self._generate_rules_for_single_column(column, col_metadata)
+                for line in log_lines:
+                    print(line)
+                if col_rules:
+                    all_rules[column] = col_rules
+                if col_prompts:
+                    all_prompts[column] = col_prompts
+            return all_rules, all_prompts
+        results: Dict[str, Tuple[List[Tuple[str, str]], Dict[str, Dict[str, str]], List[str]]] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for column, col_metadata in items:
+                futures.append(executor.submit(self._generate_rules_for_single_column, column, col_metadata))
+            for future in futures:
+                column, col_rules, col_prompts, log_lines = future.result()
+                results[column] = (col_rules, col_prompts, log_lines)
+        for column, _ in items:
+            if column not in results:
+                continue
+            col_rules, col_prompts, log_lines = results[column]
+            for line in log_lines:
+                print(line)
             if col_rules:
                 all_rules[column] = col_rules
             if col_prompts:
                 all_prompts[column] = col_prompts
-
         return all_rules, all_prompts
+
+    def _generate_clean_rules_for_single_column(self, column: str, col_metadata: Dict[str, Any]) -> Tuple[str, List[Tuple[str, str]], Dict[str, Dict[str, str]], List[str]]:
+        column_type = col_metadata.get('type', 'text')
+        agents = self.create_clean_agents(column, column_type)
+        column_rules: List[Tuple[str, str]] = []
+        column_prompts: Dict[str, Dict[str, str]] = {}
+        log_lines: List[str] = []
+        for agent in agents:
+            try:
+                pillar_rules = agent.generate_rules(column, col_metadata)
+                for rule in pillar_rules:
+                    column_rules.append((agent.pillar_name, rule))
+                prompt_info = agent.get_last_prompt_info()
+                if prompt_info['prompt']:
+                    column_prompts[agent.pillar_name] = prompt_info
+            except Exception as e:
+                log_lines.append(f"    ✗ Clean agent {agent.pillar_name} error on {column}: {e}")
+        return column, column_rules, column_prompts, log_lines
 
     def generate_clean_rules_per_column(self, metadata: Dict[str, Any]) -> Tuple[Dict[str, List[Tuple[str, str]]], Dict[str, Dict[str, Dict[str, str]]]]:
         """
@@ -1450,32 +1756,38 @@ class LegislatorFactory:
             - Dict[column_name] = List[(pillar_name, rule_string)]
             - Dict[column_name] = Dict[pillar_name] = {'prompt': ..., 'response': ...}
         """
-        clean_rules = {}
-        clean_prompts = {}
-
-        for column, col_metadata in metadata.items():
-            column_type = col_metadata.get('type', 'text')
-            agents = self.create_clean_agents(column, column_type)
-            column_rules = []
-            column_prompts = {}
-
-            for agent in agents:
-                try:
-                    pillar_rules = agent.generate_rules(column, col_metadata)
-                    for rule in pillar_rules:
-                        column_rules.append((agent.pillar_name, rule))
-                    # Capture prompt info after generation
-                    prompt_info = agent.get_last_prompt_info()
-                    if prompt_info['prompt']:
-                        column_prompts[agent.pillar_name] = prompt_info
-                except Exception as e:
-                    print(f"    ✗ Clean agent {agent.pillar_name} error on {column}: {e}")
-
+        clean_rules: Dict[str, List[Tuple[str, str]]] = {}
+        clean_prompts: Dict[str, Dict[str, Dict[str, str]]] = {}
+        items = list(metadata.items())
+        max_workers = self.max_workers if hasattr(self, "max_workers") else 1
+        if max_workers <= 1 or len(items) <= 1:
+            for column, col_metadata in items:
+                _, column_rules, column_prompts, log_lines = self._generate_clean_rules_for_single_column(column, col_metadata)
+                for line in log_lines:
+                    print(line)
+                if column_rules:
+                    clean_rules[column] = column_rules
+                if column_prompts:
+                    clean_prompts[column] = column_prompts
+            return clean_rules, clean_prompts
+        results: Dict[str, Tuple[List[Tuple[str, str]], Dict[str, Dict[str, str]], List[str]]] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for column, col_metadata in items:
+                futures.append(executor.submit(self._generate_clean_rules_for_single_column, column, col_metadata))
+            for future in futures:
+                column, column_rules, column_prompts, log_lines = future.result()
+                results[column] = (column_rules, column_prompts, log_lines)
+        for column, _ in items:
+            if column not in results:
+                continue
+            column_rules, column_prompts, log_lines = results[column]
+            for line in log_lines:
+                print(line)
             if column_rules:
                 clean_rules[column] = column_rules
             if column_prompts:
                 clean_prompts[column] = column_prompts
-
         return clean_rules, clean_prompts
 
     def generate_cross_column_rules(self, metadata: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -1522,8 +1834,8 @@ class LegislatorFactory:
             print(f"Column: {column}")
             print(f"{'='*80}")
 
-            # Create dual legislator
-            dual_legislator = DualLegislator(self.base_url, self.model)
+            # Create dual agent
+            dual_agent = DualAgent(self.base_url, self.model)
 
             # Get base rules for this column (if any)
             column_base_rules = base_rules.get(column, [])
@@ -1542,7 +1854,7 @@ class LegislatorFactory:
 
             # Generate rules
             try:
-                col_rules = dual_legislator.generate_dual_rules(
+                col_rules = dual_agent.generate_dual_rules(
                     column, col_metadata,
                     grey_samples=grey_samples,
                     conflict_samples=conflict_samples,
@@ -1586,7 +1898,7 @@ class LegislatorFactory:
         print("="*80)
 
         p_clean_rules = {}
-        dual_legislator = DualLegislator(self.base_url, self.model)
+        dual_agent = DualLegislator(self.base_url, self.model)
 
         for column, col_metadata in metadata.items():
             print(f"\n{'='*80}")
@@ -1602,8 +1914,8 @@ class LegislatorFactory:
                     meta["_refine_conflict_samples"] = context.get('conflict_samples', [])
                     meta["_base_rules"] = base_rules.get(column, []) if base_rules else []
 
-                # Generate P_clean using DualLegislator
-                clean_rule = dual_legislator.generate_p_clean_rule(
+                # Generate P_clean using DualAgent
+                clean_rule = dual_agent.generate_p_clean_rule(
                     column,
                     meta,
                     clean_base_rules=clean_base_rules.get(column, []) if clean_base_rules else None
@@ -1640,7 +1952,7 @@ class LegislatorFactory:
         print("="*80)
 
         p_dirty_rules = {}
-        dual_legislator = DualLegislator(self.base_url, self.model)
+        dual_agent = DualLegislator(self.base_url, self.model)
 
         for column, col_metadata in metadata.items():
             print(f"\n{'='*80}")
@@ -1657,7 +1969,7 @@ class LegislatorFactory:
                     meta["_base_rules"] = base_rules.get(column, []) if base_rules else []
 
                 # Generate P_dirty using DualLegislator
-                dirty_rule = dual_legislator.generate_p_dirty_rule(column, meta)
+                dirty_rule = dual_agent.generate_p_dirty_rule(column, meta)
 
                 if dirty_rule:
                     p_dirty_rules[column] = dirty_rule
@@ -1695,7 +2007,7 @@ class LegislatorFactory:
             dirty_rule = p_dirty_map.get(column)
 
             if clean_rule and dirty_rule:
-                paired_rules[column] = [("DualLegislator", clean_rule, dirty_rule)]
+                paired_rules[column] = [("DualAgent", clean_rule, dirty_rule)]
                 print(f"\n✓ {column}: paired successfully")
             else:
                 if not clean_rule:
@@ -1706,8 +2018,8 @@ class LegislatorFactory:
         return paired_rules
 
 
-class RuleFixerLegislator(BaseLegislator):
-    """Legislator specialized in fixing syntax errors in lambda rules."""
+class RuleFixerAgent(BaseAgent):
+    """Agent specialized in fixing syntax errors in lambda rules."""
 
     def _get_system_prompt(self) -> str:
         """System prompt for fixing syntax errors in rules."""

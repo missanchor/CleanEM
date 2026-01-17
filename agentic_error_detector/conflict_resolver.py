@@ -13,6 +13,7 @@ from agentic_error_detector.dual_types import (
 from agentic_error_detector.modification_memory import (
     ModificationMemory, get_logger
 )
+from agentic_error_detector.core.utils import safe_dict
 
 
 class ConflictResolver:
@@ -20,16 +21,16 @@ class ConflictResolver:
     Resolve conflicts between clean pillars and dirty agents.
     """
 
-    def __init__(self, memory: ModificationMemory, legislator_factory=None,
+    def __init__(self, memory: ModificationMemory, agent_factory=None,
                  max_pairwise_conflicts: int = 5):
         """
         Args:
             memory: ModificationMemory for tracking changes
-            legislator_factory: LegislatorFactory for LLM calls
+            agent_factory: AgentFactory for LLM calls
             max_pairwise_conflicts: Maximum number of conflict pairs to process per pillar
         """
         self.memory = memory
-        self.factory = legislator_factory
+        self.factory = agent_factory
         self.max_pairwise_conflicts = max_pairwise_conflicts
         self.logger = get_logger()
 
@@ -203,13 +204,14 @@ class ConflictResolver:
 
         # Log round summary
         if num_modifications > 0:
-            # Calculate conflict rate for summary
-            conflicts, _, _ = self._find_conflicts(
-                df, column,
-                list(pillar_set.clean_pillars.values())[0] if pillar_set.clean_pillars else None,
-                pillar_set.dirty_agents
-            )
-            conflict_rate = len(conflicts) / len(df) if len(df) > 0 else 0
+            # Calculate conflict rate for summary (considering ALL clean pillars)
+            all_conflict_indices = set()
+            for clean_pillar in pillar_set.clean_pillars.values():
+                conflicts, _, _ = self._find_conflicts(
+                    df, column, clean_pillar, pillar_set.dirty_agents
+                )
+                all_conflict_indices.update(c['row_index'] for c in conflicts)
+            conflict_rate = len(all_conflict_indices) / len(df) if len(df) > 0 else 0
 
             self.logger.log_round_summary(
                 column=column,
@@ -314,7 +316,7 @@ class ConflictResolver:
         self.logger.set_prompt(prompt)
 
         try:
-            from agentic_error_detector.legislator import DualLegislator
+            from agentic_error_detector.agent import DualAgent
             dual_leg = DualLegislator(
                 self.factory.base_url,
                 self.factory.model
@@ -568,7 +570,7 @@ Return ONLY a JSON object:
         self.logger.set_prompt(prompt)
 
         try:
-            from agentic_error_detector.legislator import DualLegislator
+            from agentic_error_detector.agent import DualAgent
             dual_leg = DualLegislator(
                 self.factory.base_url,
                 self.factory.model
@@ -606,16 +608,49 @@ Return ONLY a JSON object:
                                  pairwise_results: List[Dict[str, Any]],
                                  metadata: Dict[str, Any] = None) -> str:
         """Build prompt to synthesize all pairwise decisions into a final decision."""
-        # Format metadata
+        # Format metadata for prompt
         meta_str = ""
         if metadata:
+            # Format top values with frequencies
             top_values = metadata.get('top_values', {})
             if top_values:
-                top_items = list(top_values.items())[:5]
-                top_str = ", ".join([f"'{v}'" for v, _ in top_items])
+                top_items = list(top_values.items())[:10]
+                top_str = ", ".join([f"'{v}' ({c}次)" for v, c in top_items])
             else:
                 top_str = "N/A"
-            meta_str = f"- Top 5 Values: {top_str}"
+
+            # Format pattern-related metadata
+            length_dist = metadata.get('length_distribution', [])
+            shape_dist = metadata.get('shape_distribution', [])
+            regex_candidates = metadata.get('regex_candidates', [])
+
+            # Build pattern info section
+            pattern_info = ""
+            if length_dist or shape_dist or regex_candidates:
+                pattern_parts = []
+                if length_dist:
+                    length_summary = ", ".join([f"{l['length']}({l['count']})" for l in length_dist[:5]])
+                    pattern_parts.append(f"Length: {length_summary}")
+                if shape_dist:
+                    shape_summary = ", ".join([f"{s['shape']}({s['count']})" for s in shape_dist[:5]])
+                    pattern_parts.append(f"Shape: {shape_summary}")
+                if regex_candidates:
+                    regex_summary = ", ".join([f"{r['pattern']}({r['match_rate']:.1%})" for r in regex_candidates[:3]])
+                    pattern_parts.append(f"Regex: {regex_summary}")
+                pattern_info = "\n".join([f"- {p}" for p in pattern_parts])
+
+            meta_str = f"""
+**Column Metadata:**
+- Type: {metadata.get('type', 'unknown')}
+- Top 10 Values (with frequency):
+  {top_str}
+- Unique Count: {metadata.get('unique_count', 'unknown')}
+- Non-Null Count: {metadata.get('non_null_count', 'unknown')}
+- Null Count: {metadata.get('null_count', 'unknown')}
+- Missing Tokens: {metadata.get('dominant_missing_tokens', [])}
+**Pattern Analysis:**
+{pattern_info}
+"""
 
         # Format pairwise results summary
         results_summary = "\n".join([
@@ -693,7 +728,7 @@ Return ONLY a JSON object:
         self.logger.set_prompt(prompt)
 
         try:
-            from agentic_error_detector.legislator import DualLegislator
+            from agentic_error_detector.agent import DualAgent
             dual_leg = DualLegislator(
                 self.factory.base_url,
                 self.factory.model
@@ -806,7 +841,7 @@ lambda value, row=None: <expression>
         self.logger.set_prompt(prompt)
 
         try:
-            from agentic_error_detector.legislator import DualLegislator
+            from agentic_error_detector.agent import DualAgent
             dual_leg = DualLegislator(self.factory.base_url, self.factory.model)
 
             response = dual_leg._call_llm(prompt, max_tokens=300, temperature=0.2)
@@ -947,7 +982,7 @@ lambda value, row=None: <expression>
         self.logger.set_prompt(prompt)
 
         try:
-            from agentic_error_detector.legislator import DualLegislator
+            from agentic_error_detector.agent import DualAgent
             dual_leg = DualLegislator(self.factory.base_url, self.factory.model)
 
             response = dual_leg._call_llm(prompt, max_tokens=300, temperature=0.2)
@@ -1048,16 +1083,17 @@ lambda value, row=None: <expression>
         Returns:
             (is_accepted: bool, violation_rate: float, reason: str)
         """
-        if new_rule.rule_func is None:
-            return True, 0.0, "accepted"
-
-        # Compile the new rule function if needed
-        new_func = new_rule.rule_func
-        if new_func is None and new_rule.rule_str:
+        # Compile the new rule from rule_str (new rules always have rule_func=None)
+        new_func = None
+        if new_rule.rule_str:
             try:
                 new_func = self._compile_rule(new_rule.rule_str, side)
             except Exception as e:
-                return True, 0.0, f"compile_error: {e}"
+                return False, 0.0, f"compile_error: {e}"
+
+        # If no rule_str and no pre-compiled func, reject
+        if new_func is None:
+            return False, 0.0, "no_compilable_rule"
 
         # Calculate violation rate
         violation_count = 0
@@ -1114,35 +1150,6 @@ lambda value, row=None: <expression>
 
     def _compile_rule(self, rule_str: str, side: str) -> callable:
         """Compile a rule string to a callable function."""
-        import re
-        import pandas as pd
-        import numpy as np
-
-        def safe_float(value):
-            try:
-                if value is None:
-                    return None
-                if isinstance(value, (int, float)):
-                    return float(value)
-                cleaned = str(value).replace(',', '').strip()
-                if not cleaned:
-                    return None
-                return float(cleaned)
-            except Exception:
-                return None
-
-        safe_dict = {
-            "re": re,
-            "str": str,
-            "bool": bool,
-            "pd": pd,
-            "np": np,
-            "float": float,
-            "int": int,
-            "len": len,
-            "safe_float": safe_float,
-        }
-
         try:
             return eval(rule_str, safe_dict)
         except Exception as e:

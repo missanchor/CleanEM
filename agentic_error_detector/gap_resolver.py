@@ -20,27 +20,27 @@ class GapResolver:
     Resolve gap zones where both P_clean=False and P_dirty=False.
     """
 
-    def __init__(self, memory: ModificationMemory, legislator_factory=None):
+    def __init__(self, memory: ModificationMemory, agent_factory=None):
         """
         Args:
             memory: ModificationMemory for tracking changes
-            legislator_factory: LegislatorFactory for LLM calls
+            agent_factory: AgentFactory for LLM calls
         """
         self.memory = memory
-        self.factory = legislator_factory
+        self.factory = agent_factory
         self.logger = get_logger()
-        self._dual_legislator = None  # Lazy initialization for reuse
+        self._dual_agent = None  # Lazy initialization for reuse
 
-    def _get_dual_legislator(self):
-        """Get or create a reusable DualLegislator instance."""
-        if self._dual_legislator is None:
+    def _get_dual_agent(self):
+        """Get or create a reusable DualAgent instance."""
+        if self._dual_agent is None:
             if self.factory:
-                from agentic_error_detector.legislator import DualLegislator
-                self._dual_legislator = DualLegislator(
+                from agentic_error_detector.agent import DualAgent
+                self._dual_agent = DualAgent(
                     base_url=self.factory.base_url,
                     model=self.factory.model
                 )
-        return self._dual_legislator
+        return self._dual_agent
     
     def resolve(self, df: pd.DataFrame, column: str,
                 pillar_set: PillarRuleSet,
@@ -242,9 +242,9 @@ class GapResolver:
         self.logger.set_prompt(prompt)
 
         try:
-            dual_leg = self._get_dual_legislator()
+            dual_leg = self._get_dual_agent()
             if not dual_leg:
-                raise ValueError("No legislator available")
+                raise ValueError("No agent available")
             response = dual_leg._call_llm(prompt, max_tokens=400)
 
             # Set response for logging
@@ -435,9 +435,9 @@ lambda value, row=None: <expression>
         self.logger.set_prompt(prompt)
 
         try:
-            dual_leg = self._get_dual_legislator()
+            dual_leg = self._get_dual_agent()
             if not dual_leg:
-                raise ValueError("No legislator available")
+                raise ValueError("No agent available")
 
             response = dual_leg._call_llm(prompt, max_tokens=300, temperature=0.2)
 
@@ -541,9 +541,9 @@ lambda value, row=None: <expression>
         self.logger.set_prompt(prompt)
 
         try:
-            dual_leg = self._get_dual_legislator()
+            dual_leg = self._get_dual_agent()
             if not dual_leg:
-                raise ValueError("No legislator available")
+                raise ValueError("No agent available")
 
             response = dual_leg._call_llm(prompt, max_tokens=300, temperature=0.2)
 

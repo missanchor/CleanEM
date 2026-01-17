@@ -4,6 +4,7 @@ Dual Verification Types for P_clean/P_dirty dual rule system.
 from dataclasses import dataclass
 from typing import Dict, List, Any, Tuple, Optional
 import pandas as pd
+from agentic_error_detector.core.utils import safe_dict, safe_float
 
 
 @dataclass
@@ -188,7 +189,7 @@ class PillarRuleSet:
     clean_pillars: Dict[str, PillarRule]  # pillar_name -> PillarRule
     dirty_agents: Dict[str, PillarRule]   # agent_name -> PillarRule
 
-    def to_dual_rule(self, legislator_factory=None) -> DualRule:
+    def to_dual_rule(self, agent_factory=None) -> DualRule:
         """Convert to DualRule for compatibility with existing judge methods.
 
         Strategy:
@@ -196,44 +197,10 @@ class PillarRuleSet:
         - P_dirty: OR of all dirty agents (at least one agent detected)
 
         Args:
-            legislator_factory: Optional factory for LLM-based rule fixing
+            agent_factory: Optional factory for LLM-based rule fixing
         """
-        clean_rule_str = self._compose_and_str_safe(self.clean_pillars, legislator_factory)
-        dirty_rule_str = self._compose_or_str_safe(self.dirty_agents, legislator_factory)
-
-        import re
-        import pandas as pd
-        import numpy as np
-        try:
-            from dateutil.parser import parse  # type: ignore
-        except Exception:
-            parse = None
-
-        def safe_float(value):
-            try:
-                if value is None:
-                    return None
-                if isinstance(value, (int, float)):
-                    return float(value)
-                cleaned = str(value).replace(',', '').strip()
-                if not cleaned:
-                    return None
-                return float(cleaned)
-            except Exception:
-                return None
-
-        safe_dict = {
-            "re": re,
-            "str": str,
-            "bool": bool,
-            "pd": pd,
-            "np": np,
-            "float": float,
-            "int": int,
-            "len": len,
-            "safe_float": safe_float,
-            "parse": parse,
-        }
+        clean_rule_str = self._compose_and_str_safe(self.clean_pillars, agent_factory)
+        dirty_rule_str = self._compose_or_str_safe(self.dirty_agents, agent_factory)
 
         # Final compile attempt with error handling
         try:
@@ -258,26 +225,26 @@ class PillarRuleSet:
         )
 
     def _fix_rule_with_llm(self, broken_rule: str, error_msg: str,
-                           rule_name: str, legislator_factory) -> str:
+                           rule_name: str, agent_factory) -> str:
         """Attempt to fix a broken rule using LLM.
 
         Args:
             broken_rule: The original broken rule
             error_msg: The error message from compilation
             rule_name: Name of the rule for context
-            legislator_factory: Factory to create RuleFixerLegislator
+            agent_factory: Factory to create RuleFixerAgent
 
         Returns:
             Fixed rule string or None if fixing failed
         """
-        if not legislator_factory:
+        if not agent_factory:
             return None
 
         try:
-            from agentic_error_detector.legislator import RuleFixerLegislator
-            fixer = RuleFixerLegislator(
-                base_url=legislator_factory.base_url,
-                model=legislator_factory.model
+            from agentic_error_detector.agent import RuleFixerAgent
+            fixer = RuleFixerAgent(
+                base_url=agent_factory.base_url,
+                model=agent_factory.model
             )
             context = f"Rule name: {rule_name}, Column: {self.column}"
             fixed = fixer.fix_syntax_error(broken_rule, error_msg, context)
@@ -295,35 +262,6 @@ class PillarRuleSet:
         Returns:
             tuple: (success: bool, func: callable or None, error: str or None)
         """
-        import re
-        import pandas as pd
-        import numpy as np
-
-        def safe_float(value):
-            try:
-                if value is None:
-                    return None
-                if isinstance(value, (int, float)):
-                    return float(value)
-                cleaned = str(value).replace(',', '').strip()
-                if not cleaned:
-                    return None
-                return float(cleaned)
-            except Exception:
-                return None
-
-        safe_dict = {
-            "re": re,
-            "str": str,
-            "bool": bool,
-            "pd": pd,
-            "np": np,
-            "float": float,
-            "int": int,
-            "len": len,
-            "safe_float": safe_float,
-        }
-
         try:
             return (True, eval(rule_str, safe_dict), None)
         except SyntaxError as e:
@@ -345,12 +283,12 @@ class PillarRuleSet:
         return len(args)
 
     def _compose_and_str_safe(self, pillars: Dict[str, PillarRule],
-                               legislator_factory=None) -> str:
+                               agent_factory=None) -> str:
         """Generate AND-composed lambda string with self-healing for syntax errors.
 
         Args:
             pillars: Dict of pillar rules
-            legislator_factory: Optional factory for LLM-based rule fixing
+            agent_factory: Optional factory for LLM-based rule fixing
 
         Returns:
             Composed lambda string
@@ -366,8 +304,8 @@ class PillarRuleSet:
             if not success:
                 print(f"  ⚠ Rule '{name}' has syntax error: {error}")
                 # Try to fix with LLM
-                if legislator_factory:
-                    fixed = self._fix_rule_with_llm(rule.rule_str, error, name, legislator_factory)
+                if agent_factory:
+                    fixed = self._fix_rule_with_llm(rule.rule_str, error, name, agent_factory)
                     if fixed:
                         # Verify the fixed rule
                         fixed_success, _, _ = PillarRuleSet._compile_rule_safely(fixed)
@@ -380,7 +318,7 @@ class PillarRuleSet:
                     else:
                         continue
                 else:
-                    print(f"  ⚠ No legislator factory, skipping '{name}'")
+                    print(f"  ⚠ No agent factory, skipping '{name}'")
                     continue
 
             # Get argument count and build part
@@ -398,12 +336,12 @@ class PillarRuleSet:
         return f"lambda value, row=None: {composed}"
 
     def _compose_or_str_safe(self, agents: Dict[str, PillarRule],
-                              legislator_factory=None) -> str:
+                              agent_factory=None) -> str:
         """Generate OR-composed lambda string with self-healing for syntax errors.
 
         Args:
             agents: Dict of agent rules
-            legislator_factory: Optional factory for LLM-based rule fixing
+            agent_factory: Optional factory for LLM-based rule fixing
 
         Returns:
             Composed lambda string
@@ -419,8 +357,8 @@ class PillarRuleSet:
             if not success:
                 print(f"  ⚠ Agent '{name}' has syntax error: {error}")
                 # Try to fix with LLM
-                if legislator_factory:
-                    fixed = self._fix_rule_with_llm(rule.rule_str, error, name, legislator_factory)
+                if agent_factory:
+                    fixed = self._fix_rule_with_llm(rule.rule_str, error, name, agent_factory)
                     if fixed:
                         # Verify the fixed rule
                         fixed_success, _, _ = PillarRuleSet._compile_rule_safely(fixed)
@@ -433,7 +371,7 @@ class PillarRuleSet:
                     else:
                         continue
                 else:
-                    print(f"  ⚠ No legislator factory, skipping '{name}'")
+                    print(f"  ⚠ No agent factory, skipping '{name}'")
                     continue
 
             # Get argument count and build part

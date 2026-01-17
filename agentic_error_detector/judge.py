@@ -3,9 +3,10 @@ Judge with VR (Violation Rate) based selection logic and Dual-Verification (P_cl
 """
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, List, Any, Tuple, Optional, Callable
 import re
 from agentic_error_detector.dual_types import DualRule, DualEvaluationResult, RefinementRound
+from agentic_error_detector.core.utils import safe_dict, safe_not
 try:
     from dateutil.parser import parse  # type: ignore
 except Exception:
@@ -31,13 +32,17 @@ class Judge:
         self.threshold = threshold
         self.evaluation_results = {}
 
-    def evaluate_rules(self, df: pd.DataFrame, rules: Dict[str, list]) -> Dict[str, list]:
+    def evaluate_rules(self, df: pd.DataFrame, rules: Dict[str, list],
+                        pillar_type: str = "dirty") -> Dict[str, list]:
         """
         Evaluate all rules and return results with VR analysis.
 
         Args:
             df: DataFrame to evaluate
             rules: Dictionary of {column: [(agent_name, rule_string), ...]}
+            pillar_type: "dirty" for error detection rules, "clean" for clean pillar rules.
+                        For dirty: True = violation (error detected)
+                        For clean: False = violation (value doesn't meet clean criteria)
 
         Returns:
             Dictionary with evaluation results and VR analysis per column
@@ -46,7 +51,8 @@ class Judge:
 
         for column, candidate_rules in rules.items():
             print(f"\n{'='*80}")
-            print(f"Evaluating {len(candidate_rules)} candidate rules for column: {column}")
+            rule_type_label = "Clean Pillar Rules" if pillar_type == "clean" else "Candidate Rules"
+            print(f"Evaluating {len(candidate_rules)} {rule_type_label} for column: {column}")
             print(f"{'='*80}")
             
             col_results = []
@@ -57,32 +63,6 @@ class Judge:
 
                 # Compile the lambda function
                 try:
-                    # Safely evaluate the lambda with required imports
-                    def safe_float(value):
-                        try:
-                            if value is None:
-                                return None
-                            if isinstance(value, (int, float)):
-                                return float(value)
-                            cleaned = str(value).replace(',', '').strip()
-                            if not cleaned:
-                                return None
-                            return float(cleaned)
-                        except Exception:
-                            return None
-
-                    safe_dict = {
-                        "re": re,
-                        "str": str,
-                        "bool": bool,
-                        "pd": pd,
-                        "np": np,
-                        "float": float,
-                        "int": int,
-                        "len": len,
-                        "safe_float": safe_float,
-                        "parse": parse,
-                    }
                     rule_func = eval(rule_string, safe_dict)
 
                     # Apply rule to each row/value
@@ -90,15 +70,18 @@ class Judge:
                     for idx, row in df.iterrows():
                         try:
                             value = row[column]
-                            is_error = self._invoke_predicate(rule_func, value, row)
-                            if is_error:
+                            predicate_result = self._invoke_predicate(rule_func, value, row)
+                            # For dirty rules: True = violation (error detected)
+                            # For clean rules: False = violation (value doesn't meet clean criteria)
+                            is_violation = predicate_result if pillar_type == "dirty" else not predicate_result
+                            if is_violation:
                                 violations.append({
                                     'row_index': idx,
                                     'value': value,
                                     'column': column
                                 })
                         except Exception as e:
-                            # If rule fails on a value, count as violation
+                            # If rule fails on a value, count as violation for both types
                             violations.append({
                                 'row_index': idx,
                                 'value': row[column],
@@ -183,47 +166,153 @@ class Judge:
 
         return accepted_rules
 
-    def get_detected_errors(self, accepted_rules: Dict[str, list]) -> List[Dict[str, Any]]:
+    def get_detected_errors(self, dirty_rules: Dict[str, list],
+                             clean_rules: Dict[str, list] = None) -> List[Dict[str, Any]]:
         """
-        Extract all detected errors from accepted rules.
+        Extract all detected errors using combined AND/OR logic.
+
+        Logic:
+        - Clean Pillars (AND): All clean pillars must be satisfied for a value to be considered clean
+        - Dirty Rules (OR): Violating any dirty rule marks a value as potentially dirty
+        - Error = (NOT all clean pillars satisfied) AND (at least one dirty rule violated)
 
         Args:
-            accepted_rules: Dictionary with {column: [rule_result1, rule_result2, ...]}
+            dirty_rules: Dictionary with {column: [rule_result1, rule_result2, ...]} (OR logic)
+            clean_rules: Dictionary with {column: [rule_result1, rule_result2, ...]} (AND logic).
+                        If None, falls back to original OR-only logic.
 
         Returns:
             List of detected errors (deduplicated by row_index and column)
         """
-        all_errors = []
+        # Backward compatibility: if clean_rules is None, use original OR-only logic
+        if clean_rules is None:
+            all_errors = []
+            for column, rule_results in dirty_rules.items():
+                for result in rule_results:
+                    for violation in result['violations']:
+                        error_info = {
+                            'row_index': violation['row_index'],
+                            'column': column,
+                            'value': violation['value'],
+                            'violated_rule': result['rule_string'],
+                            'violated_agent': result['agent'],
+                            'violation_rate': result['violation_rate'],
+                            'detection_type': 'dirty_only'
+                        }
+                        all_errors.append(error_info)
 
-        for column, rule_results in accepted_rules.items():
-            for result in rule_results:
-                for violation in result['violations']:
-                    error_info = {
-                        'row_index': violation['row_index'],
-                        'column': column,
-                        'value': violation['value'],
-                        'violated_rule': result['rule_string'],
-                        'violated_agent': result['agent'],
-                        'violation_rate': result['violation_rate']
-                    }
-                    all_errors.append(error_info)
-
-        # Deduplicate errors by (row_index, column)
-        # Keep the error with the lowest violation rate (most restrictive rule)
-        seen_errors = {}
-        for error in all_errors:
-            key = (error['row_index'], error['column'])
-            if key not in seen_errors:
-                seen_errors[key] = error
-            else:
-                # Keep the one with lower violation rate (more precise)
-                if error['violation_rate'] < seen_errors[key]['violation_rate']:
+            # Deduplicate errors by (row_index, column)
+            seen_errors = {}
+            for error in all_errors:
+                key = (error['row_index'], error['column'])
+                if key not in seen_errors:
                     seen_errors[key] = error
+                else:
+                    if error['violation_rate'] < seen_errors[key]['violation_rate']:
+                        seen_errors[key] = error
 
-        # Convert back to list and sort by row index
-        unique_errors = list(seen_errors.values())
-        unique_errors.sort(key=lambda x: x['row_index'])
-        return unique_errors
+            unique_errors = list(seen_errors.values())
+            unique_errors.sort(key=lambda x: x['row_index'])
+            return unique_errors
+
+        # New combined AND/OR logic
+        detected_errors = []
+
+        # Get all columns from both rule sets
+        all_columns = set(dirty_rules.keys()) | set(clean_rules.keys())
+
+        # Get sample row to understand DataFrame structure
+        # We'll need to re-evaluate rules on actual data
+        # Since we don't have access to the original DataFrame here,
+        # we use the stored evaluation results to build masks
+
+        # For each column, build clean and dirty masks
+        for column in all_columns:
+            dirty_results = dirty_rules.get(column, [])
+            clean_results = clean_rules.get(column, [])
+
+            if not dirty_results and not clean_results:
+                continue
+
+            # Build clean_mask: True if value satisfies ALL clean pillars (AND)
+            # A value is clean only if ALL clean rules return True for it
+            # We need to check each value against all clean rules
+            # clean_mask[row_idx] = all(clean_rule_i(row_idx) == True for i in all clean rules)
+
+            # Build dirty_mask: True if value violates ANY dirty rule (OR)
+            # dirty_mask[row_idx] = any(dirty_rule_i(row_idx) == True for i in all dirty rules)
+
+            # First, collect all violations and clean hits per row
+            # From the stored results, we can reconstruct this
+
+            # For clean rules: collect rows that satisfy EACH clean rule
+            # A row is in clean_hits for rule_i if it's NOT in rule_i's violations
+            # A row is fully clean (clean_mask=True) only if it's in ALL clean_hits
+
+            # For dirty rules: collect rows that violate EACH dirty rule
+            # A row is in dirty_hits for rule_i if it IS in rule_i's violations
+            # A row is dirty (dirty_mask=True) if it's in ANY dirty_hits
+
+            # Get total rows from first rule result
+            total_rows = dirty_results[0]['total_rows'] if dirty_results else \
+                        (clean_results[0]['total_rows'] if clean_results else 0)
+
+            # Build clean_mask: row is clean only if it passes ALL clean rules
+            clean_mask = [True] * total_rows
+            for result in clean_results:
+                for violation in result['violations']:
+                    idx = violation['row_index']
+                    if idx < total_rows:
+                        clean_mask[idx] = False
+
+            # Build dirty_mask: row is dirty if it violates ANY dirty rule
+            dirty_mask = [False] * total_rows
+            for result in dirty_results:
+                for violation in result['violations']:
+                    idx = violation['row_index']
+                    if idx < total_rows:
+                        dirty_mask[idx] = True
+
+            # Error = (NOT clean) AND (dirty) = clean_mask=False AND dirty_mask=True
+            for idx in range(total_rows):
+                if not clean_mask[idx] and dirty_mask[idx]:
+                    # Find the dirty rule that caught this error
+                    violated_rule = None
+                    violated_agent = None
+                    min_vr = float('inf')
+                    for result in dirty_results:
+                        # Check if this row is in the violations
+                        for violation in result['violations']:
+                            if violation['row_index'] == idx:
+                                if result['violation_rate'] < min_vr:
+                                    min_vr = result['violation_rate']
+                                    violated_rule = result['rule_string']
+                                    violated_agent = result['agent']
+                                break
+
+                    # Get the value (from first dirty result's violations)
+                    value = None
+                    for result in dirty_results:
+                        for violation in result['violations']:
+                            if violation['row_index'] == idx:
+                                value = violation['value']
+                                break
+                        if value is not None:
+                            break
+
+                    detected_errors.append({
+                        'row_index': idx,
+                        'column': column,
+                        'value': value,
+                        'violated_rule': violated_rule,
+                        'violated_agent': violated_agent,
+                        'violation_rate': min_vr if min_vr != float('inf') else 0,
+                        'detection_type': 'combined_AND_OR'
+                    })
+
+        # Sort by row index
+        detected_errors.sort(key=lambda x: x['row_index'])
+        return detected_errors
 
     def print_summary(self, accepted_rules: Dict[str, list], pillar_type: str = "dirty"):
         """
@@ -500,42 +589,8 @@ class Judge:
 
         results = {}
 
-        def safe_float(value):
-            try:
-                if value is None:
-                    return None
-                if isinstance(value, (int, float)):
-                    return float(value)
-                cleaned = str(value).replace(',', '').strip()
-                if not cleaned:
-                    return None
-                return float(cleaned)
-            except Exception:
-                return None
-
         def call_predicate(pred, value, row=None):
             return self._invoke_predicate(pred, value, row)
-
-        def safe_not(pred, value, row=None) -> bool:
-            """Return logical NOT of pred(value,row); on any error treat as dirty (True)."""
-            try:
-                return not bool(call_predicate(pred, value, row))
-            except Exception:
-                return True
-
-        safe_dict = {
-            "re": re,
-            "str": str,
-            "bool": bool,
-            "pd": pd,
-            "np": np,
-            "float": float,
-            "int": int,
-            "len": len,
-            "safe_not": safe_not,
-            "safe_float": safe_float,
-            "parse": parse,
-        }
 
         for column, candidate_rule_tuples in dual_rules.items():
             print(f"\n{'='*80}")
@@ -795,152 +850,6 @@ class Judge:
             print(f"    Conflict Rate: {best_result.conflict_rate:.4f}")
 
         return best_rules
-
-    def refine_dual_rules(self, df: pd.DataFrame,
-                         metadata: Dict[str, Any],
-                         dual_rules: Dict[str, List[Tuple[str, str, str]]],
-                         max_rounds: int = 10,
-                         grey_tolerance: float = 0.0,
-                         factory=None) -> Tuple[Dict[str, DualRule], Dict[str, List[RefinementRound]]]:
-        """
-        Iteratively refine dual rules to eliminate conflicts and enforce disjointness.
-        Uses topology-based task generation and fallback strategy (clean -> dirty -> rollback).
-
-        Args:
-            df: DataFrame to evaluate
-            metadata: Column metadata
-            dual_rules: Initial dual rules {col: [(agent, clean_str, dirty_str), ...]}
-            max_rounds: Maximum refinement rounds
-            grey_tolerance: Maximum acceptable grey-zone (gap) rate
-            factory: LegislatorFactory instance with base_url/model (for LLM refinement)
-
-        Returns:
-            Tuple of (best_rules, refinement_history)
-        """
-        print("\n" + "="*80)
-        print("REFINING DUAL RULES - CONFLICT TOPOLOGY ANALYSIS")
-        print("="*80)
-
-        from agentic_error_detector.legislator import LegislatorFactory
-        if factory is None:
-            factory = LegislatorFactory()
-
-        current_rules = {col: list(rules) for col, rules in dual_rules.items()}
-        refinement_history = {column: [] for column in current_rules.keys()}
-        round_number = 0
-
-        while round_number < max_rounds:
-            round_number += 1
-            print(f"\n{'='*80}")
-            print(f"ROUND {round_number}/{max_rounds}")
-            print(f"{'='*80}")
-
-            # Evaluate current rules
-            evaluation_results = self.evaluate_dual_rules(df, current_rules, grey_tolerance)
-
-            # Check if all columns have acceptable rules
-            all_acceptable = True
-            needs_refinement = {}
-
-            for column, results in evaluation_results.items():
-                # Check for conflicts (intersection > 0)
-                has_conflict = any(r.conflict_count > 0 for r in results)
-                has_gap = any(r.grey_count > 0 for r in results)
-
-                if has_conflict or has_gap > grey_tolerance * len(df):
-                    all_acceptable = False
-                    best_result = self._select_refinement_candidate(results)
-                    needs_refinement[column] = {
-                        'result': best_result,
-                        'has_conflict': has_conflict,
-                        'has_gap': has_gap
-                    }
-
-                    print(f"\n  {column}: Needs refinement")
-                    print(f"    Conflicts: {best_result.conflict_count}")
-                    print(f"    Gaps: {best_result.grey_count}")
-
-            if all_acceptable:
-                print("\n✓ All columns have acceptable rules!")
-                break
-
-            # Process columns needing refinement
-            print(f"\n{'='*80}")
-            print(f"PROCESSING COLUMNS NEEDING REFINEMENT")
-            print(f"{'='*80}")
-
-            for column, problem in needs_refinement.items():
-                print(f"\n  Processing {column}...")
-
-                current_col_rules = current_rules.get(column, [])
-                if not current_col_rules:
-                    print(f"    ✗ No current rules found, skipping")
-                    continue
-
-                agent_name, clean_rule_str, dirty_rule_str = current_col_rules[0]
-                col_metadata = metadata.get(column, {})
-
-                # Generate topology-based refinement task
-                task = self._generate_refinement_task(
-                    df, column, problem['result'], col_metadata
-                )
-
-                # Execute refinement with fallback
-                new_rules = self._execute_refinement_with_fallback(
-                    df, column, task, factory, max_attempts=3
-                )
-
-                if new_rules:
-                    new_clean, new_dirty = new_rules
-                    current_rules[column] = [(agent_name, new_clean, new_dirty)]
-                    print(f"    ✓ Successfully refined rules")
-
-                    # Log refinement
-                    refinement_history[column].append({
-                        'round': round_number,
-                        'strategy': task['strategy'],
-                        'conflict_type': task['conflict_type'],
-                        'initial_conflict_count': problem['result'].conflict_count,
-                        'initial_gap_count': problem['result'].grey_count,
-                        'success': True
-                    })
-                else:
-                    print(f"    ✗ Refinement failed, keeping original rules")
-                    refinement_history[column].append({
-                        'round': round_number,
-                        'strategy': task['strategy'],
-                        'conflict_type': task['conflict_type'],
-                        'initial_conflict_count': problem['result'].conflict_count,
-                        'initial_gap_count': problem['result'].grey_count,
-                        'success': False,
-                        'message': 'All refinement attempts failed'
-                    })
-
-        # Final evaluation
-        print(f"\n{'='*80}")
-        print(f"FINAL EVALUATION AFTER {round_number} ROUNDS")
-        print(f"{'='*80}")
-
-        final_evaluation = self.evaluate_dual_rules(df, current_rules, grey_tolerance)
-        best_rules = self.select_best_dual_rules(final_evaluation)
-
-        # Print summary of disjointness validation
-        print(f"\n{'='*80}")
-        print(f"DISJOINTNESS VALIDATION SUMMARY")
-        print(f"{'='*80}")
-
-        for column, rule in best_rules.items():
-            validation = self._validate_disjointness(
-                df, column, rule.clean_rule_func, rule.dirty_rule_func
-            )
-            print(f"\n{column}:")
-            print(f"  Disjoint: {validation['is_disjoint']}")
-            print(f"  Intersections: {validation['intersection_count']}")
-            print(f"  Clean Coverage: {validation['clean_coverage_rate']:.4f}")
-            print(f"  Dirty Coverage: {validation['dirty_coverage_rate']:.4f}")
-            print(f"  Gap Rate: {validation['gap_rate']:.4f}")
-
-        return best_rules, refinement_history
 
     def _generate_repair_candidates(self, column: str, clean_rule_str: str, dirty_rule_str: str,
                                    conflict_samples: List[Dict[str, Any]],
@@ -1216,57 +1125,6 @@ class Judge:
         print(f"  - detected_dirty_values.json")
         print(f"  - coverage_gaps.json")
 
-    def _analyze_conflict_topology(self, df: pd.DataFrame, column: str,
-                                   clean_func, dirty_func) -> Dict[str, Any]:
-        """
-        Analyze the topology of conflicts between P_clean and P_dirty.
-
-        Args:
-            df: DataFrame containing the data
-            column: Column name being analyzed
-            clean_func: P_clean predicate function
-            dirty_func: P_dirty predicate function
-
-        Returns:
-            Dictionary with topology analysis including conflict type, IoU, samples
-        """
-        from agentic_error_detector.core.deducer import (
-            analyze_conflict_topology, ConflictType, classify_conflict_type
-        )
-
-        # Build masks
-        clean_mask = []
-        dirty_mask = []
-        for idx, row in df.iterrows():
-            value = row[column]
-            try:
-                clean_mask.append(bool(self._invoke_predicate(clean_func, value, row)))
-                dirty_mask.append(bool(self._invoke_predicate(dirty_func, value, row)))
-            except Exception:
-                clean_mask.append(False)
-                dirty_mask.append(False)
-
-        import numpy as np
-        clean_mask = np.array(clean_mask)
-        dirty_mask = np.array(dirty_mask)
-
-        # Analyze topology
-        topology = analyze_conflict_topology(df, column, clean_mask, dirty_mask, max_samples=5)
-
-        return {
-            'column': column,
-            'conflict_type': topology.conflict_type.value,
-            'clean_set_size': topology.clean_set_size,
-            'dirty_set_size': topology.dirty_set_size,
-            'intersection_size': topology.intersection_size,
-            'iou': topology.iou,
-            'clean_in_intersection_ratio': topology.clean_in_intersection_ratio,
-            'dirty_in_intersection_ratio': topology.dirty_in_intersection_ratio,
-            'intersection_samples': topology.intersection_samples,
-            'clean_only_samples': topology.clean_only_samples,
-            'dirty_only_samples': topology.dirty_only_samples
-        }
-
     def _select_intersection_samples(self, df: pd.DataFrame, column: str,
                                      clean_func, dirty_func, max_samples: int = 5) -> List[Dict[str, Any]]:
         """
@@ -1310,53 +1168,6 @@ class Judge:
 
         return samples
 
-    def _generate_refinement_task(self, df: pd.DataFrame, column: str,
-                                  evaluation_result: DualEvaluationResult,
-                                  metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Generate a refinement task based on conflict topology analysis.
-
-        Args:
-            df: DataFrame containing the data
-            column: Column name
-            evaluation_result: Evaluation result showing conflicts/gaps
-            metadata: Column metadata
-
-        Returns:
-            Dictionary with refinement task specification
-        """
-        from agentic_error_detector.core.deducer import generate_refinement_task
-
-        # Analyze topology
-        topology_dict = self._analyze_conflict_topology(
-            df, column,
-            evaluation_result.rule.clean_rule_func,
-            evaluation_result.rule.dirty_rule_func
-        )
-
-        # Determine strategy based on conflict type
-        conflict_type = topology_dict['conflict_type']
-        if conflict_type == 'SUBSET':
-            strategy = 'clean'
-        elif conflict_type == 'SUPERSET':
-            strategy = 'dirty'
-        elif conflict_type == 'INTERSECT':
-            strategy = 'both'
-        else:
-            strategy = 'fallback'
-
-        return {
-            'column': column,
-            'conflict_type': conflict_type,
-            'strategy': strategy,
-            'current_clean_rule': evaluation_result.rule.clean_rule_str,
-            'current_dirty_rule': evaluation_result.rule.dirty_rule_str,
-            'conflict_samples': evaluation_result.conflict_samples,
-            'grey_samples': evaluation_result.grey_samples,
-            'topology': topology_dict,
-            'metadata': metadata
-        }
-
     def _validate_disjointness(self, df: pd.DataFrame, column: str,
                                clean_func, dirty_func) -> Dict[str, Any]:
         """
@@ -1396,7 +1207,7 @@ class Judge:
             df: DataFrame containing the data
             column: Column name
             task: Refinement task dictionary
-            factory: LegislatorFactory instance for LLM generation
+            factory: AgentFactory instance for LLM generation
             max_attempts: Maximum number of refinement attempts
 
         Returns:
@@ -1448,34 +1259,6 @@ class Judge:
                         print(f"      Failed to generate P_dirty rule")
 
                 # Compile and validate
-                import re
-                import numpy as np
-
-                def safe_float(value):
-                    try:
-                        if value is None:
-                            return None
-                        if isinstance(value, (int, float)):
-                            return float(value)
-                        cleaned = str(value).replace(',', '').strip()
-                        if not cleaned:
-                            return None
-                        return float(cleaned)
-                    except Exception:
-                        return None
-
-                def safe_not(pred, value, row=None) -> bool:
-                    try:
-                        return not bool(self._invoke_predicate(pred, value, row))
-                    except Exception:
-                        return True
-
-                safe_dict = {
-                    "re": re, "str": str, "bool": bool, "pd": pd, "np": np,
-                    "float": float, "int": int, "len": len,
-                    "safe_not": safe_not, "safe_float": safe_float,
-                }
-
                 clean_func = eval(current_clean, safe_dict)
                 dirty_func = eval(current_dirty, safe_dict)
 
@@ -1519,7 +1302,8 @@ class Judge:
                            grey_tolerance: float = 0.1,
                            metadata: Dict[str, Any] = None,
                            output_dir: str = "agentic_error_detector/results",
-                           logger=None) -> Tuple['PillarRuleSet', Dict]:
+                           logger=None,
+                           console: Optional[Callable[[str], None]] = None) -> Tuple['PillarRuleSet', Dict]:
         """
         Refine pillar-level rules iteratively to reduce conflicts and gaps.
 
@@ -1527,7 +1311,7 @@ class Judge:
             df: DataFrame to evaluate
             column: Column name
             pillar_set: Current PillarRuleSet
-            factory: LegislatorFactory for LLM calls
+            factory: AgentFactory for LLM calls
             max_rounds: Maximum refinement rounds
             conflict_tolerance: Maximum acceptable conflict rate
             grey_tolerance: Maximum acceptable grey zone rate
@@ -1544,9 +1328,15 @@ class Judge:
         from agentic_error_detector.dual_types import PillarRuleSet
         from copy import deepcopy
 
-        print(f"\n{'='*80}")
-        print(f"PILLAR-LEVEL REFINEMENT: {column}")
-        print(f"{'='*80}")
+        console_fn: Callable[[str], None]
+        if console is None:
+            console_fn = print
+        else:
+            console_fn = console
+
+        console_fn("\n" + "=" * 80)
+        console_fn(f"PILLAR-LEVEL REFINEMENT: {column}")
+        console_fn("=" * 80)
 
         # Use provided logger or create a new one (for backward compatibility)
         own_logger = None
@@ -1561,18 +1351,16 @@ class Judge:
         pillar_set = self._compile_pillar_functions(pillar_set)
 
         for round_num in range(1, max_rounds + 1):
-            print(f"\n--- Round {round_num}/{max_rounds} ---")
+            console_fn(f"\n--- Round {round_num}/{max_rounds} ---")
 
             # Backup current rules
             backup = deepcopy(pillar_set)
 
-            # Resolve conflicts
-            print("  Resolving conflicts...")
+            console_fn("  Resolving conflicts...")
             conflict_resolver = ConflictResolver(memory, factory)
             pillar_set = conflict_resolver.resolve(df, column, pillar_set, metadata=metadata, round_num=round_num)
 
-            # Resolve gaps
-            print("  Resolving gaps...")
+            console_fn("  Resolving gaps...")
             gap_resolver = GapResolver(memory, factory)
             pillar_set = gap_resolver.resolve(df, column, pillar_set, metadata=metadata, round_num=round_num)
 
@@ -1580,11 +1368,11 @@ class Judge:
             pillar_set = self._compile_pillar_functions(pillar_set)
 
             # Check convergence
-            dual_rule = pillar_set.to_dual_rule(legislator_factory=factory)
+            dual_rule = pillar_set.to_dual_rule(agent_factory=factory)
             conflict_rate = self._count_conflicts(df, column, dual_rule) / len(df)
             grey_rate = self._count_grey_zone(df, column, dual_rule) / len(df)
 
-            print(f"  Conflict rate: {conflict_rate:.4f}, Grey rate: {grey_rate:.4f}")
+            console_fn(f"  Conflict rate: {conflict_rate:.4f}, Grey rate: {grey_rate:.4f}")
 
             history['rounds'].append({
                 'round': round_num,
@@ -1595,13 +1383,13 @@ class Judge:
 
             # Check termination - both conditions must be satisfied
             if conflict_rate <= conflict_tolerance and grey_rate <= grey_tolerance:
-                print(f"  ✓ Converged (conflict_rate={conflict_rate:.4f} <= {conflict_tolerance}, grey_rate={grey_rate:.4f} <= {grey_tolerance})")
+                console_fn(f"  ✓ Converged (conflict_rate={conflict_rate:.4f} <= {conflict_tolerance}, grey_rate={grey_rate:.4f} <= {grey_tolerance})")
                 break
 
             # Check if making progress
             if round_num > 1 and (conflict_rate > history['rounds'][-2]['conflict_rate'] or
                                   grey_rate > history['rounds'][-2]['grey_rate']):
-                print(f"  ⚠ No improvement (conflict: {conflict_rate:.4f} > {history['rounds'][-2]['conflict_rate']:.4f} or grey: {grey_rate:.4f} > {history['rounds'][-2]['grey_rate']:.4f}), rolling back")
+                console_fn(f"  ⚠ No improvement (conflict: {conflict_rate:.4f} > {history['rounds'][-2]['conflict_rate']:.4f} or grey: {grey_rate:.4f} > {history['rounds'][-2]['grey_rate']:.4f}), rolling back")
                 pillar_set = backup
                 break
 
@@ -1611,7 +1399,7 @@ class Judge:
                 [r.version for r in pillar_set.dirty_agents.values()]
             )
             if max_version >= max_rounds:
-                print(f"  ⚠ Max version reached ({max_version}), stopping (conflict={conflict_rate:.4f}, grey={grey_rate:.4f})")
+                console_fn(f"  ⚠ Max version reached ({max_version}), stopping (conflict={conflict_rate:.4f}, grey={grey_rate:.4f})")
                 break
 
         # Stop logging with summary (only if we created our own logger)
@@ -1631,36 +1419,6 @@ class Judge:
     
     def _compile_pillar_functions(self, pillar_set: 'PillarRuleSet') -> 'PillarRuleSet':
         """Compile rule functions from strings."""
-        import re
-        import pandas as pd
-        import numpy as np
-        
-        def safe_float(value):
-            try:
-                if value is None:
-                    return None
-                if isinstance(value, (int, float)):
-                    return float(value)
-                cleaned = str(value).replace(',', '').strip()
-                if not cleaned:
-                    return None
-                return float(cleaned)
-            except Exception:
-                return None
-        
-        safe_dict = {
-            "re": re,
-            "str": str,
-            "bool": bool,
-            "pd": pd,
-            "np": np,
-            "float": float,
-            "int": int,
-            "len": len,
-            "safe_float": safe_float,
-            "parse": parse,
-        }
-        
         for rule in pillar_set.clean_pillars.values():
             if rule.rule_func is None and rule.rule_str:
                 try:

@@ -492,7 +492,9 @@ class PandasProfiler:
         non_null_values = self.df[column].dropna().astype(str)
         value_counts = non_null_values.value_counts()
         unique_count = len(value_counts)
-        sample_values = non_null_values.head(20).tolist()
+
+        sample_size = min(20, len(non_null_values))
+        sample_values = non_null_values.sample(n=sample_size, random_state=42).tolist()
 
         return {
             'unique_count': unique_count,
@@ -651,9 +653,9 @@ class PandasProfiler:
         Infer column relationship hints based on data content and patterns.
 
         NOTE: This method provides minimal backward-compatible hints.
-        For intelligent relationship inference, use LogicLegislator directly.
+        For intelligent relationship inference, use LogicAgent directly.
 
-        The LogicLegislator in legislator.py can analyze column semantics
+        The LogicAgent in agent.py can analyze column semantics
         and data patterns to intelligently infer cross-column relationships
         without relying on these heuristic rules.
         """
