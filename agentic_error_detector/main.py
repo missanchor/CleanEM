@@ -1,7 +1,7 @@
 """
 Command-line entry point for the agentic error detector.
 
-Supports a dual verification pipeline with pillar-level refinement.
+Supports a dual verification pipeline with clean rule-level refinement.
 """
 import argparse
 import json
@@ -12,11 +12,11 @@ from datetime import datetime
 
 import pandas as pd
 
-from agentic_error_detector.judge import Judge
-from agentic_error_detector.agent import AgentFactory
-from agentic_error_detector.profiler import PandasProfiler
-from agentic_error_detector.validator import DisjointnessValidator
-from agentic_error_detector.core.utils import safe_dict
+from judge import Judge
+from agent import AgentFactory
+from profiler import PandasProfiler
+from validator import DisjointnessValidator
+from core.utils import safe_dict
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,20 +85,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_pillar_refinement(df, metadata, base_rules, clean_base_rules, factory, judge, args,
-                          clean_prompts=None, dirty_prompts=None, clean_df=None):
+def run_clean_rule_refinement(df, metadata, base_rules, clean_rules, factory, judge, args,
+                              clean_prompts=None, dirty_prompts=None, clean_df=None):
     """
-    Run pillar-level refinement for all columns.
+    Run clean rule-level refinement for all columns.
 
     Args:
         df: DataFrame
         metadata: Column metadata
         base_rules: Dict[column] -> List[(agent, rule_str)]
-        clean_base_rules: Dict[column] -> List[(pillar, rule_str)]
+        clean_rules: Dict[column] -> List[(clean_rule, rule_str)]
         factory: AgentFactory
         judge: Judge instance
         args: CLI arguments
-        clean_prompts: Dict[column] -> Dict[pillar] -> {'prompt': ..., 'response': ...}
+        clean_prompts: Dict[column] -> Dict[clean_rule] -> {'prompt': ..., 'response': ...}
         dirty_prompts: Dict[column] -> Dict[agent] -> {'prompt': ..., 'response': ...}
 
     Returns:
@@ -108,8 +108,8 @@ def run_pillar_refinement(df, metadata, base_rules, clean_base_rules, factory, j
         clean_prompts = {}
     if dirty_prompts is None:
         dirty_prompts = {}
-    from agentic_error_detector.dual_types import PillarRule, PillarRuleSet
-    from agentic_error_detector.modification_memory import start_logger, stop_logger
+    from dual_types import CleanRule, CleanRuleSet
+    from modification_memory import start_logger, stop_logger
     import re
     import pandas as pd
     import numpy as np
@@ -121,7 +121,7 @@ def run_pillar_refinement(df, metadata, base_rules, clean_base_rules, factory, j
 
     best_rules: Dict[str, Any] = {}
     all_history: Dict[str, Any] = {}
-    pillar_sets: Dict[str, Any] = {}
+    clean_rule_sets: Dict[str, Any] = {}
     initial_rules: Dict[str, Any] = {}
 
     # Extract dataset name from dirty_csv path
@@ -134,26 +134,26 @@ def run_pillar_refinement(df, metadata, base_rules, clean_base_rules, factory, j
     logger = start_logger(args.output_dir, dataset_name)
 
     # Log initial rule generation
-    logger.log_initial_rules(clean_base_rules, base_rules, clean_prompts, dirty_prompts)
+    logger.log_initial_rules(clean_rules, base_rules, clean_prompts, dirty_prompts)
 
     for column in metadata.keys():
-        clean_pillars = {}
-        for pillar_name, rule_str in clean_base_rules.get(column, []):
+        clean_rules_dict = {}
+        for rule_name, rule_str in clean_rules.get(column, []):
             try:
                 rule_func = eval(rule_str, safe_dict)
-                clean_pillars[pillar_name] = PillarRule(
-                    name=pillar_name,
+                clean_rules_dict[rule_name] = CleanRule(
+                    name=rule_name,
                     rule_str=rule_str,
                     rule_func=rule_func
                 )
             except Exception as e:
-                print(f"  ⚠ Failed to compile clean rule {pillar_name}: {e}")
+                print(f"  ⚠ Failed to compile clean rule {rule_name}: {e}")
 
-        dirty_agents = {}
+        dirty_rules = {}
         for agent_name, rule_str in base_rules.get(column, []):
             try:
                 rule_func = eval(rule_str, safe_dict)
-                dirty_agents[agent_name] = PillarRule(
+                dirty_rules[agent_name] = CleanRule(
                     name=agent_name,
                     rule_str=rule_str,
                     rule_func=rule_func
@@ -161,23 +161,23 @@ def run_pillar_refinement(df, metadata, base_rules, clean_base_rules, factory, j
             except Exception as e:
                 print(f"  ⚠ Failed to compile dirty rule {agent_name}: {e}")
 
-        if not clean_pillars and not dirty_agents:
+        if not clean_rules_dict and not dirty_rules:
             continue
 
-        pillar_set = PillarRuleSet(
+        rule_set = CleanRuleSet(
             column=column,
-            clean_pillars=clean_pillars,
-            dirty_agents=dirty_agents
+            clean_rules=clean_rules_dict,
+            dirty_rules=dirty_rules
         )
-        pillar_sets[column] = pillar_set
+        clean_rule_sets[column] = rule_set
 
-    for column, pillar_set in pillar_sets.items():
-        dual_rule = pillar_set.to_dual_rule(agent_factory=factory)
+    for column, rule_set in clean_rule_sets.items():
+        dual_rule = rule_set.to_dual_rule(agent_factory=factory)
         initial_rules[column] = dual_rule
 
     if clean_df is not None and initial_rules:
         print("\n" + "="*80)
-        print("INITIAL PILLAR PERFORMANCE (before refinement)")
+        print("INITIAL CLEAN RULE PERFORMANCE (before refinement)")
         print("="*80)
         initial_detected_errors = judge.get_detected_dirty_values(initial_rules, df)
         initial_metrics_summary = judge.evaluate_with_ground_truth(
@@ -195,13 +195,13 @@ def run_pillar_refinement(df, metadata, base_rules, clean_base_rules, factory, j
 
         return console, lines
 
-    def _refine_single_column(column: str, pillar_set: Any):
+    def _refine_single_column(column: str, rule_set: Any):
         console, log_lines = _make_console_buffer()
         col_metadata = metadata.get(column, {})
-        refined_set, history = judge.refine_pillar_rules(
+        refined_set, history = judge.refine_clean_rules(
             df,
             column,
-            pillar_set,
+            rule_set,
             factory=factory,
             max_rounds=args.max_rounds,
             conflict_tolerance=0.01,
@@ -216,8 +216,8 @@ def run_pillar_refinement(df, metadata, base_rules, clean_base_rules, factory, j
     max_workers = max(1, int(getattr(args, "max_workers", 1) or 1))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_column = {
-            executor.submit(_refine_single_column, column, pillar_set): column
-            for column, pillar_set in pillar_sets.items()
+            executor.submit(_refine_single_column, column, rule_set): column
+            for column, rule_set in clean_rule_sets.items()
         }
         for future in as_completed(future_to_column):
             column, dual_rule, history, log_lines = future.result()
@@ -302,8 +302,8 @@ def run_dual_mode(args: argparse.Namespace) -> None:
         print("[2/7] Generating base agent rules (Missing/Typo/Pattern/Outlier)")
         base_rules, dirty_prompts = factory.generate_rules_per_column(metadata)
 
-        print("[3/7] Generating clean pillar rules (Completeness/Accuracy/Pattern/Relationship)")
-        clean_base_rules, clean_prompts = factory.generate_clean_rules_per_column(metadata)
+        print("[3/7] Generating clean rules (Completeness/Accuracy/Pattern/Relationship)")
+        clean_rules, clean_prompts = factory.generate_clean_rules_per_column(metadata)
 
         judge = Judge(threshold=args.vr_threshold)
 
@@ -316,24 +316,24 @@ def run_dual_mode(args: argparse.Namespace) -> None:
         judge.print_summary(accepted_base_rules)
         # judge.print_detected_errors(base_detected_errors)
 
-        # Evaluate standalone clean pillar rules (Completeness/Accuracy/Pattern/Relationship)
+        # Evaluate standalone clean rules (Completeness/Accuracy/Pattern/Relationship)
         print("\n" + "="*80)
-        print("STANDALONE CLEAN PILLAR RULES EVALUATION")
+        print("STANDALONE CLEAN RULES EVALUATION")
         print("="*80)
-        clean_evaluation_results = judge.evaluate_rules(profiler.df, clean_base_rules, pillar_type="clean")
+        clean_evaluation_results = judge.evaluate_rules(profiler.df, clean_rules, rule_type="clean")
         accepted_clean_rules = judge.get_accepted_rules(clean_evaluation_results)
-        judge.print_summary(accepted_clean_rules, pillar_type="clean")
+        judge.print_summary(accepted_clean_rules, rule_type="clean")
 
         # Combined error detection using AND/OR logic
-        # Clean Pillar (AND): All clean pillars must be satisfied
+        # Clean Rule (AND): All clean rules must be satisfied
         # Dirty Rule (OR): Violating any dirty rule marks as potentially dirty
-        # Error = (NOT all clean pillars satisfied) AND (at least one dirty rule violated)
+        # Error = (NOT all clean rules satisfied) AND (at least one dirty rule violated)
         print("\n" + "="*80)
         print("COMBINED ERROR DETECTION (AND/OR LOGIC)")
         print("="*80)
         base_detected_errors = judge.get_detected_errors(
             accepted_base_rules,      # dirty rules (OR logic)
-            accepted_clean_rules      # clean pillars (AND logic)
+            accepted_clean_rules      # clean rules (AND logic)
         )
         print(f"Detected {len(base_detected_errors)} errors using combined AND/OR logic")
 
@@ -352,9 +352,9 @@ def run_dual_mode(args: argparse.Namespace) -> None:
             )
             judge.print_evaluation_summary(base_metrics_summary)
 
-        print("\n[7/7] Pillar-Level Refinement Mode")
+        print("\n[7/7] Clean Rule-Level Refinement Mode")
         print("="*80)
-        best_rules, refinement_history = run_pillar_refinement(
+        best_rules, refinement_history = run_clean_rule_refinement(
             profiler.df,
             metadata,
             {

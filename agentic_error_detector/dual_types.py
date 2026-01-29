@@ -4,7 +4,7 @@ Dual Verification Types for P_clean/P_dirty dual rule system.
 from dataclasses import dataclass
 from typing import Dict, List, Any, Tuple, Optional
 import pandas as pd
-from agentic_error_detector.core.utils import safe_dict, safe_float
+from core.utils import safe_dict, safe_float
 
 
 @dataclass
@@ -165,42 +165,42 @@ class DisjointnessResult:
 
 
 # ============================================================================
-# Pillar-Level Refinement Types (Phase 1)
+# CleanRule-Level Refinement Types (Phase 1)
 # ============================================================================
 
 @dataclass
-class PillarRule:
-    """Individual pillar or agent rule with version tracking."""
-    name: str                  # pillar name (e.g., 'completeness') or agent name (e.g., 'TypoLegislator')
+class CleanRule:
+    """Individual clean rule or dirty rule with version tracking."""
+    name: str                  # clean rule name (e.g., 'completeness') or agent name (e.g., 'TypoAgent')
     rule_str: str              # Lambda string
     rule_func: callable = None # Compiled lambda
     version: int = 0           # Incremented on modification
     modification_log: List[str] = None  # List of modification reasons
-    
+
     def __post_init__(self):
         if self.modification_log is None:
             self.modification_log = []
 
 
 @dataclass
-class PillarRuleSet:
-    """Collection of pillar rules and agent rules for a column."""
+class CleanRuleSet:
+    """Collection of clean rules and dirty rules for a column."""
     column: str
-    clean_pillars: Dict[str, PillarRule]  # pillar_name -> PillarRule
-    dirty_agents: Dict[str, PillarRule]   # agent_name -> PillarRule
+    clean_rules: Dict[str, CleanRule]  # clean_rule_name -> CleanRule
+    dirty_rules: Dict[str, CleanRule]  # agent_name -> CleanRule
 
     def to_dual_rule(self, agent_factory=None) -> DualRule:
         """Convert to DualRule for compatibility with existing judge methods.
 
         Strategy:
-        - P_clean: AND of all clean pillars (all pillars satisfied)
-        - P_dirty: OR of all dirty agents (at least one agent detected)
+        - P_clean: AND of all clean rules (all rules satisfied)
+        - P_dirty: OR of all dirty rules (at least one rule detected)
 
         Args:
             agent_factory: Optional factory for LLM-based rule fixing
         """
-        clean_rule_str = self._compose_and_str_safe(self.clean_pillars, agent_factory)
-        dirty_rule_str = self._compose_or_str_safe(self.dirty_agents, agent_factory)
+        clean_rule_str = self._compose_and_str_safe(self.clean_rules, agent_factory)
+        dirty_rule_str = self._compose_or_str_safe(self.dirty_rules, agent_factory)
 
         # Final compile attempt with error handling
         try:
@@ -241,7 +241,7 @@ class PillarRuleSet:
             return None
 
         try:
-            from agentic_error_detector.agent import RuleFixerAgent
+            from agent import RuleFixerAgent
             fixer = RuleFixerAgent(
                 base_url=agent_factory.base_url,
                 model=agent_factory.model
@@ -282,24 +282,24 @@ class PillarRuleSet:
         args = [a.strip() for a in args_str.split(',')]
         return len(args)
 
-    def _compose_and_str_safe(self, pillars: Dict[str, PillarRule],
+    def _compose_and_str_safe(self, rules: Dict[str, CleanRule],
                                agent_factory=None) -> str:
         """Generate AND-composed lambda string with self-healing for syntax errors.
 
         Args:
-            pillars: Dict of pillar rules
+            rules: Dict of clean rules
             agent_factory: Optional factory for LLM-based rule fixing
 
         Returns:
             Composed lambda string
         """
-        if not pillars:
+        if not rules:
             return "lambda value, row=None: True"
 
         valid_parts = []
-        for name, rule in pillars.items():
+        for name, rule in rules.items():
             # Try to compile the rule
-            success, _, error = PillarRuleSet._compile_rule_safely(rule.rule_str)
+            success, _, error = CleanRuleSet._compile_rule_safely(rule.rule_str)
 
             if not success:
                 print(f"  ⚠ Rule '{name}' has syntax error: {error}")
@@ -308,7 +308,7 @@ class PillarRuleSet:
                     fixed = self._fix_rule_with_llm(rule.rule_str, error, name, agent_factory)
                     if fixed:
                         # Verify the fixed rule
-                        fixed_success, _, _ = PillarRuleSet._compile_rule_safely(fixed)
+                        fixed_success, _, _ = CleanRuleSet._compile_rule_safely(fixed)
                         if fixed_success:
                             rule.rule_str = fixed
                             print(f"  ✓ Using fixed rule for '{name}'")
@@ -322,7 +322,7 @@ class PillarRuleSet:
                     continue
 
             # Get argument count and build part
-            arg_count = PillarRuleSet._get_arg_count(rule.rule_str)
+            arg_count = CleanRuleSet._get_arg_count(rule.rule_str)
             if arg_count == 1:
                 valid_parts.append(f"(lambda v, r: ({rule.rule_str})(v))")
             else:
@@ -335,24 +335,24 @@ class PillarRuleSet:
         composed = " and ".join([f"({p})(value, row)" for p in valid_parts])
         return f"lambda value, row=None: {composed}"
 
-    def _compose_or_str_safe(self, agents: Dict[str, PillarRule],
+    def _compose_or_str_safe(self, rules: Dict[str, CleanRule],
                               agent_factory=None) -> str:
         """Generate OR-composed lambda string with self-healing for syntax errors.
 
         Args:
-            agents: Dict of agent rules
+            rules: Dict of dirty rules
             agent_factory: Optional factory for LLM-based rule fixing
 
         Returns:
             Composed lambda string
         """
-        if not agents:
+        if not rules:
             return "lambda value, row=None: False"
 
         valid_parts = []
-        for name, rule in agents.items():
+        for name, rule in rules.items():
             # Try to compile the rule
-            success, _, error = PillarRuleSet._compile_rule_safely(rule.rule_str)
+            success, _, error = CleanRuleSet._compile_rule_safely(rule.rule_str)
 
             if not success:
                 print(f"  ⚠ Agent '{name}' has syntax error: {error}")
@@ -361,7 +361,7 @@ class PillarRuleSet:
                     fixed = self._fix_rule_with_llm(rule.rule_str, error, name, agent_factory)
                     if fixed:
                         # Verify the fixed rule
-                        fixed_success, _, _ = PillarRuleSet._compile_rule_safely(fixed)
+                        fixed_success, _, _ = CleanRuleSet._compile_rule_safely(fixed)
                         if fixed_success:
                             rule.rule_str = fixed
                             print(f"  ✓ Using fixed rule for '{name}'")
@@ -375,14 +375,14 @@ class PillarRuleSet:
                     continue
 
             # Get argument count and build part
-            arg_count = PillarRuleSet._get_arg_count(rule.rule_str)
+            arg_count = CleanRuleSet._get_arg_count(rule.rule_str)
             if arg_count == 1:
                 valid_parts.append(f"(lambda v, r: ({rule.rule_str})(v))")
             else:
                 valid_parts.append(f"({rule.rule_str})")
 
         if not valid_parts:
-            print(f"  ⚠ No valid dirty agents, using default False")
+            print(f"  ⚠ No valid dirty rules, using default False")
             return "lambda value, row=None: False"
 
         composed = " or ".join([f"({p})(value, row)" for p in valid_parts])

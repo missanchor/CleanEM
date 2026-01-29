@@ -1,24 +1,24 @@
 """
-Conflict Resolver for pillar-level rule refinement.
-Handles conflicts between clean pillars and dirty agents.
+Conflict Resolver for clean rule-level refinement.
+Handles conflicts between clean rules and dirty rules.
 """
 from typing import Dict, List, Any, Tuple
 from collections import Counter
 import pandas as pd
 import json
 
-from agentic_error_detector.dual_types import (
-    PillarRule, PillarRuleSet, ConflictRecord
+from dual_types import (
+    CleanRule, CleanRuleSet, ConflictRecord
 )
-from agentic_error_detector.modification_memory import (
+from modification_memory import (
     ModificationMemory, get_logger
 )
-from agentic_error_detector.core.utils import safe_dict
+from core.utils import safe_dict
 
 
 class ConflictResolver:
     """
-    Resolve conflicts between clean pillars and dirty agents.
+    Resolve conflicts between clean rules and dirty rules.
     """
 
     def __init__(self, memory: ModificationMemory, agent_factory=None,
@@ -35,25 +35,25 @@ class ConflictResolver:
         self.logger = get_logger()
 
     def resolve(self, df: pd.DataFrame, column: str,
-                pillar_set: PillarRuleSet,
+                rule_set: CleanRuleSet,
                 metadata: Dict[str, Any] = None,
-                round_num: int = 1) -> PillarRuleSet:
+                round_num: int = 1) -> CleanRuleSet:
         """
         Resolve conflicts for a column.
 
         Args:
             df: DataFrame to analyze
             column: Column name
-            pillar_set: Current PillarRuleSet
+            rule_set: Current CleanRuleSet
             metadata: Column metadata (type, sample_values, etc.)
             round_num: Current refinement round number
 
         Returns:
-            Refined PillarRuleSet
+            Refined CleanRuleSet
         """
         # Store initial rules for logging
-        clean_rules_before = {k: v.rule_str for k, v in pillar_set.clean_pillars.items()}
-        dirty_rules_before = {k: v.rule_str for k, v in pillar_set.dirty_agents.items()}
+        clean_rules_before = {k: v.rule_str for k, v in rule_set.clean_rules.items()}
+        dirty_rules_before = {k: v.rule_str for k, v in rule_set.dirty_rules.items()}
 
         # Set current column and round for logging
         self.current_column = column
@@ -73,16 +73,16 @@ class ConflictResolver:
 
         num_modifications = 0
 
-        # For each clean pillar, find conflicts with dirty agents
-        for pillar_name, clean_rule in pillar_set.clean_pillars.items():
+        # For each clean rule, find conflicts with dirty rules
+        for rule_name, clean_rule in rule_set.clean_rules.items():
             conflicts, clean_only, dirty_only = self._find_conflicts(
-                df, column, clean_rule, pillar_set.dirty_agents
+                df, column, clean_rule, rule_set.dirty_rules
             )
 
             if not conflicts:
                 continue
 
-            # Get unique conflicting agents for this pillar
+            # Get unique conflicting agents for this rule
             conflicting_agents = list(set([c.dirty_rule_name for c in conflicts]))
 
             if not conflicting_agents:
@@ -99,10 +99,10 @@ class ConflictResolver:
             max_pairs = self.max_pairwise_conflicts
 
             for agent_name in conflicting_agents[:max_pairs]:
-                if agent_name not in pillar_set.dirty_agents:
+                if agent_name not in rule_set.dirty_rules:
                     continue
 
-                dirty_rule = pillar_set.dirty_agents[agent_name]
+                dirty_rule = rule_set.dirty_rules[agent_name]
 
                 # Get pairwise conflicting values for this specific pair
                 pairwise_conflicts = [c for c in top_conflicts if c.dirty_rule_name == agent_name]
@@ -115,7 +115,7 @@ class ConflictResolver:
                 )
 
                 pairwise_results.append({
-                    'clean_rule': pillar_name,
+                    'clean_rule': rule_name,
                     'dirty_rule': agent_name,
                     **result
                 })
@@ -140,15 +140,15 @@ class ConflictResolver:
                 }
 
                 new_clean_rule = self._refine_clean_rule(
-                    pillar_name, clean_rule, analysis, metadata, dirty_only_values, conflict_values
+                    rule_name, clean_rule, analysis, metadata, dirty_only_values, conflict_values
                 )
                 if new_clean_rule.rule_str != clean_rule.rule_str:
                     num_modifications += 1
                     # Record pairwise modification
                     if hasattr(self.memory, 'add'):
-                        self.memory.add('clean', pillar_name, 'pairwise_refined',
+                        self.memory.add('clean', rule_name, 'pairwise_refined',
                                       synthesis_reason, new_clean_rule.rule_str)
-                pillar_set.clean_pillars[pillar_name] = new_clean_rule
+                rule_set.clean_rules[rule_name] = new_clean_rule
             else:
                 # Modify dirty rules (only those suggested by synthesis)
                 affected_rules = synthesis.get('affected_rules', [])
@@ -159,7 +159,7 @@ class ConflictResolver:
                                     if r.get('suggested_modify') == 'dirty']
 
                 for agent_name in affected_rules:
-                    if agent_name not in pillar_set.dirty_agents:
+                    if agent_name not in rule_set.dirty_rules:
                         continue
 
                     # Find the pairwise result for this agent
@@ -171,7 +171,7 @@ class ConflictResolver:
                     if not pair_result:
                         continue
 
-                    dirty_rule = pillar_set.dirty_agents[agent_name]
+                    dirty_rule = rule_set.dirty_rules[agent_name]
                     reason = pair_result.get('reason', synthesis_reason)
 
                     # Collect conflicting values for this specific agent
@@ -190,11 +190,11 @@ class ConflictResolver:
                             self.memory.add('dirty', agent_name, 'pairwise_refined',
                                           reason, new_dirty_rule.rule_str)
 
-                    pillar_set.dirty_agents[agent_name] = new_dirty_rule
+                    rule_set.dirty_rules[agent_name] = new_dirty_rule
 
         # Store final rules for logging
-        clean_rules_after = {k: v.rule_str for k, v in pillar_set.clean_pillars.items()}
-        dirty_rules_after = {k: v.rule_str for k, v in pillar_set.dirty_agents.items()}
+        clean_rules_after = {k: v.rule_str for k, v in rule_set.clean_rules.items()}
+        dirty_rules_after = {k: v.rule_str for k, v in rule_set.dirty_rules.items()}
 
         # End column refinement logging
         self.logger.end_column_refinement(
@@ -204,11 +204,11 @@ class ConflictResolver:
 
         # Log round summary
         if num_modifications > 0:
-            # Calculate conflict rate for summary (considering ALL clean pillars)
+            # Calculate conflict rate for summary (considering ALL clean rules)
             all_conflict_indices = set()
-            for clean_pillar in pillar_set.clean_pillars.values():
+            for clean_rule_item in rule_set.clean_rules.values():
                 conflicts, _, _ = self._find_conflicts(
-                    df, column, clean_pillar, pillar_set.dirty_agents
+                    df, column, clean_rule_item, rule_set.dirty_rules
                 )
                 all_conflict_indices.update(c['row_index'] for c in conflicts)
             conflict_rate = len(all_conflict_indices) / len(df) if len(df) > 0 else 0
@@ -221,11 +221,11 @@ class ConflictResolver:
                 num_modifications=num_modifications
             )
 
-        return pillar_set
-    
+        return rule_set
+
     def _find_conflicts(self, df: pd.DataFrame, column: str,
-                       clean_rule: PillarRule,
-                       dirty_agents: Dict[str, PillarRule]) -> Tuple[List[ConflictRecord], List[Dict], List[Dict]]:
+                       clean_rule: CleanRule,
+                       dirty_rules: Dict[str, CleanRule]) -> Tuple[List[ConflictRecord], List[Dict], List[Dict]]:
         """Find conflicts, clean-only samples, and dirty-only samples.
 
         Returns:
@@ -245,7 +245,7 @@ class ConflictResolver:
 
                 # Check which dirty rules pass
                 dirty_results = {}
-                for agent_name, dirty_rule in dirty_agents.items():
+                for agent_name, dirty_rule in dirty_rules.items():
                     if self._invoke_rule(dirty_rule.rule_func, value, row):
                         dirty_results[agent_name] = True
 
@@ -279,8 +279,8 @@ class ConflictResolver:
     
     def _analyze_conflict(self, df: pd.DataFrame, column: str,
                          top_conflicts: List[ConflictRecord],
-                         clean_rule: PillarRule,
-                         dirty_agents: Dict[str, PillarRule],
+                         clean_rule: CleanRule,
+                         dirty_rules: Dict[str, CleanRule],
                          metadata: Dict[str, Any] = None,
                          clean_only_samples: List[Dict] = None,
                          dirty_only_samples: List[Dict] = None) -> Dict[str, Any]:
@@ -308,7 +308,7 @@ class ConflictResolver:
 
         # Use LLM to decide with sample context
         prompt = self._build_conflict_analysis_prompt(
-            column, conflict_values, clean_rule, dirty_agents, conflicting_agents,
+            column, conflict_values, clean_rule, dirty_rules, conflicting_agents,
             metadata, clean_only_samples, dirty_only_samples
         )
 
@@ -316,8 +316,8 @@ class ConflictResolver:
         self.logger.set_prompt(prompt)
 
         try:
-            from agentic_error_detector.agent import DualAgent
-            dual_leg = DualLegislator(
+            from agent import DualAgent
+            dual_leg = DualAgent(
                 self.factory.base_url,
                 self.factory.model
             )
@@ -351,17 +351,17 @@ class ConflictResolver:
                 'llm_analysis': f'Error: {e}',
                 'decision': 'clean'
             }
-    
+
     def _build_conflict_analysis_prompt(self, column: str, values: List[Any],
-                                       clean_rule: PillarRule,
-                                       dirty_agents: Dict[str, PillarRule],
+                                       clean_rule: CleanRule,
+                                       dirty_rules: Dict[str, CleanRule],
                                        conflicting_agents: List[str],
                                        metadata: Dict[str, Any] = None,
                                        clean_only_samples: List[Dict] = None,
                                        dirty_only_samples: List[Dict] = None) -> str:
         """Build prompt for LLM conflict analysis with sample context."""
         dirty_rules_str = "\n".join([
-            f"- {name}: {dirty_agents[name].rule_str}"
+            f"- {name}: {dirty_rules[name].rule_str}"
             for name in conflicting_agents
         ])
 
@@ -453,8 +453,8 @@ Return ONLY a JSON object:
 """
 
     def _build_pairwise_conflict_prompt(self, column: str,
-                                        clean_rule: PillarRule,
-                                        dirty_rule: PillarRule,
+                                        clean_rule: CleanRule,
+                                        dirty_rule: CleanRule,
                                         conflict_values: List[str],
                                         clean_only_values: List[str],
                                         dirty_only_values: List[str],
@@ -541,8 +541,8 @@ Return ONLY a JSON object:
 """
 
     def _analyze_pairwise_conflict(self, column: str,
-                                   clean_rule: PillarRule,
-                                   dirty_rule: PillarRule,
+                                   clean_rule: CleanRule,
+                                   dirty_rule: CleanRule,
                                    conflict_values: List[str],
                                    clean_only_values: List[str],
                                    dirty_only_values: List[str],
@@ -570,7 +570,7 @@ Return ONLY a JSON object:
         self.logger.set_prompt(prompt)
 
         try:
-            from agentic_error_detector.agent import DualAgent
+            from agent import DualAgent
             dual_leg = DualLegislator(
                 self.factory.base_url,
                 self.factory.model
@@ -604,7 +604,7 @@ Return ONLY a JSON object:
             }
 
     def _build_synthesis_prompt(self, column: str,
-                                 clean_rule: PillarRule,
+                                 clean_rule: CleanRule,
                                  pairwise_results: List[Dict[str, Any]],
                                  metadata: Dict[str, Any] = None) -> str:
         """Build prompt to synthesize all pairwise decisions into a final decision."""
@@ -694,7 +694,7 @@ Return ONLY a JSON object:
 """
 
     def _synthesize_decision(self, column: str,
-                             clean_rule: PillarRule,
+                             clean_rule: CleanRule,
                              pairwise_results: List[Dict[str, Any]],
                              metadata: Dict[str, Any] = None) -> Dict[str, Any]:
         """
@@ -728,7 +728,7 @@ Return ONLY a JSON object:
         self.logger.set_prompt(prompt)
 
         try:
-            from agentic_error_detector.agent import DualAgent
+            from agent import DualAgent
             dual_leg = DualLegislator(
                 self.factory.base_url,
                 self.factory.model
@@ -763,12 +763,12 @@ Return ONLY a JSON object:
                 'affected_rules': affected_rules
             }
     
-    def _refine_clean_rule(self, pillar_name: str, rule: PillarRule,
+    def _refine_clean_rule(self, rule_name: str, rule: CleanRule,
                           analysis: Dict[str, Any],
                           metadata: Dict[str, Any] = None,
                           dirty_only_values: List[str] = None,
-                          conflicting_values: List[str] = None) -> PillarRule:
-        """Refine a clean pillar rule to exclude conflicts."""
+                          conflicting_values: List[str] = None) -> CleanRule:
+        """Refine a clean rule to exclude conflicts."""
         if not self.factory:
             # Return unchanged if no LLM available
             return rule
@@ -815,7 +815,7 @@ These values incorrectly satisfy both clean and dirty rules.
 
         prompt = f"""Refine this clean data quality rule to be more precise:
 
-**Current Rule ({pillar_name}):**
+**Current Rule ({rule_name}):**
 {rule.rule_str}
 {meta_str}
 {dirty_section}
@@ -841,8 +841,8 @@ lambda value, row=None: <expression>
         self.logger.set_prompt(prompt)
 
         try:
-            from agentic_error_detector.agent import DualAgent
-            dual_leg = DualLegislator(self.factory.base_url, self.factory.model)
+            from agent import DualAgent
+            dual_leg = DualAgent(self.factory.base_url, self.factory.model)
 
             response = dual_leg._call_llm(prompt, max_tokens=300, temperature=0.2)
 
@@ -853,8 +853,8 @@ lambda value, row=None: <expression>
             new_rule_str = self._extract_lambda(response)
             if new_rule_str:
                 # Create new rule object (without compiling yet)
-                new_rule = PillarRule(
-                    name=pillar_name,
+                new_rule = CleanRule(
+                    name=rule_name,
                     rule_str=new_rule_str,
                     rule_func=None,
                     version=rule.version + 1,
@@ -873,7 +873,7 @@ lambda value, row=None: <expression>
                         # Reject the rule - log and return original
                         self.logger.log_rejection(
                             rule_type="clean",
-                            rule_name=pillar_name,
+                            rule_name=rule_name,
                             old_rule=rule.rule_str,
                             new_rule=new_rule_str,
                             violation_rate=violation_rate,
@@ -881,16 +881,16 @@ lambda value, row=None: <expression>
                         )
 
                         if hasattr(self.memory, 'add'):
-                            self.memory.add('clean', pillar_name, 'rejected',
+                            self.memory.add('clean', rule_name, 'rejected',
                                           reject_reason, new_rule_str)
 
-                        print(f"  ⚠ Clean rule '{pillar_name}' rejected: violation rate {violation_rate*100:.1f}%")
+                        print(f"  ⚠ Clean rule '{rule_name}' rejected: violation rate {violation_rate*100:.1f}%")
                         return rule  # Return original rule
 
                 # Rule accepted - add modification to logging
                 self.logger.add_modification(
                     rule_type="clean",
-                    rule_name=pillar_name,
+                    rule_name=rule_name,
                     old_rule=rule.rule_str,
                     new_rule=new_rule_str,
                     modification_type="tightened",
@@ -898,7 +898,7 @@ lambda value, row=None: <expression>
                 )
 
                 if hasattr(self.memory, 'add'):
-                    self.memory.add('clean', pillar_name, 'tightened',
+                    self.memory.add('clean', rule_name, 'tightened',
                                   analysis.get('reason', ''), new_rule_str)
 
                 return new_rule
@@ -907,13 +907,13 @@ lambda value, row=None: <expression>
             print(f"  ⚠ Failed to refine clean rule: {e}")
 
         return rule
-    
-    def _refine_dirty_rule(self, agent_name: str, rule: PillarRule,
+
+    def _refine_dirty_rule(self, agent_name: str, rule: CleanRule,
                           reasons: List[str],
                           metadata: Dict[str, Any] = None,
                           dirty_only_values: List[str] = None,
-                          conflicting_values: List[str] = None) -> PillarRule:
-        """Refine a dirty agent rule based on accumulated reasons."""
+                          conflicting_values: List[str] = None) -> CleanRule:
+        """Refine a dirty rule based on accumulated reasons."""
         if not self.factory:
             return rule
 
@@ -982,8 +982,8 @@ lambda value, row=None: <expression>
         self.logger.set_prompt(prompt)
 
         try:
-            from agentic_error_detector.agent import DualAgent
-            dual_leg = DualLegislator(self.factory.base_url, self.factory.model)
+            from agent import DualAgent
+            dual_leg = DualAgent(self.factory.base_url, self.factory.model)
 
             response = dual_leg._call_llm(prompt, max_tokens=300, temperature=0.2)
 
@@ -993,7 +993,7 @@ lambda value, row=None: <expression>
             new_rule_str = self._extract_lambda(response)
             if new_rule_str:
                 # Create new rule object (without compiling yet)
-                new_rule = PillarRule(
+                new_rule = CleanRule(
                     name=agent_name,
                     rule_str=new_rule_str,
                     rule_func=None,
@@ -1068,7 +1068,7 @@ lambda value, row=None: <expression>
             return False
 
     def _validate_refined_rule(self, df: pd.DataFrame, column: str,
-                               old_rule: 'PillarRule', new_rule: 'PillarRule',
+                               old_rule: 'CleanRule', new_rule: 'CleanRule',
                                side: str) -> tuple:
         """
         Validate a refined rule against the full dataset.
@@ -1125,7 +1125,7 @@ lambda value, row=None: <expression>
         return True, violation_rate, "accepted"
 
     def _get_original_violation_rate(self, df: pd.DataFrame, column: str,
-                                     rule: 'PillarRule', side: str) -> float:
+                                     rule: 'CleanRule', side: str) -> float:
         """Get the original rule's violation rate for comparison."""
         if rule.rule_func is None:
             return 0.0

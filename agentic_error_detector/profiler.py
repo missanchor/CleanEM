@@ -661,7 +661,7 @@ class PandasProfiler:
         """
         # Only infer very obvious relationships based on column names
         # This is kept for backward compatibility
-        # For full intelligence, LogicLegislator should be used directly
+        # For full intelligence, LogicAgent should be used directly
         column_lookup = {col.lower(): col for col in self.df.columns}
         state_col = column_lookup.get('state')
         city_col = column_lookup.get('city')
@@ -701,7 +701,7 @@ class PandasProfiler:
                 })
 
             # Note: These are minimal hints for backward compatibility.
-            # The main intelligent inference is done by LogicLegislator.
+            # The main intelligent inference is done by LogicAgent.
             if constraints:
                 metadata['relationship_constraints'] = constraints
 

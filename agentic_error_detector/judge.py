@@ -5,8 +5,8 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Any, Tuple, Optional, Callable
 import re
-from agentic_error_detector.dual_types import DualRule, DualEvaluationResult, RefinementRound
-from agentic_error_detector.core.utils import safe_dict, safe_not
+from dual_types import DualRule, DualEvaluationResult, RefinementRound
+from core.utils import safe_dict, safe_not
 try:
     from dateutil.parser import parse  # type: ignore
 except Exception:
@@ -33,14 +33,14 @@ class Judge:
         self.evaluation_results = {}
 
     def evaluate_rules(self, df: pd.DataFrame, rules: Dict[str, list],
-                        pillar_type: str = "dirty") -> Dict[str, list]:
+                        rule_type: str = "dirty") -> Dict[str, list]:
         """
         Evaluate all rules and return results with VR analysis.
 
         Args:
             df: DataFrame to evaluate
             rules: Dictionary of {column: [(agent_name, rule_string), ...]}
-            pillar_type: "dirty" for error detection rules, "clean" for clean pillar rules.
+            rule_type: "dirty" for error detection rules, "clean" for clean rules.
                         For dirty: True = violation (error detected)
                         For clean: False = violation (value doesn't meet clean criteria)
 
@@ -51,7 +51,7 @@ class Judge:
 
         for column, candidate_rules in rules.items():
             print(f"\n{'='*80}")
-            rule_type_label = "Clean Pillar Rules" if pillar_type == "clean" else "Candidate Rules"
+            rule_type_label = "Clean Rules" if rule_type == "clean" else "Candidate Rules"
             print(f"Evaluating {len(candidate_rules)} {rule_type_label} for column: {column}")
             print(f"{'='*80}")
             
@@ -73,7 +73,7 @@ class Judge:
                             predicate_result = self._invoke_predicate(rule_func, value, row)
                             # For dirty rules: True = violation (error detected)
                             # For clean rules: False = violation (value doesn't meet clean criteria)
-                            is_violation = predicate_result if pillar_type == "dirty" else not predicate_result
+                            is_violation = predicate_result if rule_type == "dirty" else not predicate_result
                             if is_violation:
                                 violations.append({
                                     'row_index': idx,
@@ -172,9 +172,9 @@ class Judge:
         Extract all detected errors using combined AND/OR logic.
 
         Logic:
-        - Clean Pillars (AND): All clean pillars must be satisfied for a value to be considered clean
+        - Clean Rules (AND): All clean rules must be satisfied for a value to be considered clean
         - Dirty Rules (OR): Violating any dirty rule marks a value as potentially dirty
-        - Error = (NOT all clean pillars satisfied) AND (at least one dirty rule violated)
+        - Error = (NOT all clean rules satisfied) AND (at least one dirty rule violated)
 
         Args:
             dirty_rules: Dictionary with {column: [rule_result1, rule_result2, ...]} (OR logic)
@@ -314,16 +314,16 @@ class Judge:
         detected_errors.sort(key=lambda x: x['row_index'])
         return detected_errors
 
-    def print_summary(self, accepted_rules: Dict[str, list], pillar_type: str = "dirty"):
+    def print_summary(self, accepted_rules: Dict[str, list], rule_type: str = "dirty"):
         """
         Print a summary of the evaluation.
 
         Args:
             accepted_rules: Dictionary with {column: [rule_result1, ...]}
-            pillar_type: Type of rules being evaluated ("dirty" for error rules, "clean" for clean pillar rules)
+            rule_type: Type of rules being evaluated ("dirty" for error rules, "clean" for clean rules)
         """
         print("\n" + "="*80)
-        rule_type_label = "Clean Pillar Rules" if pillar_type == "clean" else "Rule Evaluation Results"
+        rule_type_label = "Clean Rules" if rule_type == "clean" else "Rule Evaluation Results"
         print(f"JUDGE SUMMARY - {rule_type_label}")
         print("="*80)
 
@@ -1140,7 +1140,7 @@ class Judge:
         Returns:
             List of sample dictionaries with row_index, value
         """
-        from agentic_error_detector.core.deducer import select_intersection_samples
+        from core.deducer import select_intersection_samples
 
         # Build masks
         clean_mask = []
@@ -1182,7 +1182,7 @@ class Judge:
         Returns:
             Dictionary with validation results
         """
-        from agentic_error_detector.core.deducer import validate_disjointness
+        from core.deducer import validate_disjointness
 
         result = validate_disjointness(df, column, clean_func, dirty_func)
 
@@ -1290,12 +1290,12 @@ class Judge:
         return None
 
     # =========================================================================================
-    # PILLAR-LEVEL REFINEMENT (Phase 2)
+    # CLEAN RULE-LEVEL REFINEMENT (Phase 2)
     # =========================================================================================
-    
-    def refine_pillar_rules(self, df: pd.DataFrame,
+
+    def refine_clean_rules(self, df: pd.DataFrame,
                            column: str,
-                           pillar_set: 'PillarRuleSet',
+                           rule_set: 'CleanRuleSet',
                            factory=None,
                            max_rounds: int = 10,
                            conflict_tolerance: float = 0.01,
@@ -1303,14 +1303,14 @@ class Judge:
                            metadata: Dict[str, Any] = None,
                            output_dir: str = "agentic_error_detector/results",
                            logger=None,
-                           console: Optional[Callable[[str], None]] = None) -> Tuple['PillarRuleSet', Dict]:
+                           console: Optional[Callable[[str], None]] = None) -> Tuple['CleanRuleSet', Dict]:
         """
-        Refine pillar-level rules iteratively to reduce conflicts and gaps.
+        Refine clean rule-level rules iteratively to reduce conflicts and gaps.
 
         Args:
             df: DataFrame to evaluate
             column: Column name
-            pillar_set: Current PillarRuleSet
+            rule_set: Current CleanRuleSet
             factory: AgentFactory for LLM calls
             max_rounds: Maximum refinement rounds
             conflict_tolerance: Maximum acceptable conflict rate
@@ -1320,12 +1320,12 @@ class Judge:
             logger: Optional RefinementLogger instance (if provided, will not create new one)
 
         Returns:
-            Tuple of (refined PillarRuleSet, refinement history)
+            Tuple of (refined CleanRuleSet, refinement history)
         """
-        from agentic_error_detector.modification_memory import ModificationMemory, start_logger, stop_logger, get_logger
-        from agentic_error_detector.conflict_resolver import ConflictResolver
-        from agentic_error_detector.gap_resolver import GapResolver
-        from agentic_error_detector.dual_types import PillarRuleSet
+        from modification_memory import ModificationMemory, start_logger, stop_logger, get_logger
+        from conflict_resolver import ConflictResolver
+        from gap_resolver import GapResolver
+        from dual_types import CleanRuleSet
         from copy import deepcopy
 
         console_fn: Callable[[str], None]
@@ -1335,7 +1335,7 @@ class Judge:
             console_fn = console
 
         console_fn("\n" + "=" * 80)
-        console_fn(f"PILLAR-LEVEL REFINEMENT: {column}")
+        console_fn(f"CLEAN RULE-LEVEL REFINEMENT: {column}")
         console_fn("=" * 80)
 
         # Use provided logger or create a new one (for backward compatibility)
@@ -1348,27 +1348,27 @@ class Judge:
         history = {'rounds': [], 'column': column}
 
         # Compile rule functions if not already compiled
-        pillar_set = self._compile_pillar_functions(pillar_set)
+        rule_set = self._compile_rule_functions(rule_set)
 
         for round_num in range(1, max_rounds + 1):
             console_fn(f"\n--- Round {round_num}/{max_rounds} ---")
 
             # Backup current rules
-            backup = deepcopy(pillar_set)
+            backup = deepcopy(rule_set)
 
             console_fn("  Resolving conflicts...")
             conflict_resolver = ConflictResolver(memory, factory)
-            pillar_set = conflict_resolver.resolve(df, column, pillar_set, metadata=metadata, round_num=round_num)
+            rule_set = conflict_resolver.resolve(df, column, rule_set, metadata=metadata, round_num=round_num)
 
             console_fn("  Resolving gaps...")
             gap_resolver = GapResolver(memory, factory)
-            pillar_set = gap_resolver.resolve(df, column, pillar_set, metadata=metadata, round_num=round_num)
+            rule_set = gap_resolver.resolve(df, column, rule_set, metadata=metadata, round_num=round_num)
 
             # Recompile functions after refinement
-            pillar_set = self._compile_pillar_functions(pillar_set)
+            rule_set = self._compile_rule_functions(rule_set)
 
             # Check convergence
-            dual_rule = pillar_set.to_dual_rule(agent_factory=factory)
+            dual_rule = rule_set.to_dual_rule(agent_factory=factory)
             conflict_rate = self._count_conflicts(df, column, dual_rule) / len(df)
             grey_rate = self._count_grey_zone(df, column, dual_rule) / len(df)
 
@@ -1390,13 +1390,13 @@ class Judge:
             if round_num > 1 and (conflict_rate > history['rounds'][-2]['conflict_rate'] or
                                   grey_rate > history['rounds'][-2]['grey_rate']):
                 console_fn(f"  ⚠ No improvement (conflict: {conflict_rate:.4f} > {history['rounds'][-2]['conflict_rate']:.4f} or grey: {grey_rate:.4f} > {history['rounds'][-2]['grey_rate']:.4f}), rolling back")
-                pillar_set = backup
+                rule_set = backup
                 break
 
             # Check version limits
             max_version = max(
-                [r.version for r in pillar_set.clean_pillars.values()] +
-                [r.version for r in pillar_set.dirty_agents.values()]
+                [r.version for r in rule_set.clean_rules.values()] +
+                [r.version for r in rule_set.dirty_rules.values()]
             )
             if max_version >= max_rounds:
                 console_fn(f"  ⚠ Max version reached ({max_version}), stopping (conflict={conflict_rate:.4f}, grey={grey_rate:.4f})")
@@ -1415,25 +1415,25 @@ class Judge:
         history['final_memory'] = memory.to_context() if hasattr(memory, 'to_context') else str(memory)
         history['log_file'] = logger.path if hasattr(logger, 'path') else None
 
-        return pillar_set, history
-    
-    def _compile_pillar_functions(self, pillar_set: 'PillarRuleSet') -> 'PillarRuleSet':
+        return rule_set, history
+
+    def _compile_rule_functions(self, rule_set: 'CleanRuleSet') -> 'CleanRuleSet':
         """Compile rule functions from strings."""
-        for rule in pillar_set.clean_pillars.values():
+        for rule in rule_set.clean_rules.values():
             if rule.rule_func is None and rule.rule_str:
                 try:
                     rule.rule_func = eval(rule.rule_str, safe_dict)
                 except Exception as e:
                     print(f"  ⚠ Failed to compile {rule.name}: {e}")
-        
-        for rule in pillar_set.dirty_agents.values():
+
+        for rule in rule_set.dirty_rules.values():
             if rule.rule_func is None and rule.rule_str:
                 try:
                     rule.rule_func = eval(rule.rule_str, safe_dict)
                 except Exception as e:
                     print(f"  ⚠ Failed to compile {rule.name}: {e}")
-        
-        return pillar_set
+
+        return rule_set
     
     def _count_conflicts(self, df: pd.DataFrame, column: str, dual_rule: 'DualRule') -> int:
         """Count conflicts (P_clean=True AND P_dirty=True)."""

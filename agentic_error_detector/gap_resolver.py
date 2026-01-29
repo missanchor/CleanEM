@@ -1,5 +1,5 @@
 """
-Gap Resolver for handling gap zones in pillar-level refinement.
+Gap Resolver for handling gap zones in clean rule-level refinement.
 Extends both clean and dirty rules to cover undefined areas.
 """
 from typing import Dict, List, Any
@@ -7,10 +7,10 @@ from collections import Counter
 import pandas as pd
 import json
 
-from agentic_error_detector.dual_types import (
-    PillarRule, PillarRuleSet, GapRecord
+from dual_types import (
+    CleanRule, CleanRuleSet, GapRecord
 )
-from agentic_error_detector.modification_memory import (
+from modification_memory import (
     ModificationMemory, get_logger
 )
 
@@ -35,7 +35,7 @@ class GapResolver:
         """Get or create a reusable DualAgent instance."""
         if self._dual_agent is None:
             if self.factory:
-                from agentic_error_detector.agent import DualAgent
+                from agent import DualAgent
                 self._dual_agent = DualAgent(
                     base_url=self.factory.base_url,
                     model=self.factory.model
@@ -43,21 +43,21 @@ class GapResolver:
         return self._dual_agent
     
     def resolve(self, df: pd.DataFrame, column: str,
-                pillar_set: PillarRuleSet,
+                rule_set: CleanRuleSet,
                 metadata: Dict[str, Any] = None,
-                round_num: int = 1) -> PillarRuleSet:
+                round_num: int = 1) -> CleanRuleSet:
         """
         Resolve gap zones for a column.
 
         Args:
             df: DataFrame to analyze
             column: Column name
-            pillar_set: Current PillarRuleSet
+            rule_set: Current CleanRuleSet
             metadata: Column metadata (type, sample_values, etc.)
             round_num: Current refinement round number
 
         Returns:
-            Refined PillarRuleSet with extended rules
+            Refined CleanRuleSet with extended rules
         """
         self.current_column = column
         self.round_num = round_num
@@ -66,8 +66,8 @@ class GapResolver:
         self._current_df = df
 
         # Store initial rules for logging
-        clean_rules_before = {k: v.rule_str for k, v in pillar_set.clean_pillars.items()}
-        dirty_rules_before = {k: v.rule_str for k, v in pillar_set.dirty_agents.items()}
+        clean_rules_before = {k: v.rule_str for k, v in rule_set.clean_rules.items()}
+        dirty_rules_before = {k: v.rule_str for k, v in rule_set.dirty_rules.items()}
 
         # Begin column refinement logging
         self.logger.begin_column_refinement(
@@ -79,7 +79,7 @@ class GapResolver:
         )
 
         # Find gap, clean, and dirty samples
-        gap_samples, clean_samples, dirty_samples = self._find_gap_values(df, column, pillar_set)
+        gap_samples, clean_samples, dirty_samples = self._find_gap_values(df, column, rule_set)
 
         if not gap_samples:
             # End logging without modifications
@@ -87,7 +87,7 @@ class GapResolver:
                 clean_rules=clean_rules_before,
                 dirty_rules=dirty_rules_before
             )
-            return pillar_set
+            return rule_set
 
         gap_values = list(set([str(s['value']) for s in gap_samples]))
         clean_values = list(set([str(s['value']) for s in clean_samples[:10]]))
@@ -95,19 +95,19 @@ class GapResolver:
 
         # Analyze gaps and classify them with positive and negative examples
         analysis = self._analyze_gap(
-            df, column, gap_samples, clean_samples, dirty_samples, pillar_set, metadata
+            df, column, gap_samples, clean_samples, dirty_samples, rule_set, metadata
         )
 
         num_modifications = 0
 
         # === Process clean rules: one at a time with immediate validation ===
         extend_clean = analysis.get('extend_clean', {})
-        for pillar_name in list(extend_clean.keys()):
-            extension_info = extend_clean[pillar_name]
-            if extension_info and pillar_name in pillar_set.clean_pillars:
-                old_rule = pillar_set.clean_pillars[pillar_name]
+        for rule_name in list(extend_clean.keys()):
+            extension_info = extend_clean[rule_name]
+            if extension_info and rule_name in rule_set.clean_rules:
+                old_rule = rule_set.clean_rules[rule_name]
                 new_rule = self._extend_rule_single(
-                    pillar_set.clean_pillars[pillar_name],
+                    rule_set.clean_rules[rule_name],
                     extension_info,
                     'clean',
                     gap_values, clean_values, dirty_values
@@ -115,18 +115,18 @@ class GapResolver:
                 if new_rule.rule_str != old_rule.rule_str:
                     num_modifications += 1
                     # Re-evaluate gaps after this extension
-                    gap_samples, _, _ = self._find_gap_values(df, column, pillar_set)
+                    gap_samples, _, _ = self._find_gap_values(df, column, rule_set)
                     gap_values = list(set([str(s['value']) for s in gap_samples]))
-                pillar_set.clean_pillars[pillar_name] = new_rule
+                rule_set.clean_rules[rule_name] = new_rule
 
         # === Process dirty rules: one at a time with immediate validation ===
         extend_dirty = analysis.get('extend_dirty', {})
         for agent_name in list(extend_dirty.keys()):
             extension_info = extend_dirty[agent_name]
-            if extension_info and agent_name in pillar_set.dirty_agents:
-                old_rule = pillar_set.dirty_agents[agent_name]
+            if extension_info and agent_name in rule_set.dirty_rules:
+                old_rule = rule_set.dirty_rules[agent_name]
                 new_rule = self._extend_rule_single(
-                    pillar_set.dirty_agents[agent_name],
+                    rule_set.dirty_rules[agent_name],
                     extension_info,
                     'dirty',
                     gap_values, clean_values, dirty_values
@@ -134,13 +134,13 @@ class GapResolver:
                 if new_rule.rule_str != old_rule.rule_str:
                     num_modifications += 1
                     # Re-evaluate gaps after this extension
-                    gap_samples, _, _ = self._find_gap_values(df, column, pillar_set)
+                    gap_samples, _, _ = self._find_gap_values(df, column, rule_set)
                     gap_values = list(set([str(s['value']) for s in gap_samples]))
-                pillar_set.dirty_agents[agent_name] = new_rule
+                rule_set.dirty_rules[agent_name] = new_rule
 
         # Store final rules for logging
-        clean_rules_after = {k: v.rule_str for k, v in pillar_set.clean_pillars.items()}
-        dirty_rules_after = {k: v.rule_str for k, v in pillar_set.dirty_agents.items()}
+        clean_rules_after = {k: v.rule_str for k, v in rule_set.clean_rules.items()}
+        dirty_rules_after = {k: v.rule_str for k, v in rule_set.dirty_rules.items()}
 
         # End column refinement logging
         self.logger.end_column_refinement(
@@ -158,10 +158,10 @@ class GapResolver:
                 num_modifications=num_modifications
             )
 
-        return pillar_set
-    
+        return rule_set
+
     def _find_gap_values(self, df: pd.DataFrame, column: str,
-                        pillar_set: PillarRuleSet) -> tuple:
+                        rule_set: CleanRuleSet) -> tuple:
         """Find gap, clean, and dirty samples for better LLM context.
 
         Returns:
@@ -169,8 +169,8 @@ class GapResolver:
             Each sample is a dict: {'row_index': int, 'value': Any, 'row_data': Dict}
         """
         # Compose P_clean and P_dirty
-        P_clean = self._compose_and(pillar_set.clean_pillars)
-        P_dirty = self._compose_or(pillar_set.dirty_agents)
+        P_clean = self._compose_and(rule_set.clean_rules)
+        P_dirty = self._compose_or(rule_set.dirty_rules)
 
         gap_samples = []
         clean_samples = []
@@ -216,7 +216,7 @@ class GapResolver:
                     gap_samples: List[Dict],
                     clean_samples: List[Dict],
                     dirty_samples: List[Dict],
-                    pillar_set: PillarRuleSet,
+                    rule_set: CleanRuleSet,
                     metadata: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         Analyze gap values and determine if they should be clean or dirty.
@@ -234,7 +234,7 @@ class GapResolver:
             return {'extend_clean': {}, 'extend_dirty': {}}
 
         prompt = self._build_gap_analysis_prompt(
-            column, gap_values, pillar_set, metadata,
+            column, gap_values, rule_set, metadata,
             top_gaps, clean_samples[:5], dirty_samples[:5]
         )
 
@@ -261,7 +261,7 @@ class GapResolver:
             return {'extend_clean': {}, 'extend_dirty': {}}
     
     def _build_gap_analysis_prompt(self, column: str, values: List[Any],
-                                   pillar_set: PillarRuleSet,
+                                   rule_set: CleanRuleSet,
                                    metadata: Dict[str, Any] = None,
                                    gap_samples: List[Dict] = None,
                                    clean_samples: List[Dict] = None,
@@ -269,12 +269,12 @@ class GapResolver:
         """Build prompt for LLM gap analysis with positive and negative examples."""
         clean_rules_str = "\n".join([
             f"- {name}: {rule.rule_str}"
-            for name, rule in pillar_set.clean_pillars.items()
+            for name, rule in rule_set.clean_rules.items()
         ])
 
         dirty_rules_str = "\n".join([
             f"- {name}: {rule.rule_str}"
-            for name, rule in pillar_set.dirty_agents.items()
+            for name, rule in rule_set.dirty_rules.items()
         ])
 
         # Format metadata for prompt
@@ -368,9 +368,9 @@ Return ONLY a JSON object:
 }}
 """
     
-    def _extend_rule_single(self, rule: PillarRule, extension_info: str,
+    def _extend_rule_single(self, rule: CleanRule, extension_info: str,
                             side: str, gap_values: List[str],
-                            clean_values: List[str], dirty_values: List[str]) -> PillarRule:
+                            clean_values: List[str], dirty_values: List[str]) -> CleanRule:
         """Extend a single rule to cover ONE specific pattern with full context.
 
         This is the 'single combat' approach - generate one rule at a time
@@ -447,7 +447,7 @@ lambda value, row=None: <expression>
             new_rule_str = self._extract_lambda(response)
             if new_rule_str:
                 # Create new rule object (without compiling yet)
-                new_rule = PillarRule(
+                new_rule = CleanRule(
                     name=rule.name,
                     rule_str=new_rule_str,
                     rule_func=None,
@@ -497,7 +497,7 @@ lambda value, row=None: <expression>
                 if hasattr(self.memory, 'add'):
                     self.memory.add(side, rule.name, 'extended_single', extension_info, new_rule_str)
 
-                return PillarRule(
+                return CleanRule(
                     name=rule.name,
                     rule_str=new_rule_str,
                     rule_func=new_rule_func,
@@ -510,8 +510,8 @@ lambda value, row=None: <expression>
 
         return rule
 
-    def _extend_rule(self, rule: PillarRule, extension_info: str,
-                    side: str) -> PillarRule:
+    def _extend_rule(self, rule: CleanRule, extension_info: str,
+                    side: str) -> CleanRule:
         """Extend a rule to cover additional patterns (legacy method for compatibility)."""
         if not self.factory:
             return rule
@@ -553,7 +553,7 @@ lambda value, row=None: <expression>
             new_rule_str = self._extract_lambda(response)
             if new_rule_str:
                 # Create new rule object (without compiling yet)
-                new_rule = PillarRule(
+                new_rule = CleanRule(
                     name=rule.name,
                     rule_str=new_rule_str,
                     rule_func=None,
@@ -603,7 +603,7 @@ lambda value, row=None: <expression>
                 if hasattr(self.memory, 'add'):
                     self.memory.add(side, rule.name, 'extended', extension_info, new_rule_str)
 
-                return PillarRule(
+                return CleanRule(
                     name=rule.name,
                     rule_str=new_rule_str,
                     rule_func=new_rule_func,
@@ -665,10 +665,10 @@ lambda value, row=None: <expression>
             print(f"  ⚠ Failed to compile {side} rule: {e}")
             return None
 
-    def _compose_and(self, pillars: Dict[str, PillarRule]):
-        """Compose AND of all pillar rules."""
+    def _compose_and(self, rules: Dict[str, CleanRule]):
+        """Compose AND of all clean rules."""
         def P_clean(value, row=None):
-            for rule in pillars.values():
+            for rule in rules.values():
                 if rule.rule_func is None:
                     continue
                 try:
@@ -678,11 +678,11 @@ lambda value, row=None: <expression>
                     return False
             return True
         return P_clean
-    
-    def _compose_or(self, agents: Dict[str, PillarRule]):
-        """Compose OR of all agent rules."""
+
+    def _compose_or(self, rules: Dict[str, CleanRule]):
+        """Compose OR of all dirty rules."""
         def P_dirty(value, row=None):
-            for rule in agents.values():
+            for rule in rules.values():
                 if rule.rule_func is None:
                     continue
                 try:
@@ -725,7 +725,7 @@ lambda value, row=None: <expression>
             return False
 
     def _validate_refined_rule(self, df: pd.DataFrame, column: str,
-                               old_rule: 'PillarRule', new_rule: 'PillarRule',
+                               old_rule: 'CleanRule', new_rule: 'CleanRule',
                                side: str) -> tuple:
         """
         Validate a refined rule against the full dataset.
@@ -784,7 +784,7 @@ lambda value, row=None: <expression>
         return True, violation_rate, "accepted"
 
     def _get_original_violation_rate(self, df: pd.DataFrame, column: str,
-                                     rule: 'PillarRule', side: str) -> float:
+                                     rule: 'CleanRule', side: str) -> float:
         """Get the original rule's violation rate for comparison."""
         if rule.rule_func is None:
             return 0.0
