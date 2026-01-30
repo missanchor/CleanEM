@@ -751,9 +751,9 @@ Return ONLY the lambda functions, one per line. Each function accepts a row (dic
 
 
 class CleanCompletenessAgent(BaseAgent):
-    """Agent specialized in Completeness pillar - ensuring values are present and complete."""
+    """Agent specialized in Completeness - ensuring values are present and complete."""
 
-    pillar_name = "completeness"
+    clean_agent_name = "completeness"
 
     def _get_system_prompt(self) -> str:
         """System prompt for completeness validation."""
@@ -788,9 +788,9 @@ Return ONLY the lambda functions, one per line. Each function should return True
 
 
 class CleanAccuracyAgent(BaseAgent):
-    """Agent specialized in Accuracy pillar - ensuring values fall into reasonable ranges."""
+    """Agent specialized in Accuracy - ensuring values fall into reasonable ranges."""
 
-    pillar_name = "accuracy"
+    clean_agent_name = "accuracy"
 
     def _get_system_prompt(self) -> str:
         """System prompt for accuracy validation."""
@@ -810,8 +810,12 @@ Return ONLY the lambda functions, one per line. Each function should return True
         unique_count = metadata.get('unique_count', 0)
         numeric_count = metadata.get('numeric_count', 0)
 
-        # Build top values with frequencies
-        top_with_freq = [(str(k), v) for k, v in list(top_values.items())[:20]] if top_values else []
+        # Build top values with frequencies (as percentages)
+        if top_values:
+            total_count = sum(top_values.values())
+            top_with_freq = [(str(k), f"{v/total_count*100:.3f}%") for k, v in list(top_values.items())[:20]]
+        else:
+            top_with_freq = []
         sample_values = metadata.get('sample_values', [])
 
         prompt = f"""
@@ -820,7 +824,7 @@ For column '{column}', generate up to 5 Python lambda functions to validate data
 Column metadata:
 - Type: {col_type}
 - Unique count: {unique_count}
-- Top categorical values with frequencies: {json.dumps(top_with_freq, ensure_ascii=False)}
+- Top categorical values (with %): {json.dumps(top_with_freq, ensure_ascii=False)}
 - Min: {min_val}, Max: {max_val}, Mean: {mean_val}, Std: {std_val}
 - Numeric count: {numeric_count}
 
@@ -829,7 +833,7 @@ IMPORTANT GUIDELINES:
 2. For numeric: check reasonable value ranges based on statistics with tolerance
 3. For text: check reasonable length and character constraints
 4. NOTE: Top categorical values are **not the only valid values**
-5. Be PERMISSIVE - only reject clearly **inaccurate** values
+5. Be STRINGENT - only accept values that are definitely ACCURATE and follow the expected domain format. Any deviation should be rejected.
 
 Return ONLY lambda functions, one per line. Format:
 lambda value, row=None: <expression>
@@ -877,9 +881,9 @@ lambda value, row=None: <expression>
 
 
 class CleanPatternAgent(BaseAgent):
-    """Agent specialized in Pattern Consistency pillar - ensuring values respect known patterns."""
+    """Agent specialized in Pattern Consistenc - ensuring values respect known patterns."""
 
-    pillar_name = "pattern_consistency"
+    clean_agent_name = "pattern_consistency"
 
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
         """Generate rules to ensure pattern consistency using PatternExplorer."""
@@ -927,7 +931,7 @@ Rules should:
 1. Check expected format
 2. Ensure consistent structure across values
 3. Validate character types for the field type
-4. Be PERMISSIVE - only reject values that clearly break patterns
+4.Be STRINGENT - only accept values that are definitely ACCURATE and follow the expected domain format. Any deviation should be rejected.
 
 Return ONLY lambda functions, one per line. Format:
 lambda value, row=None: <expression>
@@ -998,9 +1002,9 @@ lambda value, row=None: bool(re.match(r'^\\d{10}$', re.sub(r'\\D', '', str(value
 
 
 class CleanRelationshipAgent(BaseAgent):
-    """Agent specialized in Column Relationship pillar - ensuring intra-row column relationship constraints."""
+    """Agent specialized in Column Relationship - ensuring intra-row column relationship constraints."""
 
-    pillar_name = "column_relationship"
+    clean_agent_name = "column_relationship"
 
     def _get_system_prompt(self) -> str:
         """System prompt for column relationship validation."""
@@ -1098,12 +1102,12 @@ class DualAgent(BaseAgent):
 
 Your role is to generate Python lambda functions for P_clean(x) that CONFIRM when a value is definitely CLEAN (correct/proper).
 
-CRITICAL REQUIREMENTS (cover every pillar below):
+CRITICAL REQUIREMENTS (cover every agent below):
 1. Completeness: reject missing/placeholder tokens (None, NaN, empty strings, 'n/a', 'unknown', etc.)
 2. Accuracy: ensure numeric ranges, enumerations, and domain-specific thresholds are respected
 3. Column relationship constraints: when metadata provides relational expectations, enforce them conservatively
 4. Pattern/format consistency: honor regex-like structures, code lengths, and canonical casing
-5. P_clean should remain PERMISSIVE overall—only reject values that clearly break the pillars above
+5. P_clean should remain PERMISSIVE overall—only reject values that clearly break the agent above
 6. Must return boolean values (True/False) and handle edge cases gracefully
 
 Return ONLY the lambda function:
@@ -1198,7 +1202,7 @@ Be PRECISE and CONTRACT-ONLY - minimize creative interpretation to avoid new con
 """
 
     def _combine_clean_base_rules(self, clean_base_rules: List[Tuple[str, str]] = None) -> str:
-        """Combine deterministic clean base rules (per pillar) into a single predicate."""
+        """Combine deterministic clean base rules into a single predicate."""
         if not clean_base_rules:
             return None
 
@@ -1737,14 +1741,14 @@ class AgentFactory:
         log_lines: List[str] = []
         for agent in agents:
             try:
-                pillar_rules = agent.generate_rules(column, col_metadata)
-                for rule in pillar_rules:
-                    column_rules.append((agent.pillar_name, rule))
+                clean_agent_rules = agent.generate_rules(column, col_metadata)
+                for rule in clean_agent_rules:
+                    column_rules.append((agent.clean_agent_name, rule))
                 prompt_info = agent.get_last_prompt_info()
                 if prompt_info['prompt']:
-                    column_prompts[agent.pillar_name] = prompt_info
+                    column_prompts[agent.clean_agent_name] = prompt_info
             except Exception as e:
-                log_lines.append(f"    ✗ Clean agent {agent.pillar_name} error on {column}: {e}")
+                log_lines.append(f"    ✗ Clean agent {agent.clean_agent_name} error on {column}: {e}")
         return column, column_rules, column_prompts, log_lines
 
     def generate_clean_rules_per_column(self, metadata: Dict[str, Any]) -> Tuple[Dict[str, List[Tuple[str, str]]], Dict[str, Dict[str, Dict[str, str]]]]:
@@ -1753,8 +1757,8 @@ class AgentFactory:
 
         Returns:
             Tuple of:
-            - Dict[column_name] = List[(pillar_name, rule_string)]
-            - Dict[column_name] = Dict[pillar_name] = {'prompt': ..., 'response': ...}
+            - Dict[column_name] = List[(clean_agent_name, rule_string)]
+            - Dict[column_name] = Dict[clean_agent_name] = {'prompt': ..., 'response': ...}
         """
         clean_rules: Dict[str, List[Tuple[str, str]]] = {}
         clean_prompts: Dict[str, Dict[str, Dict[str, str]]] = {}

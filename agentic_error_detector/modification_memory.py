@@ -10,13 +10,14 @@ from typing import List, Dict, Optional, TextIO, Tuple, Any
 
 @dataclass
 class ModificationMemory:
-    entries: List[Dict[str, str]] = field(default_factory=list)
+    entries: List[Dict[str, Any]] = field(default_factory=list)
     max_entries: int = 20
 
-    def add(self, rule_type: str, rule_name: str, action: str, reason: str, new_rule_str: Optional[str] = None) -> None:
+    def add(self, rule_type: str, rule_name: str, action: str, reason: str, new_rule_str: Optional[str] = None,
+            metrics: Optional[Dict[str, float]] = None, round_num: Optional[int] = None) -> None:
         if len(self.entries) >= self.max_entries:
             self.entries = self._summarize_oldest(5) + self.entries[5:]
-        entry: Dict[str, str] = {
+        entry: Dict[str, Any] = {
             "type": rule_type,
             "name": rule_name,
             "action": action,
@@ -24,6 +25,10 @@ class ModificationMemory:
         }
         if new_rule_str is not None:
             entry["new_rule"] = new_rule_str
+        if metrics:
+            entry["metrics"] = metrics
+        if round_num is not None:
+            entry["round"] = round_num
         self.entries.append(entry)
 
     def _summarize_oldest(self, n: int) -> List[Dict[str, str]]:
@@ -32,6 +37,21 @@ class ModificationMemory:
         summary = f"[{n} prior modifications: {', '.join(names)}]"
         return [{"type": "summary", "name": "", "action": "", "reason": summary}]
 
+    def add_round_summary(self, round_num: int, conflict_rate: float, gap_rate: float) -> None:
+        if len(self.entries) >= self.max_entries:
+            self.entries = self._summarize_oldest(5) + self.entries[5:]
+        self.entries.append({
+            "type": "round_summary",
+            "name": "",
+            "action": "summary",
+            "reason": "",
+            "round": round_num,
+            "metrics": {
+                "conflict_rate": conflict_rate,
+                "gap_rate": gap_rate
+            }
+        })
+
     def to_context(self) -> str:
         if not self.entries:
             return "# Modification History\nNo modifications yet."
@@ -39,8 +59,35 @@ class ModificationMemory:
         for e in self.entries[-10:]:
             if e.get("type") == "summary":
                 lines.append(f"- {e.get('reason', '')}")
+            elif e.get("type") == "round_summary":
+                metrics = e.get("metrics", {})
+                conflict_rate = metrics.get("conflict_rate")
+                gap_rate = metrics.get("gap_rate")
+                round_num = e.get("round")
+                parts = []
+                if conflict_rate is not None:
+                    parts.append(f"conflict_rate={conflict_rate:.4f}")
+                if gap_rate is not None:
+                    parts.append(f"gap_rate={gap_rate:.4f}")
+                metrics_str = ", ".join(parts)
+                if round_num is not None:
+                    if metrics_str:
+                        lines.append(f"- [round {round_num}] summary: {metrics_str}")
+                    else:
+                        lines.append(f"- [round {round_num}] summary")
+                else:
+                    lines.append(f"- summary: {metrics_str}")
             else:
-                lines.append(f"- [{e.get('type','')}/{e.get('name','')}] {e.get('action','')}: {e.get('reason','')}")
+                metrics = e.get("metrics", {})
+                metrics_parts = []
+                for key, value in metrics.items():
+                    if isinstance(value, float):
+                        metrics_parts.append(f"{key}={value:.4f}")
+                    else:
+                        metrics_parts.append(f"{key}={value}")
+                metrics_str = f" ({', '.join(metrics_parts)})" if metrics_parts else ""
+                round_str = f" [round {e.get('round')}]" if e.get("round") is not None else ""
+                lines.append(f"- [{e.get('type','')}/{e.get('name','')}] {e.get('action','')}: {e.get('reason','')}{metrics_str}{round_str}")
         return "\n".join(lines)
 
     def clear(self) -> None:
@@ -162,7 +209,7 @@ class RefinementLogger:
     ) -> None:
         self._log("  [REJECTED] Rule rejected for excessive violations")
         self._log(f"    Type: {rule_type}, Name: {rule_name}")
-        self._log(f"    Violation rate: {violation_rate * 100:.1f}% (>50% threshold)")
+        self._log(f"    Violation rate: {violation_rate * 100:.1f}% (over violation threshold)")
         self._log(f"    Old: {old_rule}")
         self._log(f"    Proposed new: {new_rule}")
         self._log(f"    Reason: {reason}")

@@ -22,16 +22,19 @@ class ConflictResolver:
     """
 
     def __init__(self, memory: ModificationMemory, agent_factory=None,
-                 max_pairwise_conflicts: int = 5):
+                 max_pairwise_conflicts: int = 5,
+                 violation_threshold: float = 0.5):
         """
         Args:
             memory: ModificationMemory for tracking changes
             agent_factory: AgentFactory for LLM calls
-            max_pairwise_conflicts: Maximum number of conflict pairs to process per pillar
+            max_pairwise_conflicts: Maximum number of conflict pairs to process per clean agent
+            violation_threshold: Threshold for rejecting rules that would flag too many violations (default 0.5)
         """
         self.memory = memory
         self.factory = agent_factory
         self.max_pairwise_conflicts = max_pairwise_conflicts
+        self.violation_threshold = violation_threshold
         self.logger = get_logger()
 
     def resolve(self, df: pd.DataFrame, column: str,
@@ -146,8 +149,14 @@ class ConflictResolver:
                     num_modifications += 1
                     # Record pairwise modification
                     if hasattr(self.memory, 'add'):
-                        self.memory.add('clean', rule_name, 'pairwise_refined',
-                                      synthesis_reason, new_clean_rule.rule_str)
+                        self.memory.add(
+                            'clean',
+                            rule_name,
+                            'pairwise_refined',
+                            synthesis_reason,
+                            new_clean_rule.rule_str,
+                            round_num=getattr(self, 'round_num', None)
+                        )
                 rule_set.clean_rules[rule_name] = new_clean_rule
             else:
                 # Modify dirty rules (only those suggested by synthesis)
@@ -187,8 +196,14 @@ class ConflictResolver:
                         num_modifications += 1
                         # Record pairwise modification
                         if hasattr(self.memory, 'add'):
-                            self.memory.add('dirty', agent_name, 'pairwise_refined',
-                                          reason, new_dirty_rule.rule_str)
+                            self.memory.add(
+                                'dirty',
+                                agent_name,
+                                'pairwise_refined',
+                                reason,
+                                new_dirty_rule.rule_str,
+                                round_num=getattr(self, 'round_num', None)
+                            )
 
                     rule_set.dirty_rules[agent_name] = new_dirty_rule
 
@@ -210,7 +225,10 @@ class ConflictResolver:
                 conflicts, _, _ = self._find_conflicts(
                     df, column, clean_rule_item, rule_set.dirty_rules
                 )
-                all_conflict_indices.update(c['row_index'] for c in conflicts)
+                all_conflict_indices.update(
+                    int(c.row_index) if hasattr(c, "row_index") else int(c.get("row_index"))
+                    for c in conflicts
+                )
             conflict_rate = len(all_conflict_indices) / len(df) if len(df) > 0 else 0
 
             self.logger.log_round_summary(
@@ -881,8 +899,15 @@ lambda value, row=None: <expression>
                         )
 
                         if hasattr(self.memory, 'add'):
-                            self.memory.add('clean', rule_name, 'rejected',
-                                          reject_reason, new_rule_str)
+                            self.memory.add(
+                                'clean',
+                                rule_name,
+                                'rejected',
+                                reject_reason,
+                                new_rule_str,
+                                metrics={"violation_rate": violation_rate},
+                                round_num=getattr(self, 'round_num', None)
+                            )
 
                         print(f"  ⚠ Clean rule '{rule_name}' rejected: violation rate {violation_rate*100:.1f}%")
                         return rule  # Return original rule
@@ -898,8 +923,14 @@ lambda value, row=None: <expression>
                 )
 
                 if hasattr(self.memory, 'add'):
-                    self.memory.add('clean', rule_name, 'tightened',
-                                  analysis.get('reason', ''), new_rule_str)
+                    self.memory.add(
+                        'clean',
+                        rule_name,
+                        'tightened',
+                        analysis.get('reason', ''),
+                        new_rule_str,
+                        round_num=getattr(self, 'round_num', None)
+                    )
 
                 return new_rule
         except Exception as e:
@@ -1021,8 +1052,15 @@ lambda value, row=None: <expression>
                         )
 
                         if hasattr(self.memory, 'add'):
-                            self.memory.add('dirty', agent_name, 'rejected',
-                                          reject_reason, new_rule_str)
+                            self.memory.add(
+                                'dirty',
+                                agent_name,
+                                'rejected',
+                                reject_reason,
+                                new_rule_str,
+                                metrics={"violation_rate": violation_rate},
+                                round_num=getattr(self, 'round_num', None)
+                            )
 
                         print(f"  ⚠ Dirty rule '{agent_name}' rejected: violation rate {violation_rate*100:.1f}%")
                         return rule  # Return original rule
@@ -1038,7 +1076,14 @@ lambda value, row=None: <expression>
                 )
 
                 if hasattr(self.memory, 'add'):
-                    self.memory.add('dirty', agent_name, 'relaxed', combined_reason, new_rule_str)
+                    self.memory.add(
+                        'dirty',
+                        agent_name,
+                        'relaxed',
+                        combined_reason,
+                        new_rule_str,
+                        round_num=getattr(self, 'round_num', None)
+                    )
 
                 return new_rule
         except Exception as e:
@@ -1069,7 +1114,7 @@ lambda value, row=None: <expression>
 
     def _validate_refined_rule(self, df: pd.DataFrame, column: str,
                                old_rule: 'CleanRule', new_rule: 'CleanRule',
-                               side: str) -> tuple:
+                               side: str, violation_threshold: float = None) -> tuple:
         """
         Validate a refined rule against the full dataset.
 
@@ -1116,10 +1161,11 @@ lambda value, row=None: <expression>
                 violation_count += 1
 
         violation_rate = violation_count / total_count if total_count > 0 else 0
+        threshold = violation_threshold if violation_threshold is not None else self.violation_threshold
 
-        # Threshold check: > 50% is too strict
-        if violation_rate > 0.5:
-            reason = f"Would flag {violation_rate*100:.1f}% as violation (>50% threshold). Original rule flagged {self._get_original_violation_rate(df, column, old_rule, side)*100:.1f}%"
+        # Threshold check: > threshold is too strict
+        if violation_rate > threshold:
+            reason = f"Would flag {violation_rate*100:.1f}% as violation (>{threshold*100:.0f}% threshold). Original rule flagged {self._get_original_violation_rate(df, column, old_rule, side)*100:.1f}%"
             return False, violation_rate, reason
 
         return True, violation_rate, "accepted"

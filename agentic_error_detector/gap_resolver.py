@@ -20,14 +20,17 @@ class GapResolver:
     Resolve gap zones where both P_clean=False and P_dirty=False.
     """
 
-    def __init__(self, memory: ModificationMemory, agent_factory=None):
+    def __init__(self, memory: ModificationMemory, agent_factory=None,
+                 violation_threshold: float = 0.5):
         """
         Args:
             memory: ModificationMemory for tracking changes
             agent_factory: AgentFactory for LLM calls
+            violation_threshold: Threshold for rejecting rules that would flag too many violations (default 0.5)
         """
         self.memory = memory
         self.factory = agent_factory
+        self.violation_threshold = violation_threshold
         self.logger = get_logger()
         self._dual_agent = None  # Lazy initialization for reuse
 
@@ -123,7 +126,15 @@ class GapResolver:
         extend_dirty = analysis.get('extend_dirty', {})
         for agent_name in list(extend_dirty.keys()):
             extension_info = extend_dirty[agent_name]
-            if extension_info and agent_name in rule_set.dirty_rules:
+            if extension_info:
+                if agent_name not in rule_set.dirty_rules:
+                    rule_set.dirty_rules[agent_name] = CleanRule(
+                        name=agent_name,
+                        rule_str="lambda value, row=None: False",
+                        rule_func=lambda value, row=None: False,
+                        version=0,
+                        modification_log=[]
+                    )
                 old_rule = rule_set.dirty_rules[agent_name]
                 new_rule = self._extend_rule_single(
                     rule_set.dirty_rules[agent_name],
@@ -233,9 +244,14 @@ class GapResolver:
         if not self.factory:
             return {'extend_clean': {}, 'extend_dirty': {}}
 
+        # Compute per-rule statistics on GAP samples (clean rules only)
+        gap_rule_stats = self._compute_rule_statistics(top_gaps, rule_set.clean_rules)
+        gap_stats_str = self._format_statistics_for_prompt(gap_rule_stats)
+
         prompt = self._build_gap_analysis_prompt(
             column, gap_values, rule_set, metadata,
-            top_gaps, clean_samples[:5], dirty_samples[:5]
+            top_gaps, clean_samples[:5], dirty_samples[:5],
+            gap_stats_str
         )
 
         # Set prompt for logging
@@ -253,19 +269,45 @@ class GapResolver:
             # Parse JSON response
             classification = json.loads(response)
             return {
+                'culprit_rule': classification.get('culprit_rule', ''),
+                'culprit_analysis': classification.get('culprit_analysis', ''),
                 'extend_clean': classification.get('extend_clean', {}),
                 'extend_dirty': classification.get('extend_dirty', {})
             }
         except Exception as e:
             print(f"  ⚠ Gap analysis failed: {e}")
             return {'extend_clean': {}, 'extend_dirty': {}}
-    
+
+    def _compute_rule_statistics(self, samples: List[Dict[str, Any]],
+                                  rules: Dict[str, CleanRule]) -> Dict[str, Dict]:
+        """Compute false counts for each rule on the sample set."""
+        stats = {}
+        for rule_name, rule in rules.items():
+            if rule.rule_func is None:
+                continue
+            false_count = sum(1 for s in samples if not self._invoke_rule(rule.rule_func, s['value'], s.get('row_data', {})))
+            stats[rule_name] = {
+                'false_count': false_count,
+                'total_samples': len(samples)
+            }
+        return stats
+
+    def _format_statistics_for_prompt(self, stats: Dict[str, Dict]) -> str:
+        """Format false counts for each rule for prompt display."""
+        if not stats:
+            return ""
+        lines = []
+        for rule_name, stat in sorted(stats.items(), key=lambda x: x[1]['false_count'], reverse=True):
+            lines.append(f"- {rule_name}: {stat['false_count']}/{stat['total_samples']} false")
+        return "\n".join(lines)
+
     def _build_gap_analysis_prompt(self, column: str, values: List[Any],
                                    rule_set: CleanRuleSet,
                                    metadata: Dict[str, Any] = None,
                                    gap_samples: List[Dict] = None,
                                    clean_samples: List[Dict] = None,
-                                   dirty_samples: List[Dict] = None) -> str:
+                                   dirty_samples: List[Dict] = None,
+                                   gap_rule_stats: str = "") -> str:
         """Build prompt for LLM gap analysis with positive and negative examples."""
         clean_rules_str = "\n".join([
             f"- {name}: {rule.rule_str}"
@@ -336,11 +378,22 @@ These values failed all clean rules and all dirty rules. Classify them based on 
 {gap_examples}
 """
 
+        # Format statistics section
+        stats_section = ""
+        if gap_rule_stats:
+            stats_section = f"""
+**Per-rule False Counts on GAP Values:**
+{gap_rule_stats}
+
+(A rule with HIGH false count indicates it may be too strict or missing valid patterns)
+"""
+
         return f"""Analyze these gap values for column '{column}':
 {meta_str}
 {clean_section}
 {dirty_section}
 {gap_section}
+{stats_section}
 **Current Clean Rules:**
 {clean_rules_str}
 
@@ -351,27 +404,35 @@ These values failed all clean rules and all dirty rules. Classify them based on 
 {self.memory.to_context()}
 
 **Task:**
-1. Compare gap values with known clean and dirty values.
-2. Determine if gap values should be classified as clean or dirty.
-3. Explain which rules need extension to cover the gap values.
+1. **Identify the Culprit Rule (REQUIRED):** First, explicitly identify which SINGLE clean rule is the most likely cause of the gap zone using the per-rule false counts above.
+   - Look for clean rules with HIGH false count (rule is too strict)
+
+2. Provide clean rule modification suggestions referencing the culprit rule.
+
+3. **Assume GAP values are erroneous by default.** Propose exactly ONE dirty rule extension that will detect the gap values.
+   - If existing dirty rules are insufficient, create a NEW dirty rule and let the LLM name it consistently (global naming strategy).
+   - Do NOT split gap values into subsets; use one rule that broadly covers the gap values.
 
 **Important Guidelines for Rule Analysis:**
 - A Dirty Rule's purpose is to catch ERRORS.
 - A Clean Rule's purpose is to match VALID data.
+- **Recall Priority**: If a gap value is ambiguous or differs significantly from the majority of clean patterns, prefer classifying it as **dirty**. It is better to flag a suspicious value for review than to let a potential error slip through.
 
 Return ONLY a JSON object:
 {{
+  "culprit_rule": "rule_name",
+  "culprit_analysis": "explanation of why this rule is the culprit based on false counts",
   "classification": "clean" or "dirty" or "mixed",
-  "reasoning": "brief explanation based on pattern comparison, explicitly mentioning separator precision if applicable",
-  "extend_clean": {{"pillar_name": "description of pattern to include"}},
-  "extend_dirty": {{"agent_name": "description of pattern to include"}}
+  "reasoning": "brief explanation based on comparison",
+  "extend_clean": {{"clean_rule_name": "description of pattern to include"}},
+  "extend_dirty": {{"dirty_rule_name": "description of pattern to include"}}
 }}
 """
     
     def _extend_rule_single(self, rule: CleanRule, extension_info: str,
                             side: str, gap_values: List[str],
                             clean_values: List[str], dirty_values: List[str]) -> CleanRule:
-        """Extend a single rule to cover ONE specific pattern with full context.
+        """Extend a single rule to cover with full context.
 
         This is the 'single combat' approach - generate one rule at a time
         with full context of all sample values.
@@ -407,7 +468,7 @@ Return ONLY a JSON object:
 {dirty_examples}
 """
 
-        prompt = f"""Extend this {side} rule to cover ONE specific pattern with full context:
+        prompt = f"""Extend this {side} rule to cover with full context:
 
 **Current Rule ({rule.name}):**
 {rule.rule_str}
@@ -423,7 +484,7 @@ Return ONLY a JSON object:
 **Task:**
 Generate a refined lambda function that:
 1. STILL covers all existing clean/dirty values
-2. ALSO covers the new gap pattern
+2. ALSO covers the new gap
 
 Return ONLY the lambda function, no explanation.
 
@@ -475,8 +536,15 @@ lambda value, row=None: <expression>
                         )
 
                         if hasattr(self.memory, 'add'):
-                            self.memory.add(side, rule.name, 'rejected',
-                                          reject_reason, new_rule_str)
+                            self.memory.add(
+                                side,
+                                rule.name,
+                                'rejected',
+                                reject_reason,
+                                new_rule_str,
+                                metrics={"violation_rate": violation_rate},
+                                round_num=getattr(self, 'round_num', None)
+                            )
 
                         print(f"  ⚠ {side} rule '{rule.name}' rejected: violation rate {violation_rate*100:.1f}%")
                         return rule  # Return original rule
@@ -495,7 +563,18 @@ lambda value, row=None: <expression>
                 )
 
                 if hasattr(self.memory, 'add'):
-                    self.memory.add(side, rule.name, 'extended_single', extension_info, new_rule_str)
+                    df = getattr(self, '_current_df', None)
+                    gap_rate = len(gap_values) / len(df) if df is not None and len(df) > 0 else None
+                    metrics = {"gap_rate": gap_rate} if gap_rate is not None else None
+                    self.memory.add(
+                        side,
+                        rule.name,
+                        'extended_single',
+                        extension_info,
+                        new_rule_str,
+                        metrics=metrics,
+                        round_num=getattr(self, 'round_num', None)
+                    )
 
                 return CleanRule(
                     name=rule.name,
@@ -530,7 +609,7 @@ lambda value, row=None: <expression>
 **Modification History:**
 {self.memory.to_context() if hasattr(self.memory, 'to_context') else 'N/A'}
 
-Generate a refined lambda function that ALSO covers the new pattern.
+Generate a refined lambda function that ALSO covers the new values.
 Return ONLY the lambda function, no explanation.
 
 Example format:
@@ -581,8 +660,15 @@ lambda value, row=None: <expression>
                         )
 
                         if hasattr(self.memory, 'add'):
-                            self.memory.add(side, rule.name, 'rejected',
-                                          reject_reason, new_rule_str)
+                            self.memory.add(
+                                side,
+                                rule.name,
+                                'rejected',
+                                reject_reason,
+                                new_rule_str,
+                                metrics={"violation_rate": violation_rate},
+                                round_num=getattr(self, 'round_num', None)
+                            )
 
                         print(f"  ⚠ {side} rule '{rule.name}' rejected: violation rate {violation_rate*100:.1f}%")
                         return rule  # Return original rule
@@ -601,7 +687,14 @@ lambda value, row=None: <expression>
                 )
 
                 if hasattr(self.memory, 'add'):
-                    self.memory.add(side, rule.name, 'extended', extension_info, new_rule_str)
+                    self.memory.add(
+                        side,
+                        rule.name,
+                        'extended',
+                        extension_info,
+                        new_rule_str,
+                        round_num=getattr(self, 'round_num', None)
+                    )
 
                 return CleanRule(
                     name=rule.name,
@@ -726,7 +819,7 @@ lambda value, row=None: <expression>
 
     def _validate_refined_rule(self, df: pd.DataFrame, column: str,
                                old_rule: 'CleanRule', new_rule: 'CleanRule',
-                               side: str) -> tuple:
+                               side: str, violation_threshold: float = None) -> tuple:
         """
         Validate a refined rule against the full dataset.
 
@@ -775,10 +868,11 @@ lambda value, row=None: <expression>
                 violation_count += 1
 
         violation_rate = violation_count / total_count if total_count > 0 else 0
+        threshold = violation_threshold if violation_threshold is not None else self.violation_threshold
 
-        # Threshold check: > 50% is too strict
-        if violation_rate > 0.5:
-            reason = f"Would flag {violation_rate*100:.1f}% as violation (>50% threshold). Original rule flagged {self._get_original_violation_rate(df, column, old_rule, side)*100:.1f}%"
+        # Threshold check: > threshold is too strict
+        if violation_rate > threshold:
+            reason = f"Would flag {violation_rate*100:.1f}% as violation (>{threshold*100:.0f}% threshold). Original rule flagged {self._get_original_violation_rate(df, column, old_rule, side)*100:.1f}%"
             return False, violation_rate, reason
 
         return True, violation_rate, "accepted"

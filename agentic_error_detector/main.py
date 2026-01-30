@@ -25,12 +25,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dirty_csv",
-        default="data/flights_error-01.csv",
+        default="data/hospital_error-01.csv",
         help="Path to the dirty/error-prone CSV that needs inspection."
     )
     parser.add_argument(
         "--clean_csv",
-        default="data/flights_clean.csv",
+        default="data/hospital_clean.csv",
         help="Optional clean CSV for evaluation against ground truth."
     )
     parser.add_argument(
@@ -47,13 +47,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--grey_tolerance",
         type=float,
-        default=0.1,
+        default=0.01,
         help="Allowed grey-zone rate when evaluating dual rules."
     )
     parser.add_argument(
         "--vr_threshold",
         type=float,
-        default=0.5,
+        default=0.6,
         help="Violation-rate threshold for legacy VR mode."
     )
     parser.add_argument(
@@ -305,7 +305,7 @@ def run_dual_mode(args: argparse.Namespace) -> None:
         print("[3/7] Generating clean rules (Completeness/Accuracy/Pattern/Relationship)")
         clean_rules, clean_prompts = factory.generate_clean_rules_per_column(metadata)
 
-        judge = Judge(threshold=args.vr_threshold)
+        judge = Judge(threshold=args.vr_threshold, violation_threshold=args.vr_threshold)
 
         print("[6.5/7] Evaluating base rules independently (standalone rule-based detection)")
         print("="*80)

@@ -27,9 +27,15 @@ class Judge:
     - Small Non-Zero VR: Indicates Anomalies (Errors)
     """
 
-    def __init__(self, threshold: float = 0.05):
-        """Initialize Judge with VR threshold."""
+    def __init__(self, threshold: float = 0.1, violation_threshold: float = 0.5):
+        """Initialize Judge with VR threshold.
+
+        Args:
+            threshold: VR threshold for rule evaluation
+            violation_threshold: Threshold for rejecting rules that would flag too many violations in refinement
+        """
         self.threshold = threshold
+        self.violation_threshold = violation_threshold
         self.evaluation_results = {}
 
     def evaluate_rules(self, df: pd.DataFrame, rules: Dict[str, list],
@@ -234,7 +240,7 @@ class Judge:
             if not dirty_results and not clean_results:
                 continue
 
-            # Build clean_mask: True if value satisfies ALL clean pillars (AND)
+            # Build clean_mask: True if value satisfies ALL clean rules (AND)
             # A value is clean only if ALL clean rules return True for it
             # We need to check each value against all clean rules
             # clean_mask[row_idx] = all(clean_rule_i(row_idx) == True for i in all clean rules)
@@ -799,58 +805,6 @@ class Judge:
 
         return max(results, key=lambda r: (score(r), r.dirty_rate))
 
-    def select_best_dual_rules(self, evaluation_results: Dict[str, List[DualEvaluationResult]]) -> Dict[str, DualRule]:
-        """
-        Select the best dual rule for each column based on constraints and dirty rate.
-
-        Strategy:
-        1. Filter rules that meet hard constraints
-        2. Among valid rules, select one with minimum dirty_rate
-        3. If dirty_rate == 0, accept (allows all-clean columns)
-        4. If no valid rules, return None for that column
-        """
-        print("\n" + "="*80)
-        print("SELECTING BEST DUAL RULES")
-        print("="*80)
-
-        best_rules = {}
-
-        for column, results in evaluation_results.items():
-            print(f"\n{column}:")
-
-            # Filter acceptable rules
-            acceptable = [r for r in results if r.status in ['accept', 'accept_all_clean']]
-
-            if not acceptable:
-                print(f"  ✗ No acceptable rules found")
-                # Show why each was rejected
-                for r in results:
-                    print(f"    - {r.status}: {r.violation_message}")
-                continue
-
-            # Sort by dirty_rate (ascending - prefer fewer dirty values)
-            acceptable.sort(key=lambda x: x.dirty_rate)
-
-            best_result = acceptable[0]
-
-            # Reject if dirty_rate > 0.5 (likely inverted logic or wrong rule type)
-            if best_result.dirty_rate > 0.5:
-                print(f"  ✗ Rejected: dirty_rate {best_result.dirty_rate:.4f} > 0.5")
-                print(f"    Rule likely has inverted logic or wrong type assumption")
-                print(f"    P_clean: {best_result.rule.clean_rule_str[:80]}...")
-                continue
-
-            best_rules[column] = best_result.rule
-
-            print(f"  ✓ Selected rule:")
-            print(f"    Agent: {best_result.rule.agent_name}")
-            print(f"    Dirty Rate: {best_result.dirty_rate:.4f}")
-            print(f"    Clean Rate: {best_result.clean_rate:.4f}")
-            print(f"    Grey Rate: {best_result.grey_rate:.4f}")
-            print(f"    Conflict Rate: {best_result.conflict_rate:.4f}")
-
-        return best_rules
-
     def _generate_repair_candidates(self, column: str, clean_rule_str: str, dirty_rule_str: str,
                                    conflict_samples: List[Dict[str, Any]],
                                    gap_samples: List[Dict[str, Any]],
@@ -962,6 +916,157 @@ class Judge:
         # Among valid, prefer lowest dirty_rate
         best_id = min(valid.keys(), key=lambda cid: valid[cid].dirty_rate)
         return best_id
+
+    def _analyze_conflict_topology(self, df: pd.DataFrame, column: str,
+                                   clean_func, dirty_func) -> Dict[str, Any]:
+        from core.deducer import analyze_conflict_topology
+        import numpy as np
+
+        clean_mask = []
+        dirty_mask = []
+        for _, row in df.iterrows():
+            value = row[column]
+            try:
+                clean_mask.append(bool(self._invoke_predicate(clean_func, value, row)))
+                dirty_mask.append(bool(self._invoke_predicate(dirty_func, value, row)))
+            except Exception:
+                clean_mask.append(False)
+                dirty_mask.append(False)
+
+        topology = analyze_conflict_topology(
+            df,
+            column,
+            np.array(clean_mask),
+            np.array(dirty_mask)
+        )
+
+        return {
+            'column': topology.column,
+            'conflict_type': topology.conflict_type.value,
+            'clean_set_size': topology.clean_set_size,
+            'dirty_set_size': topology.dirty_set_size,
+            'intersection_size': topology.intersection_size,
+            'union_size': topology.union_size,
+            'iou': topology.iou,
+            'clean_in_intersection_ratio': topology.clean_in_intersection_ratio,
+            'dirty_in_intersection_ratio': topology.dirty_in_intersection_ratio,
+            'intersection_samples': topology.intersection_samples,
+            'clean_only_samples': topology.clean_only_samples,
+            'dirty_only_samples': topology.dirty_only_samples,
+            'total_rows': topology.total_rows
+        }
+
+    def _generate_refinement_task(self, df: pd.DataFrame, column: str,
+                                  evaluation_result: DualEvaluationResult,
+                                  metadata: Dict[str, Any]) -> Dict[str, Any]:
+        from core.deducer import analyze_conflict_topology, generate_refinement_task
+        import numpy as np
+
+        clean_rule_str = evaluation_result.rule.clean_rule_str
+        dirty_rule_str = evaluation_result.rule.dirty_rule_str
+
+        clean_func = evaluation_result.rule.clean_rule_func
+        dirty_func = evaluation_result.rule.dirty_rule_func
+        if clean_func is None:
+            clean_func = eval(clean_rule_str, safe_dict)
+        if dirty_func is None:
+            dirty_func = eval(dirty_rule_str, safe_dict)
+
+        clean_mask = []
+        dirty_mask = []
+        for _, row in df.iterrows():
+            value = row[column]
+            try:
+                clean_mask.append(bool(self._invoke_predicate(clean_func, value, row)))
+                dirty_mask.append(bool(self._invoke_predicate(dirty_func, value, row)))
+            except Exception:
+                clean_mask.append(False)
+                dirty_mask.append(False)
+
+        topology = analyze_conflict_topology(
+            df,
+            column,
+            np.array(clean_mask),
+            np.array(dirty_mask)
+        )
+        task = generate_refinement_task(
+            topology,
+            clean_rule_str,
+            dirty_rule_str,
+            metadata
+        )
+
+        return {
+            'column': task.column,
+            'conflict_type': task.conflict_type.value,
+            'current_clean_rule': task.current_clean_rule,
+            'current_dirty_rule': task.current_dirty_rule,
+            'conflict_samples': evaluation_result.conflict_samples,
+            'grey_samples': evaluation_result.grey_samples,
+            'strategy': task.strategy,
+            'metadata': task.metadata
+        }
+
+    def refine_dual_rules(self, df: pd.DataFrame, metadata: Dict[str, Any],
+                          initial_rules: Dict[str, List[Tuple[str, str, str]]],
+                          max_rounds: int = 3, grey_tolerance: float = 0.0,
+                          factory=None) -> Tuple[Dict[str, DualRule], Dict[str, List[Dict[str, Any]]]]:
+        current_rules = dict(initial_rules)
+        refinement_history: Dict[str, List[Dict[str, Any]]] = {column: [] for column in current_rules}
+        best_rules: Dict[str, DualRule] = {}
+
+        for round_num in range(1, max_rounds + 1):
+            evaluation_results = self.evaluate_dual_rules(
+                df,
+                current_rules,
+                grey_tolerance=grey_tolerance
+            )
+
+            for column, results in evaluation_results.items():
+                if not results:
+                    continue
+                result = results[0]
+                best_rules[column] = result.rule
+                refinement_history[column].append({
+                    'round': round_num,
+                    'status': result.status,
+                    'conflict_rate': result.conflict_rate,
+                    'grey_rate': result.grey_rate,
+                    'dirty_rate': result.dirty_rate
+                })
+
+            if not factory:
+                break
+
+            next_rules: Dict[str, List[Tuple[str, str, str]]] = {}
+            for column, results in evaluation_results.items():
+                if not results:
+                    continue
+                result = results[0]
+                if result.conflict_rate == 0 and result.grey_rate <= grey_tolerance:
+                    next_rules[column] = [
+                        (result.rule.agent_name, result.rule.clean_rule_str, result.rule.dirty_rule_str)
+                    ]
+                    continue
+
+                task = self._generate_refinement_task(df, column, result, metadata.get(column, {}))
+                updated = self._execute_refinement_with_fallback(
+                    df,
+                    column,
+                    task,
+                    factory,
+                    max_attempts=2
+                )
+                if updated:
+                    next_rules[column] = [(result.rule.agent_name, updated[0], updated[1])]
+                else:
+                    next_rules[column] = [
+                        (result.rule.agent_name, result.rule.clean_rule_str, result.rule.dirty_rule_str)
+                    ]
+
+            current_rules = next_rules
+
+        return best_rules, refinement_history
 
     def get_detected_dirty_values(self, best_rules: Dict[str, DualRule], df: pd.DataFrame) -> List[Dict[str, Any]]:
         """
@@ -1217,12 +1322,25 @@ class Judge:
 
         current_clean = task['current_clean_rule']
         current_dirty = task['current_dirty_rule']
-        strategy = task['strategy']
+        strategy = task.get('strategy')
+        if not strategy:
+            conflict_type = task.get('conflict_type')
+            if hasattr(conflict_type, "value"):
+                conflict_type = conflict_type.value
+            if conflict_type == 'SUBSET':
+                strategy = 'clean'
+            elif conflict_type == 'SUPERSET':
+                strategy = 'dirty'
+            elif conflict_type == 'INTERSECT':
+                strategy = 'both'
+            else:
+                strategy = 'fallback'
 
         for attempt in range(1, max_attempts + 1):
             print(f"    Attempt {attempt}/{max_attempts} (strategy: {strategy})")
 
             try:
+                updated_rule = False
                 # Generate refined rule based on strategy
                 if strategy == 'clean' or (attempt == 1 and strategy in ['both', 'fallback']):
                     new_clean = factory.generate_p_clean_predicates_per_column(
@@ -1237,6 +1355,7 @@ class Judge:
                     )
                     if column in new_clean and new_clean[column]:
                         current_clean = new_clean[column]
+                        updated_rule = True
                         print(f"      Generated new P_clean rule")
                     else:
                         print(f"      Failed to generate P_clean rule")
@@ -1254,6 +1373,7 @@ class Judge:
                     )
                     if column in new_dirty and new_dirty[column]:
                         current_dirty = new_dirty[column]
+                        updated_rule = True
                         print(f"      Generated new P_dirty rule")
                     else:
                         print(f"      Failed to generate P_dirty rule")
@@ -1267,7 +1387,9 @@ class Judge:
 
                 if validation['is_disjoint']:
                     print(f"      ✓ Disjointness validation passed!")
-                    return (current_clean, current_dirty)
+                    if updated_rule or attempt == max_attempts:
+                        return (current_clean, current_dirty)
+                    continue
                 else:
                     print(f"      ✗ Disjointness validation failed: {validation['intersection_count']} intersections")
 
@@ -1299,7 +1421,7 @@ class Judge:
                            factory=None,
                            max_rounds: int = 10,
                            conflict_tolerance: float = 0.01,
-                           grey_tolerance: float = 0.1,
+                           grey_tolerance: float = 0.01,
                            metadata: Dict[str, Any] = None,
                            output_dir: str = "agentic_error_detector/results",
                            logger=None,
@@ -1356,13 +1478,13 @@ class Judge:
             # Backup current rules
             backup = deepcopy(rule_set)
 
-            console_fn("  Resolving conflicts...")
-            conflict_resolver = ConflictResolver(memory, factory)
-            rule_set = conflict_resolver.resolve(df, column, rule_set, metadata=metadata, round_num=round_num)
-
             console_fn("  Resolving gaps...")
-            gap_resolver = GapResolver(memory, factory)
+            gap_resolver = GapResolver(memory, factory, violation_threshold=self.violation_threshold)
             rule_set = gap_resolver.resolve(df, column, rule_set, metadata=metadata, round_num=round_num)
+
+            console_fn("  Resolving conflicts...")
+            conflict_resolver = ConflictResolver(memory, factory, violation_threshold=self.violation_threshold)
+            rule_set = conflict_resolver.resolve(df, column, rule_set, metadata=metadata, round_num=round_num)
 
             # Recompile functions after refinement
             rule_set = self._compile_rule_functions(rule_set)
@@ -1373,6 +1495,9 @@ class Judge:
             grey_rate = self._count_grey_zone(df, column, dual_rule) / len(df)
 
             console_fn(f"  Conflict rate: {conflict_rate:.4f}, Grey rate: {grey_rate:.4f}")
+
+            if hasattr(memory, 'add_round_summary'):
+                memory.add_round_summary(round_num, conflict_rate, grey_rate)
 
             history['rounds'].append({
                 'round': round_num,
