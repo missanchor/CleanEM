@@ -40,7 +40,8 @@ class ConflictResolver:
     def resolve(self, df: pd.DataFrame, column: str,
                 rule_set: CleanRuleSet,
                 metadata: Dict[str, Any] = None,
-                round_num: int = 1) -> CleanRuleSet:
+                round_num: int = 1,
+                em_scores: Dict[int, float] = None) -> CleanRuleSet:
         """
         Resolve conflicts for a column.
 
@@ -79,7 +80,7 @@ class ConflictResolver:
         # For each clean rule, find conflicts with dirty rules
         for rule_name, clean_rule in rule_set.clean_rules.items():
             conflicts, clean_only, dirty_only = self._find_conflicts(
-                df, column, clean_rule, rule_set.dirty_rules
+                df, column, clean_rule, rule_set.dirty_rules, em_scores=em_scores
             )
 
             if not conflicts:
@@ -223,7 +224,7 @@ class ConflictResolver:
             all_conflict_indices = set()
             for clean_rule_item in rule_set.clean_rules.values():
                 conflicts, _, _ = self._find_conflicts(
-                    df, column, clean_rule_item, rule_set.dirty_rules
+                    df, column, clean_rule_item, rule_set.dirty_rules, em_scores=em_scores
                 )
                 all_conflict_indices.update(
                     int(c.row_index) if hasattr(c, "row_index") else int(c.get("row_index"))
@@ -243,7 +244,8 @@ class ConflictResolver:
 
     def _find_conflicts(self, df: pd.DataFrame, column: str,
                        clean_rule: CleanRule,
-                       dirty_rules: Dict[str, CleanRule]) -> Tuple[List[ConflictRecord], List[Dict], List[Dict]]:
+                       dirty_rules: Dict[str, CleanRule],
+                       em_scores: Dict[int, float] = None) -> Tuple[List[ConflictRecord], List[Dict], List[Dict]]:
         """Find conflicts, clean-only samples, and dirty-only samples.
 
         Returns:
@@ -340,7 +342,7 @@ class ConflictResolver:
                 self.factory.model
             )
 
-            response = dual_leg._call_llm(prompt, max_tokens=300)
+            response = dual_leg._call_llm(prompt)
 
             # Set response for logging
             self.logger.set_response(response)
@@ -391,7 +393,7 @@ class ConflictResolver:
             if top_values:
                 # top_values is a dict like {'United': 100, 'American': 95, ...}
                 top_items = list(top_values.items())[:10]
-                top_str = ", ".join([f"'{v}' ({c}次)" for v, c in top_items])
+                top_str = ", ".join([f"'{v}' ({c}times)" for v, c in top_items])
             else:
                 top_str = "N/A"
 
@@ -405,12 +407,15 @@ class ConflictResolver:
 - Null Count: {metadata.get('null_count', 'unknown')}
 """
 
-        # Format sample sections with negative feedback
+        # Format clean-only values
         clean_section = ""
         if clean_only_samples:
+            # Group clean-only values by frequency
+            clean_only_counts = Counter([s['value'] for s in clean_only_samples])
+            top_clean_only = clean_only_counts.most_common(10)
             clean_examples = "\n".join([
-                f"  - '{s['value']}'"
-                for s in clean_only_samples[:5]
+                f"  - '{v}' ({c} times)"
+                for v, c in top_clean_only
             ])
             clean_section = f"""
 **Clean-Only Values (correctly clean - should NOT be flagged as dirty):**
@@ -420,9 +425,12 @@ These values satisfy the clean rule and should NOT be detected by dirty rules.
 
         dirty_section = ""
         if dirty_only_samples:
+            # Group dirty-only values by frequency
+            dirty_only_counts = Counter([s['value'] for s in dirty_only_samples])
+            top_dirty_only = dirty_only_counts.most_common(10)
             dirty_examples = "\n".join([
-                f"  - '{s['value']}'"
-                for s in dirty_only_samples[:5]
+                f"  - '{v}' ({c} times)"
+                for v, c in top_dirty_only
             ])
             dirty_section = f"""
 **Dirty-Only Values (correctly detected as dirty):**
@@ -451,13 +459,14 @@ These values are incorrectly flagged by both rules.
 **Conflicting Dirty Rules:**
 {dirty_rules_str}
 
-**Modification History:**
+**Refinement History:**
 {self.memory.to_context()}
 
 **Task:**
 1. Compare conflicting values with clean-only and dirty-only samples.
 2. Determine whether the clean rule is too broad or the dirty rule is too aggressive.
 3. Decide which rule should be modified.
+4. **IMPORTANT: Avoid proposing any rule expressions that are listed as 'rejected' in the Refinement History.** If a similar rule was rejected due to a high violation rate, you must find a more precise or different approach.
 
 **Important Guidelines for Rule Analysis:**
 - A Dirty Rule's purpose is to catch ERRORS. If it matches valid data, it is too aggressive.
@@ -484,7 +493,7 @@ Return ONLY a JSON object:
             top_values = metadata.get('top_values', {})
             if top_values:
                 top_items = list(top_values.items())[:10]
-                top_str = ", ".join([f"'{v}' ({c}次)" for v, c in top_items])
+                top_str = ", ".join([f"'{v}' ({c} times)" for v, c in top_items])
             else:
                 top_str = "N/A"
 
@@ -501,7 +510,9 @@ Return ONLY a JSON object:
         # Format clean-only values
         clean_section = ""
         if clean_only_values:
-            clean_examples = "\n".join([f"  - '{v}'" for v in clean_only_values[:5]])
+            clean_only_counts = Counter(clean_only_values)
+            top_clean_only = clean_only_counts.most_common(10)
+            clean_examples = "\n".join([f"  - '{v}' ({c} times)" for v, c in top_clean_only])
             clean_section = f"""
 **Clean-Only Values (correctly clean - should NOT be flagged as dirty):**
 These values satisfy the clean rule and should NOT be detected by this dirty rule.
@@ -511,7 +522,9 @@ These values satisfy the clean rule and should NOT be detected by this dirty rul
         # Format dirty-only values
         dirty_section = ""
         if dirty_only_values:
-            dirty_examples = "\n".join([f"  - '{v}'" for v in dirty_only_values[:5]])
+            dirty_only_counts = Counter(dirty_only_values)
+            top_dirty_only = dirty_only_counts.most_common(10)
+            dirty_examples = "\n".join([f"  - '{v}' ({c} times)" for v, c in top_dirty_only])
             dirty_section = f"""
 **Dirty-Only Values (correctly detected as dirty):**
 These values are correctly flagged by this dirty rule.
@@ -539,12 +552,13 @@ You are comparing ONLY these two rules - do NOT consider other rules.
 {clean_section}
 {dirty_section}
 {conflict_section}
-**Modification History:**
+**Refinement History:**
 {self.memory.to_context()}
 
 **Task:**
 Compare the conflicting values with clean-only and dirty-only samples.
 Determine whether the clean rule is too broad or this specific dirty rule is too aggressive.
+**IMPORTANT: Avoid proposing any rule expressions that are listed as 'rejected' in the Refinement History.**
 
 **Guidelines:**
 - A Dirty Rule's purpose is to catch ERRORS. If it matches valid data (clean-only values), it is too aggressive.
@@ -589,12 +603,12 @@ Return ONLY a JSON object:
 
         try:
             from agent import DualAgent
-            dual_leg = DualLegislator(
+            dual_leg = DualAgent(
                 self.factory.base_url,
                 self.factory.model
             )
 
-            response = dual_leg._call_llm(prompt, max_tokens=300)
+            response = dual_leg._call_llm(prompt)
 
             # Set response for logging
             self.logger.set_response(response)
@@ -633,7 +647,7 @@ Return ONLY a JSON object:
             top_values = metadata.get('top_values', {})
             if top_values:
                 top_items = list(top_values.items())[:10]
-                top_str = ", ".join([f"'{v}' ({c}次)" for v, c in top_items])
+                top_str = ", ".join([f"'{v}' ({c} times)" for v, c in top_items])
             else:
                 top_str = "N/A"
 
@@ -747,12 +761,12 @@ Return ONLY a JSON object:
 
         try:
             from agent import DualAgent
-            dual_leg = DualLegislator(
+            dual_leg = DualAgent(
                 self.factory.base_url,
                 self.factory.model
             )
 
-            response = dual_leg._call_llm(prompt, max_tokens=300)
+            response = dual_leg._call_llm(prompt)
 
             # Set response for logging
             self.logger.set_response(response)
@@ -800,7 +814,7 @@ Return ONLY a JSON object:
             top_values = metadata.get('top_values', {})
             if top_values:
                 top_items = list(top_values.items())[:10]
-                top_str = ", ".join([f"'{v}' ({c}次)" for v, c in top_items])
+                top_str = ", ".join([f"'{v}' ({c} times)" for v, c in top_items])
             else:
                 top_str = "N/A"
 
@@ -841,7 +855,7 @@ These values incorrectly satisfy both clean and dirty rules.
 **Problem:**
 {analysis['reason']}
 
-**Modification History:**
+**Refinement History:**
 {self.memory.to_context() if hasattr(self.memory, 'to_context') else 'N/A'}
 
 **CRITICAL INSTRUCTIONS for Clean Rules:**
@@ -862,7 +876,7 @@ lambda value, row=None: <expression>
             from agent import DualAgent
             dual_leg = DualAgent(self.factory.base_url, self.factory.model)
 
-            response = dual_leg._call_llm(prompt, max_tokens=300, temperature=0.2)
+            response = dual_leg._call_llm(prompt, temperature=0.2)
 
             # Set response for logging
             self.logger.set_response(response)
@@ -959,7 +973,7 @@ lambda value, row=None: <expression>
             top_values = metadata.get('top_values', {})
             if top_values:
                 top_items = list(top_values.items())[:10]
-                top_str = ", ".join([f"'{v}' ({c}次)" for v, c in top_items])
+                top_str = ", ".join([f"'{v}' ({c} times)" for v, c in top_items])
             else:
                 top_str = "N/A"
 
@@ -999,7 +1013,7 @@ These values are clean and should NOT be flagged.
 **Accumulated Issues:**
 {combined_reason}
 
-**Modification History:**
+**Refinement History:**
 {self.memory.to_context() if hasattr(self.memory, 'to_context') else 'N/A'}
 
 Generate a refined lambda function that excludes the conflicting values while still detecting dirty-only values.
@@ -1016,7 +1030,7 @@ lambda value, row=None: <expression>
             from agent import DualAgent
             dual_leg = DualAgent(self.factory.base_url, self.factory.model)
 
-            response = dual_leg._call_llm(prompt, max_tokens=300, temperature=0.2)
+            response = dual_leg._call_llm(prompt, temperature=0.2)
 
             # Set response for logging
             self.logger.set_response(response)

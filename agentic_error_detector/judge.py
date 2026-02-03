@@ -21,7 +21,7 @@ class Judge:
     VR = count(Rule == False) / total_rows
 
     Criteria:
-    - Accept: 0 < VR < threshold (e.g., 0.05)
+    - Accept: 0 <= VR < threshold (e.g., 0.05)
     - VR = 0: Rule is trivial (everyone follows it)
     - VR > threshold: Rule is too strict or wrong
     - Small Non-Zero VR: Indicates Anomalies (Errors)
@@ -132,11 +132,9 @@ class Judge:
 
     def _evaluate_vr(self, vr: float) -> str:
         """Evaluate the violation rate."""
-        if vr == 0:
-            return "reject_trivial"
-        elif vr > self.threshold:
+        if vr > self.threshold:
             return "reject_too_strict"
-        elif 0 < vr <= self.threshold:
+        elif 0 <= vr <= self.threshold:
             return "accept_anomaly"
         else:
             return "unknown"
@@ -145,7 +143,7 @@ class Judge:
         """
         Get all accepted rules for each column based on VR.
 
-        Strategy: Return all rules with "accept_anomaly" status (0 < VR <= threshold).
+        Strategy: Return all rules with "accept_anomaly" status (0 <= VR <= threshold).
         This allows using multiple rules per column for more comprehensive error detection.
         """
         accepted_rules = {}
@@ -958,7 +956,8 @@ class Judge:
 
     def _generate_refinement_task(self, df: pd.DataFrame, column: str,
                                   evaluation_result: DualEvaluationResult,
-                                  metadata: Dict[str, Any]) -> Dict[str, Any]:
+                                  metadata: Dict[str, Any],
+                                  em_scores: Optional[Dict[int, float]] = None) -> Dict[str, Any]:
         from core.deducer import analyze_conflict_topology, generate_refinement_task
         import numpy as np
 
@@ -974,8 +973,10 @@ class Judge:
 
         clean_mask = []
         dirty_mask = []
-        for _, row in df.iterrows():
+        row_indices = []
+        for idx, row in df.iterrows():
             value = row[column]
+            row_indices.append(int(idx))
             try:
                 clean_mask.append(bool(self._invoke_predicate(clean_func, value, row)))
                 dirty_mask.append(bool(self._invoke_predicate(dirty_func, value, row)))
@@ -996,13 +997,66 @@ class Judge:
             metadata
         )
 
+        conflict_samples = evaluation_result.conflict_samples
+        grey_samples = evaluation_result.grey_samples
+
+        if em_scores:
+            from collections import Counter
+
+            value_counts = Counter()
+            for idx, row in df.iterrows():
+                value_counts[row[column]] += 1
+
+            def build_samples(mask_clean: List[bool], mask_dirty: List[bool],
+                              selector, max_samples: int) -> List[Dict[str, Any]]:
+                indices: List[int] = []
+                for i, row_idx in enumerate(row_indices):
+                    if selector(mask_clean[i], mask_dirty[i]):
+                        indices.append(int(row_idx))
+                if not indices:
+                    return []
+                indices.sort(key=lambda rid: em_scores.get(int(rid), 0.5), reverse=True)
+                indices = indices[:max_samples]
+                samples: List[Dict[str, Any]] = []
+                for rid in indices:
+                    if rid not in df.index:
+                        continue
+                    row = df.loc[rid]
+                    value = row[column]
+                    sample: Dict[str, Any] = {
+                        'row_index': int(rid),
+                        'value': value,
+                        'count': int(value_counts[value]),
+                        'p_error': float(em_scores.get(int(rid), 0.0)),
+                    }
+                    samples.append(sample)
+                return samples
+
+            conflict_samples_em = build_samples(
+                clean_mask,
+                dirty_mask,
+                lambda c, d: c and d,
+                max_samples=10,
+            )
+            grey_samples_em = build_samples(
+                clean_mask,
+                dirty_mask,
+                lambda c, d: (not c) and (not d),
+                max_samples=10,
+            )
+
+            if conflict_samples_em:
+                conflict_samples = conflict_samples_em
+            if grey_samples_em:
+                grey_samples = grey_samples_em
+
         return {
             'column': task.column,
             'conflict_type': task.conflict_type.value,
             'current_clean_rule': task.current_clean_rule,
             'current_dirty_rule': task.current_dirty_rule,
-            'conflict_samples': evaluation_result.conflict_samples,
-            'grey_samples': evaluation_result.grey_samples,
+            'conflict_samples': conflict_samples,
+            'grey_samples': grey_samples,
             'strategy': task.strategy,
             'metadata': task.metadata
         }
@@ -1049,7 +1103,46 @@ class Judge:
                     ]
                     continue
 
-                task = self._generate_refinement_task(df, column, result, metadata.get(column, {}))
+                em_scores: Optional[Dict[int, float]] = None
+                try:
+                    from dual_types import CleanRule, CleanRuleSet
+
+                    clean_rule = CleanRule(
+                        name="P_clean",
+                        rule_str=result.rule.clean_rule_str,
+                        rule_func=result.rule.clean_rule_func,
+                        version=0,
+                        modification_log=[],
+                    )
+                    dirty_rule = CleanRule(
+                        name="P_dirty",
+                        rule_str=result.rule.dirty_rule_str,
+                        rule_func=result.rule.dirty_rule_func,
+                        version=0,
+                        modification_log=[],
+                    )
+                    rule_set = CleanRuleSet(
+                        column=column,
+                        clean_rules={"P_clean": clean_rule},
+                        dirty_rules={"P_dirty": dirty_rule},
+                    )
+                    em_result = self.em_label_model_column(df, column, rule_set)
+                    row_indices = em_result.get("row_indices", [])
+                    posteriors = em_result.get("posteriors", [])
+                    em_scores = {
+                        int(idx): float(p)
+                        for idx, p in zip(row_indices, posteriors)
+                    }
+                except Exception:
+                    em_scores = None
+
+                task = self._generate_refinement_task(
+                    df,
+                    column,
+                    result,
+                    metadata.get(column, {}),
+                    em_scores=em_scores,
+                )
                 updated = self._execute_refinement_with_fallback(
                     df,
                     column,
@@ -1478,23 +1571,70 @@ class Judge:
             # Backup current rules
             backup = deepcopy(rule_set)
 
-            console_fn("  Resolving gaps...")
-            gap_resolver = GapResolver(memory, factory, violation_threshold=self.violation_threshold)
-            rule_set = gap_resolver.resolve(df, column, rule_set, metadata=metadata, round_num=round_num)
-
-            console_fn("  Resolving conflicts...")
-            conflict_resolver = ConflictResolver(memory, factory, violation_threshold=self.violation_threshold)
-            rule_set = conflict_resolver.resolve(df, column, rule_set, metadata=metadata, round_num=round_num)
-
-            # Recompile functions after refinement
-            rule_set = self._compile_rule_functions(rule_set)
-
-            # Check convergence
+            # Check current status BEFORE attempting refinement
             dual_rule = rule_set.to_dual_rule(agent_factory=factory)
             conflict_rate = self._count_conflicts(df, column, dual_rule) / len(df)
             grey_rate = self._count_grey_zone(df, column, dual_rule) / len(df)
 
-            console_fn(f"  Conflict rate: {conflict_rate:.4f}, Grey rate: {grey_rate:.4f}")
+            console_fn(f"  Current status - Conflict rate: {conflict_rate:.4f}, Grey rate: {grey_rate:.4f}")
+
+            # Check termination - both conditions must be satisfied
+            if conflict_rate <= conflict_tolerance and grey_rate <= grey_tolerance:
+                console_fn(f"  ✓ Converged (conflict_rate={conflict_rate:.4f} <= {conflict_tolerance}, grey_rate={grey_rate:.4f} <= {grey_tolerance})")
+                # Record the final state
+                if hasattr(memory, 'add_round_summary'):
+                    memory.add_round_summary(round_num, conflict_rate, grey_rate)
+                history['rounds'].append({
+                    'round': round_num,
+                    'conflict_rate': conflict_rate,
+                    'grey_rate': grey_rate,
+                    'modifications': memory.to_context() if hasattr(memory, 'to_context') else str(memory)
+                })
+                break
+
+            em_scores: Dict[int, float] = {}
+            try:
+                em_result = self.em_label_model_column(df, column, rule_set)
+                row_indices = em_result.get("row_indices", [])
+                posteriors = em_result.get("posteriors", [])
+                em_scores = {
+                    int(idx): float(p)
+                    for idx, p in zip(row_indices, posteriors)
+                }
+            except Exception as e:
+                console_fn(f"  ⚠ EM label model failed for column {column}: {e}")
+
+            console_fn("  Resolving gaps...")
+            gap_resolver = GapResolver(memory, factory, violation_threshold=self.violation_threshold)
+            rule_set = gap_resolver.resolve(
+                df,
+                column,
+                rule_set,
+                metadata=metadata,
+                round_num=round_num,
+                em_scores=em_scores or None,
+            )
+
+            console_fn("  Resolving conflicts...")
+            conflict_resolver = ConflictResolver(memory, factory, violation_threshold=self.violation_threshold)
+            rule_set = conflict_resolver.resolve(
+                df,
+                column,
+                rule_set,
+                metadata=metadata,
+                round_num=round_num,
+                em_scores=em_scores or None,
+            )
+
+            # Recompile functions after refinement
+            rule_set = self._compile_rule_functions(rule_set)
+
+            # Check status after refinement
+            dual_rule = rule_set.to_dual_rule(agent_factory=factory)
+            conflict_rate = self._count_conflicts(df, column, dual_rule) / len(df)
+            grey_rate = self._count_grey_zone(df, column, dual_rule) / len(df)
+
+            console_fn(f"  After refinement - Conflict rate: {conflict_rate:.4f}, Grey rate: {grey_rate:.4f}")
 
             if hasattr(memory, 'add_round_summary'):
                 memory.add_round_summary(round_num, conflict_rate, grey_rate)
@@ -1506,9 +1646,9 @@ class Judge:
                 'modifications': memory.to_context() if hasattr(memory, 'to_context') else str(memory)
             })
 
-            # Check termination - both conditions must be satisfied
+            # Check termination after refinement
             if conflict_rate <= conflict_tolerance and grey_rate <= grey_tolerance:
-                console_fn(f"  ✓ Converged (conflict_rate={conflict_rate:.4f} <= {conflict_tolerance}, grey_rate={grey_rate:.4f} <= {grey_tolerance})")
+                console_fn(f"  ✓ Converged after refinement (conflict_rate={conflict_rate:.4f} <= {conflict_tolerance}, grey_rate={grey_rate:.4f} <= {grey_tolerance})")
                 break
 
             # Check if making progress
@@ -1541,6 +1681,175 @@ class Judge:
         history['log_file'] = logger.path if hasattr(logger, 'path') else None
 
         return rule_set, history
+
+    def em_label_model_column(
+        self,
+        df: pd.DataFrame,
+        column: str,
+        rule_set: 'CleanRuleSet',
+        pi: float = 0.05,
+        max_iter: int = 20,
+        tol: float = 1e-3,
+        a1: float = 1.0,
+        b1: float = 1.0,
+        a0: float = 1.0,
+        b0: float = 1.0,
+    ) -> Dict[str, Any]:
+        from dual_types import CleanRuleSet
+
+        rule_set = self._compile_rule_functions(rule_set)
+
+        if column not in df.columns:
+            raise ValueError(f"Column '{column}' not found in DataFrame")
+
+        n = len(df)
+        if n == 0:
+            return {
+                "column": column,
+                "row_indices": [],
+                "posteriors": [],
+                "rule_params": {},
+                "iterations": 0,
+            }
+
+        clean_rules = list(rule_set.clean_rules.values())
+        dirty_rules = list(rule_set.dirty_rules.values())
+        rules = clean_rules + dirty_rules
+
+        if not rules:
+            return {
+                "column": column,
+                "row_indices": list(df.index.astype(int)),
+                "posteriors": [float(pi)] * n,
+                "rule_params": {},
+                "iterations": 0,
+            }
+
+        num_rules = len(rules)
+        polarities = np.concatenate(
+            [
+                np.full(len(clean_rules), -1, dtype=int),
+                np.full(len(dirty_rules), 1, dtype=int),
+            ]
+        )
+
+        Z = np.zeros((num_rules, n), dtype=np.int8)
+        row_indices = list(df.index)
+
+        for j, rule in enumerate(rules):
+            for i, idx in enumerate(row_indices):
+                row = df.loc[idx]
+                value = row[column]
+                try:
+                    pred = self._invoke_predicate(rule.rule_func, value, row)
+                except Exception:
+                    pred = False
+                if polarities[j] == 1:
+                    z = 1 if pred else 0
+                else:
+                    z = 0 if pred else 1
+                Z[j, i] = z
+
+        alpha = np.full(num_rules, 0.9, dtype=float)
+        beta = np.full(num_rules, 0.9, dtype=float)
+        p = np.full(n, pi, dtype=float)
+
+        iterations = 0
+        for iteration in range(max_iter):
+            iterations += 1
+
+            log_p1 = np.log(pi) * np.ones(n, dtype=float)
+            log_p0 = np.log(1.0 - pi) * np.ones(n, dtype=float)
+
+            for j in range(num_rules):
+                z_j = Z[j].astype(float)
+                log_p1 += z_j * np.log(alpha[j]) + (1.0 - z_j) * np.log(1.0 - alpha[j])
+                log_p0 += z_j * np.log(1.0 - beta[j]) + (1.0 - z_j) * np.log(beta[j])
+
+            max_log = np.maximum(log_p1, log_p0)
+            log_p1_adj = log_p1 - max_log
+            log_p0_adj = log_p0 - max_log
+            exp_p1 = np.exp(log_p1_adj)
+            exp_p0 = np.exp(log_p0_adj)
+            denom = exp_p1 + exp_p0 + 1e-12
+            new_p = exp_p1 / denom
+
+            delta = float(np.max(np.abs(new_p - p)))
+            p = new_p
+
+            w1 = p
+            w0 = 1.0 - p
+
+            for j in range(num_rules):
+                z_j = Z[j].astype(float)
+                N11 = float(np.sum(w1 * z_j))
+                N10 = float(np.sum(w1 * (1.0 - z_j)))
+                N01 = float(np.sum(w0 * z_j))
+                N00 = float(np.sum(w0 * (1.0 - z_j)))
+
+                alpha[j] = (N11 + a1) / (N11 + N10 + a1 + b1 + 1e-12)
+                beta[j] = (N00 + a0) / (N00 + N01 + a0 + b0 + 1e-12)
+
+            if delta < tol:
+                break
+
+        rule_params: Dict[str, Any] = {}
+        for idx_rule, rule in enumerate(rules):
+            rule_params[rule.name] = {
+                "alpha": float(alpha[idx_rule]),
+                "beta": float(beta[idx_rule]),
+                "polarity": int(polarities[idx_rule]),
+            }
+
+        posteriors = [float(x) for x in p]
+        row_indices_int = [int(i) for i in row_indices]
+
+        return {
+            "column": column,
+            "row_indices": row_indices_int,
+            "posteriors": posteriors,
+            "rule_params": rule_params,
+            "iterations": iterations,
+        }
+
+    def prune_rules_by_em(
+        self,
+        df: pd.DataFrame,
+        column: str,
+        rule_set: 'CleanRuleSet',
+        reliability_threshold: float = 0.6,
+        **em_kwargs: Any,
+    ) -> Tuple['CleanRuleSet', Dict[str, Any]]:
+        from dual_types import CleanRuleSet
+
+        em_result = self.em_label_model_column(df, column, rule_set, **em_kwargs)
+        rule_params = em_result.get("rule_params", {})
+
+        clean_rules = {}
+        for name, rule in rule_set.clean_rules.items():
+            params = rule_params.get(name)
+            if not params:
+                continue
+            reliability = min(params["alpha"], params["beta"])
+            if reliability >= reliability_threshold:
+                clean_rules[name] = rule
+
+        dirty_rules = {}
+        for name, rule in rule_set.dirty_rules.items():
+            params = rule_params.get(name)
+            if not params:
+                continue
+            reliability = min(params["alpha"], params["beta"])
+            if reliability >= reliability_threshold:
+                dirty_rules[name] = rule
+
+        pruned_rule_set = CleanRuleSet(
+            column=column,
+            clean_rules=clean_rules,
+            dirty_rules=dirty_rules,
+        )
+
+        return pruned_rule_set, em_result
 
     def _compile_rule_functions(self, rule_set: 'CleanRuleSet') -> 'CleanRuleSet':
         """Compile rule functions from strings."""

@@ -3,6 +3,7 @@ Modification memory and refinement logging utilities.
 """
 import os
 import json
+import threading
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, TextIO, Tuple, Any
@@ -54,40 +55,86 @@ class ModificationMemory:
 
     def to_context(self) -> str:
         if not self.entries:
-            return "# Modification History\nNo modifications yet."
-        lines: List[str] = ["# Modification History"]
-        for e in self.entries[-10:]:
-            if e.get("type") == "summary":
-                lines.append(f"- {e.get('reason', '')}")
-            elif e.get("type") == "round_summary":
-                metrics = e.get("metrics", {})
-                conflict_rate = metrics.get("conflict_rate")
-                gap_rate = metrics.get("gap_rate")
+            return "# Refinement History\nNo modifications yet."
+        round_summaries: Dict[int, Dict[str, float]] = {}
+        round_mods: Dict[int, List[Dict[str, Any]]] = {}
+        for e in self.entries:
+            if e.get("type") == "round_summary":
                 round_num = e.get("round")
-                parts = []
-                if conflict_rate is not None:
-                    parts.append(f"conflict_rate={conflict_rate:.4f}")
-                if gap_rate is not None:
-                    parts.append(f"gap_rate={gap_rate:.4f}")
-                metrics_str = ", ".join(parts)
-                if round_num is not None:
-                    if metrics_str:
-                        lines.append(f"- [round {round_num}] summary: {metrics_str}")
-                    else:
-                        lines.append(f"- [round {round_num}] summary")
-                else:
-                    lines.append(f"- summary: {metrics_str}")
+                if isinstance(round_num, int):
+                    round_summaries[round_num] = e.get("metrics", {}) or {}
+            elif e.get("type") == "summary":
+                continue
             else:
-                metrics = e.get("metrics", {})
-                metrics_parts = []
-                for key, value in metrics.items():
-                    if isinstance(value, float):
-                        metrics_parts.append(f"{key}={value:.4f}")
+                round_num = e.get("round")
+                if isinstance(round_num, int):
+                    round_mods.setdefault(round_num, []).append(e)
+        if not round_summaries:
+            return "# Refinement History\nNo round summaries available."
+        sorted_rounds = sorted(round_summaries.keys())
+        if len(sorted_rounds) > 10:
+            sorted_rounds = sorted_rounds[-10:]
+        
+        lines: List[str] = ["# Refinement History"]
+        
+        # Add a clear instruction for the LLM
+        lines.append("\n**CRITICAL: Do NOT propose any rules that have been REJECTED in previous rounds.**\n")
+        
+        prev_conflict: Optional[float] = None
+        prev_gap: Optional[float] = None
+        for round_num in sorted_rounds:
+            metrics = round_summaries.get(round_num, {})
+            conflict_rate = metrics.get("conflict_rate")
+            gap_rate = metrics.get("gap_rate")
+            if conflict_rate is not None and prev_conflict is not None:
+                conflict_str = f"{prev_conflict:.4f}->{conflict_rate:.4f}"
+            elif conflict_rate is not None:
+                conflict_str = f"{conflict_rate:.4f}"
+            else:
+                conflict_str = "N/A"
+            if gap_rate is not None and prev_gap is not None:
+                gap_str = f"{prev_gap:.4f}->{gap_rate:.4f}"
+            elif gap_rate is not None:
+                gap_str = f"{gap_rate:.4f}"
+            else:
+                gap_str = "N/A"
+            mods = round_mods.get(round_num, [])
+            if mods:
+                change_items: List[str] = []
+                for m in mods:
+                    action = m.get("action", "")
+                    rule_str = m.get("new_rule") or ""
+                    if rule_str:
+                        if len(rule_str) > 120:
+                            rule_str_disp = rule_str[:117] + "..."
+                        else:
+                            rule_str_disp = rule_str
+                        base = f"{m.get('type','')}/{m.get('name','')} {action}: {rule_str_disp}"
                     else:
-                        metrics_parts.append(f"{key}={value}")
-                metrics_str = f" ({', '.join(metrics_parts)})" if metrics_parts else ""
-                round_str = f" [round {e.get('round')}]" if e.get("round") is not None else ""
-                lines.append(f"- [{e.get('type','')}/{e.get('name','')}] {e.get('action','')}: {e.get('reason','')}{metrics_str}{round_str}")
+                        base = f"{m.get('type','')}/{m.get('name','')} {action}"
+                    if action == "rejected":
+                        reason = m.get("reason") or ""
+                        metrics = m.get("metrics") or {}
+                        violation_rate = metrics.get("violation_rate")
+                        reason_parts: List[str] = []
+                        if reason:
+                            reason_parts.append(reason)
+                        if isinstance(violation_rate, float):
+                            reason_parts.append(f"violation_rate={violation_rate:.4f}")
+                        if reason_parts:
+                            base = f"{base} | reason=" + ", ".join(reason_parts)
+                    change_items.append(base)
+                changes_str = "; ".join(change_items)
+            else:
+                changes_str = "no rule changes"
+            lines.append(
+                f"- [round {round_num}] changes: {changes_str}; "
+                f"conflict={conflict_str}, gap={gap_str}"
+            )
+            if conflict_rate is not None:
+                prev_conflict = conflict_rate
+            if gap_rate is not None:
+                prev_gap = gap_rate
         return "\n".join(lines)
 
     def clear(self) -> None:
@@ -99,6 +146,7 @@ class RefinementLogger:
         self.log_file: Optional[TextIO] = None
         self.log_path: Optional[str] = None
         self.run_id: Optional[str] = None
+        self._lock = threading.RLock()
 
     def start(self, output_dir: str, dataset_name: Optional[str] = None) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -127,8 +175,9 @@ class RefinementLogger:
     def _log(self, msg: str) -> None:
         if not self.log_file:
             return
-        self.log_file.write(msg + "\n")
-        self.log_file.flush()
+        with self._lock:
+            self.log_file.write(msg + "\n")
+            self.log_file.flush()
 
     def begin_column_refinement(
         self,
@@ -153,16 +202,24 @@ class RefinementLogger:
         self._log("  --- End of column refinement ---")
 
     def set_prompt(self, prompt: str) -> None:
-        self._log("  [PROMPT]")
-        for line in prompt.splitlines():
-            self._log("    " + line)
-        self._log("  [/PROMPT]")
+        if not self.log_file:
+            return
+        with self._lock:
+            self.log_file.write("  [PROMPT]\n")
+            for line in prompt.splitlines():
+                self.log_file.write("    " + line + "\n")
+            self.log_file.write("  [/PROMPT]\n")
+            self.log_file.flush()
 
     def set_response(self, response: str) -> None:
-        self._log("  [RESPONSE]")
-        for line in response.splitlines():
-            self._log("    " + line)
-        self._log("  [/RESPONSE]")
+        if not self.log_file:
+            return
+        with self._lock:
+            self.log_file.write("  [RESPONSE]\n")
+            for line in response.splitlines():
+                self.log_file.write("    " + line + "\n")
+            self.log_file.write("  [/RESPONSE]\n")
+            self.log_file.flush()
 
     def add_modification(
         self,
@@ -207,11 +264,11 @@ class RefinementLogger:
         violation_rate: float,
         reason: str,
     ) -> None:
-        self._log("  [REJECTED] Rule rejected for excessive violations")
-        self._log(f"    Type: {rule_type}, Name: {rule_name}")
-        self._log(f"    Violation rate: {violation_rate * 100:.1f}% (over violation threshold)")
+        self._log(f"  [REJECTION] {rule_name}")
+        self._log(f"    Type: {rule_type}")
         self._log(f"    Old: {old_rule}")
-        self._log(f"    Proposed new: {new_rule}")
+        self._log(f"    New: {new_rule}")
+        self._log(f"    Violation Rate: {violation_rate:.4f}")
         self._log(f"    Reason: {reason}")
 
     def log_initial_rules(

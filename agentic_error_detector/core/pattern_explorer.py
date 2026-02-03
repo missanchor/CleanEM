@@ -474,9 +474,11 @@ JSON格式:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
-                max_tokens=1000
+                max_tokens=1024
             )
-            return response.choices[0].message.content.strip()
+            raw = response.choices[0].message.content or ""
+            cleaned = re.sub(r"<think>.*?</think>\s*", "", raw, flags=re.DOTALL).strip()
+            return cleaned
         except Exception as e:
             print(f"  [PatternExplorer] LLM call error: {e}")
             return "{}"

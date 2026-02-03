@@ -25,12 +25,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dirty_csv",
-        default="data/hospital_error-01.csv",
+        default="data/flights_error-01.csv",
         help="Path to the dirty/error-prone CSV that needs inspection."
     )
     parser.add_argument(
         "--clean_csv",
-        default="data/hospital_clean.csv",
+        default="data/flights_clean.csv",
         help="Optional clean CSV for evaluation against ground truth."
     )
     parser.add_argument(
@@ -128,9 +128,7 @@ def run_clean_rule_refinement(df, metadata, base_rules, clean_rules, factory, ju
     dataset_name = os.path.splitext(os.path.basename(args.dirty_csv))[0]
 
     # Start a single logger for all columns
-    print(f"\n{'='*80}")
-    print(f"Starting unified refinement log for dataset: {dataset_name}")
-    print(f"{'='*80}")
+    print(f"\nRefinement log started: {dataset_name}")
     logger = start_logger(args.output_dir, dataset_name)
 
     # Log initial rule generation
@@ -176,9 +174,7 @@ def run_clean_rule_refinement(df, metadata, base_rules, clean_rules, factory, ju
         initial_rules[column] = dual_rule
 
     if clean_df is not None and initial_rules:
-        print("\n" + "="*80)
-        print("INITIAL CLEAN RULE PERFORMANCE (before refinement)")
-        print("="*80)
+        print("\nInitial performance (before refinement):")
         initial_detected_errors = judge.get_detected_dirty_values(initial_rules, df)
         initial_metrics_summary = judge.evaluate_with_ground_truth(
             df,
@@ -221,9 +217,7 @@ def run_clean_rule_refinement(df, metadata, base_rules, clean_rules, factory, ju
         }
         for future in as_completed(future_to_column):
             column, dual_rule, history, log_lines = future.result()
-            print("\n" + "=" * 80)
-            print(f"Processing column: {column}")
-            print("=" * 80)
+            print(f"\nProcessing column: {column}")
             for line in log_lines:
                 print(line)
             best_rules[column] = dual_rule
@@ -236,9 +230,7 @@ def run_clean_rule_refinement(df, metadata, base_rules, clean_rules, factory, ju
         'processed_columns': list(best_rules.keys()),
     }
     stop_logger(final_summary)
-    print(f"\n{'='*80}")
-    print(f"Refinement log saved for dataset: {dataset_name}")
-    print(f"{'='*80}")
+    print(f"\nRefinement log saved: {dataset_name}")
 
     return best_rules, all_history
 
@@ -307,19 +299,14 @@ def run_dual_mode(args: argparse.Namespace) -> None:
 
         judge = Judge(threshold=args.vr_threshold, violation_threshold=args.vr_threshold)
 
-        print("[6.5/7] Evaluating base rules independently (standalone rule-based detection)")
-        print("="*80)
-        print("STANDALONE RULE-BASED ERROR DETECTION")
-        print("="*80)
+        print("[4/7] Standalone rule-based error detection")
         base_evaluation_results = judge.evaluate_rules(profiler.df, base_rules)
         accepted_base_rules = judge.get_accepted_rules(base_evaluation_results)
         judge.print_summary(accepted_base_rules)
         # judge.print_detected_errors(base_detected_errors)
 
         # Evaluate standalone clean rules (Completeness/Accuracy/Pattern/Relationship)
-        print("\n" + "="*80)
-        print("STANDALONE CLEAN RULES EVALUATION")
-        print("="*80)
+        print("\nStandalone clean rules evaluation:")
         clean_evaluation_results = judge.evaluate_rules(profiler.df, clean_rules, rule_type="clean")
         accepted_clean_rules = judge.get_accepted_rules(clean_evaluation_results)
         judge.print_summary(accepted_clean_rules, rule_type="clean")
@@ -328,9 +315,7 @@ def run_dual_mode(args: argparse.Namespace) -> None:
         # Clean Rule (AND): All clean rules must be satisfied
         # Dirty Rule (OR): Violating any dirty rule marks as potentially dirty
         # Error = (NOT all clean rules satisfied) AND (at least one dirty rule violated)
-        print("\n" + "="*80)
-        print("COMBINED ERROR DETECTION (AND/OR LOGIC)")
-        print("="*80)
+        print("\nCombined AND/OR error detection:")
         base_detected_errors = judge.get_detected_errors(
             accepted_base_rules,      # dirty rules (OR logic)
             accepted_clean_rules      # clean rules (AND logic)
@@ -341,9 +326,7 @@ def run_dual_mode(args: argparse.Namespace) -> None:
         base_metrics_summary = None
         clean_df = None
         if args.clean_csv:
-            print("\n" + "="*80)
-            print("STANDALONE BASE RULES - GROUND TRUTH EVALUATION")
-            print("="*80)
+            print("\nGround truth evaluation (base rules):")
             clean_df = pd.read_csv(args.clean_csv)
             base_metrics_summary = judge.evaluate_with_ground_truth(
                 profiler.df,
@@ -352,8 +335,7 @@ def run_dual_mode(args: argparse.Namespace) -> None:
             )
             judge.print_evaluation_summary(base_metrics_summary)
 
-        print("\n[7/7] Clean Rule-Level Refinement Mode")
-        print("="*80)
+        print("\n[5/7] Clean rule-level refinement")
         best_rules, refinement_history = run_clean_rule_refinement(
             profiler.df,
             metadata,
@@ -377,17 +359,14 @@ def run_dual_mode(args: argparse.Namespace) -> None:
             print("✗ No acceptable dual rules were produced. See refinement logs for details.")
             return
 
-        print("\n[7.5/7] Validating disjointness of refined rules")
-        print("="*80)
-        print("DISJOINTNESS VALIDATION")
-        print("="*80)
+        print("\n[6/7] Validating disjointness of refined rules")
         validator = DisjointnessValidator(gap_tolerance=args.grey_tolerance)
         validation_result = validator.validate_batch(profiler.df, best_rules)
         print(validator.report_violations(validation_result))
 
         coverage_gaps = sorted(set(metadata.keys()) - set(best_rules.keys()))
 
-        print("[8/8] Evaluating final dual rules on the dataset")
+        print("[7/7] Evaluating final dual rules on the dataset")
         evaluation_payload = _materialize_rule_payload(best_rules)
         evaluation_results = judge.evaluate_dual_rules(
             profiler.df,
@@ -397,17 +376,16 @@ def run_dual_mode(args: argparse.Namespace) -> None:
         detected_dirty_values = judge.get_detected_dirty_values(best_rules, profiler.df)
         judge.print_dual_summary(best_rules, evaluation_results)
 
-        metrics_summary = None
-        if args.clean_csv:
-            print(f"[9/9] Comparing dual rules against ground truth: {args.clean_csv}")
-            if clean_df is None:
-                clean_df = pd.read_csv(args.clean_csv)
-            metrics_summary = judge.evaluate_with_ground_truth(
+        refined_metrics_summary = None
+        # Evaluate refined dual rules against ground truth if clean CSV is provided
+        if args.clean_csv and clean_df is not None:
+            print("\nGround truth evaluation (refined rules):")
+            refined_metrics_summary = judge.evaluate_with_ground_truth(
                 profiler.df,
                 clean_df,
                 detected_dirty_values
             )
-            judge.print_evaluation_summary(metrics_summary)
+            judge.print_evaluation_summary(refined_metrics_summary)
 
         os.makedirs(args.output_dir, exist_ok=True)
         judge.save_dual_results(
@@ -420,9 +398,7 @@ def run_dual_mode(args: argparse.Namespace) -> None:
         )
 
         # Save base rules evaluation results
-        print("\n" + "="*80)
-        print("SAVING STANDALONE BASE RULES RESULTS")
-        print("="*80)
+        print("\nSaving results:")
 
         # Save base rules evaluation
         with open(os.path.join(args.output_dir, "base_rules_evaluation.json"), "w") as f:
@@ -441,11 +417,13 @@ def run_dual_mode(args: argparse.Namespace) -> None:
                 json.dump(base_metrics_summary, f, indent=2)
             print(f"  - base_rules_ground_truth_metrics.json")
 
-        if metrics_summary:
-            metrics_path = os.path.join(args.output_dir, "dual_ground_truth_metrics.json")
-            with open(metrics_path, "w") as f:
-                json.dump(metrics_summary, f, indent=2)
-            print(f"✓ Dual ground-truth metrics saved to {metrics_path}")
+        # Save refined dual rules ground truth metrics if available
+        if 'refined_metrics_summary' in locals() and refined_metrics_summary:
+            refined_metrics_path = os.path.join(args.output_dir, "refined_ground_truth_metrics.json")
+            with open(refined_metrics_path, "w") as f:
+                json.dump(refined_metrics_summary, f, indent=2)
+            print(f"  - refined_ground_truth_metrics.json")
+
 
         # Save disjointness validation results
         validation_path = os.path.join(args.output_dir, "disjointness_validation.json")

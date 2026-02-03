@@ -48,7 +48,8 @@ class GapResolver:
     def resolve(self, df: pd.DataFrame, column: str,
                 rule_set: CleanRuleSet,
                 metadata: Dict[str, Any] = None,
-                round_num: int = 1) -> CleanRuleSet:
+                round_num: int = 1,
+                em_scores: Dict[int, float] = None) -> CleanRuleSet:
         """
         Resolve gap zones for a column.
 
@@ -81,8 +82,22 @@ class GapResolver:
             dirty_rules=dirty_rules_before
         )
 
-        # Find gap, clean, and dirty samples
-        gap_samples, clean_samples, dirty_samples = self._find_gap_values(df, column, rule_set)
+        gap_samples, clean_samples, dirty_samples = self._find_gap_values(
+            df,
+            column,
+            rule_set,
+            em_scores=em_scores,
+        )
+
+        if em_scores:
+            clean_samples = sorted(
+                clean_samples,
+                key=lambda s: (s.get('p_error') is None, s.get('p_error', 0.0))
+            )
+            dirty_samples = sorted(
+                dirty_samples,
+                key=lambda s: (s.get('p_error') is None, -s.get('p_error', 0.0))
+            )
 
         if not gap_samples:
             # End logging without modifications
@@ -98,7 +113,13 @@ class GapResolver:
 
         # Analyze gaps and classify them with positive and negative examples
         analysis = self._analyze_gap(
-            df, column, gap_samples, clean_samples, dirty_samples, rule_set, metadata
+            df,
+            column,
+            gap_samples,
+            clean_samples,
+            dirty_samples,
+            rule_set,
+            metadata,
         )
 
         num_modifications = 0
@@ -118,7 +139,12 @@ class GapResolver:
                 if new_rule.rule_str != old_rule.rule_str:
                     num_modifications += 1
                     # Re-evaluate gaps after this extension
-                    gap_samples, _, _ = self._find_gap_values(df, column, rule_set)
+                    gap_samples, _, _ = self._find_gap_values(
+                        df,
+                        column,
+                        rule_set,
+                        em_scores=em_scores,
+                    )
                     gap_values = list(set([str(s['value']) for s in gap_samples]))
                 rule_set.clean_rules[rule_name] = new_rule
 
@@ -145,7 +171,12 @@ class GapResolver:
                 if new_rule.rule_str != old_rule.rule_str:
                     num_modifications += 1
                     # Re-evaluate gaps after this extension
-                    gap_samples, _, _ = self._find_gap_values(df, column, rule_set)
+                    gap_samples, _, _ = self._find_gap_values(
+                        df,
+                        column,
+                        rule_set,
+                        em_scores=em_scores,
+                    )
                     gap_values = list(set([str(s['value']) for s in gap_samples]))
                 rule_set.dirty_rules[agent_name] = new_rule
 
@@ -172,7 +203,8 @@ class GapResolver:
         return rule_set
 
     def _find_gap_values(self, df: pd.DataFrame, column: str,
-                        rule_set: CleanRuleSet) -> tuple:
+                        rule_set: CleanRuleSet,
+                        em_scores: Dict[int, float] = None) -> tuple:
         """Find gap, clean, and dirty samples for better LLM context.
 
         Returns:
@@ -200,6 +232,8 @@ class GapResolver:
                     'value': value,
                     'row_data': row_dict
                 }
+                if em_scores is not None:
+                    sample['p_error'] = float(em_scores.get(int(idx), 0.0))
 
                 if not is_clean and not is_dirty:
                     gap_samples.append(sample)
@@ -209,19 +243,109 @@ class GapResolver:
                     dirty_samples.append(sample)
             except Exception:
                 # On exception, treat as gap to be conservative
-                gap_samples.append({
+                gap_sample = {
                     'row_index': int(idx),
                     'value': value,
                     'row_data': row_dict
-                })
+                }
+                if em_scores is not None:
+                    gap_sample['p_error'] = float(em_scores.get(int(idx), 0.0))
+                gap_samples.append(gap_sample)
 
         return gap_samples, clean_samples, dirty_samples
     
     def _get_top_gaps(self, gap_samples: List[Dict], k: int = 10) -> List[Dict]:
-        """Get top-k most frequent gap samples."""
+        if not gap_samples:
+            return []
+        if 'p_error' in gap_samples[0] and gap_samples[0].get('p_error') is not None:
+            sorted_samples = sorted(
+                gap_samples,
+                key=lambda s: (-s.get('p_error', 0.0), s['row_index'])
+            )
+            return sorted_samples[:k]
         value_freq = Counter([s['value'] for s in gap_samples])
         top_values = [v for v, _ in value_freq.most_common(k)]
         return [s for s in gap_samples if s['value'] in top_values]
+
+    def _safe_json_loads(self, response: str) -> dict:
+        """
+        安全地解析 LLM 返回的 JSON，处理常见的格式问题。
+        
+        处理的问题：
+        1. Markdown 代码块标记（```json ... ```）
+        2. 正则表达式中的反斜杠转义
+        3. 双重转义问题
+        4. 额外的空白字符
+        """
+        import re
+        
+        original_response = response
+        
+        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+        response = re.sub(r'^```json\s*', '', response.strip())
+        response = re.sub(r'```\s*$', '', response.strip())
+        
+        if "{" not in response:
+            return {
+                "culprit_rule": "",
+                "extend_clean": {},
+                "extend_dirty": {},
+            }
+        
+        # 步骤 2: 尝试直接解析
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            pass
+        
+        # 步骤 3: 修复常见的 JSON 格式问题
+        # 3.1 修复双重转义（LLM 有时会过度转义）
+        response = response.replace('\\\\', '\\')
+        
+        # 3.2 修复正则表达式字符串中的未转义反斜杠
+        # 使用正则表达式查找字符串中的 \d, \s, \w 等模式，并确保它们被正确转义
+        def fix_regex_escapes(match):
+            """修复正则表达式字符串中的转义问题"""
+            content = match.group(1)
+            # 确保正则元字符被正确转义（在 JSON 中需要双重转义）
+            # 匹配未转义的反斜杠后跟字母（如 \d, \s, \w）
+            content = re.sub(r'(?<!\\)\\([dDsSwWbBnrtv])', r'\\\\\\1', content)
+            return f'"{content}"'
+        
+        # 尝试修复字符串值中的转义问题
+        try:
+            response = re.sub(r'"((?:[^"\\]|\\.)*)"', fix_regex_escapes, response)
+        except Exception:
+            pass
+        
+        # 步骤 4: 再次尝试解析
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            pass
+        
+        # 步骤 5: 如果还是失败，尝试提取 JSON 对象
+        # 有时候 LLM 会在 JSON 前后添加额外的文本
+        json_pattern = r'\{[\s\S]*?\}'
+        matches = re.findall(json_pattern, response)
+        
+        for match in matches:
+            try:
+                return json.loads(match)
+            except json.JSONDecodeError:
+                continue
+        
+        # 步骤 6: 所有尝试都失败，记录错误并返回空结果
+        error_msg = f"Failed to parse JSON after all attempts. Response preview: {original_response[:200]}..."
+        self.logger.log_error(getattr(self, 'current_column', 'unknown'), "json_parse", error_msg)
+        print(f"  ⚠ {error_msg}")
+        
+        # 返回一个安全的默认结构，避免上层代码崩溃
+        return {
+            'culprit_rule': '',
+            'extend_clean': {},
+            'extend_dirty': {}
+        }
     
     def _analyze_gap(self, df: pd.DataFrame, column: str,
                     gap_samples: List[Dict],
@@ -261,16 +385,15 @@ class GapResolver:
             dual_leg = self._get_dual_agent()
             if not dual_leg:
                 raise ValueError("No agent available")
-            response = dual_leg._call_llm(prompt, max_tokens=400)
+            response = dual_leg._call_llm(prompt)
 
             # Set response for logging
             self.logger.set_response(response)
 
-            # Parse JSON response
-            classification = json.loads(response)
+            # Parse JSON response using safe parser
+            classification = self._safe_json_loads(response)
             return {
                 'culprit_rule': classification.get('culprit_rule', ''),
-                'culprit_analysis': classification.get('culprit_analysis', ''),
                 'extend_clean': classification.get('extend_clean', {}),
                 'extend_dirty': classification.get('extend_dirty', {})
             }
@@ -309,25 +432,24 @@ class GapResolver:
                                    dirty_samples: List[Dict] = None,
                                    gap_rule_stats: str = "") -> str:
         """Build prompt for LLM gap analysis with positive and negative examples."""
+        # 使用 json.dumps 预处理规则字符串，确保特殊字符被正确转义
         clean_rules_str = "\n".join([
-            f"- {name}: {rule.rule_str}"
+            f"- {name}: {json.dumps(rule.rule_str)}"
             for name, rule in rule_set.clean_rules.items()
         ])
 
         dirty_rules_str = "\n".join([
-            f"- {name}: {rule.rule_str}"
+            f"- {name}: {json.dumps(rule.rule_str)}"
             for name, rule in rule_set.dirty_rules.items()
         ])
 
         # Format metadata for prompt
         meta_str = ""
         if metadata:
-            # Format top values with frequencies
             top_values = metadata.get('top_values', {})
             if top_values:
-                # top_values is a dict like {'United': 100, 'American': 95, ...}
                 top_items = list(top_values.items())[:10]
-                top_str = ", ".join([f"'{v}' ({c}次)" for v, c in top_items])
+                top_str = ", ".join([f"'{v}' ({c} times)" for v, c in top_items])
             else:
                 top_str = "N/A"
 
@@ -341,12 +463,13 @@ class GapResolver:
 - Null Count: {metadata.get('null_count', 'unknown')}
 """
 
-        # Format sample sections with negative feedback
         clean_section = ""
         if clean_samples:
+            clean_only_counts = Counter([s['value'] for s in clean_samples])
+            top_clean_only = clean_only_counts.most_common(10)
             clean_examples = "\n".join([
-                f"  - Row {s['row_index']}: value='{s['value']}'"
-                for s in clean_samples[:5]
+                f"  - '{v}' ({c} times)"
+                for v, c in top_clean_only
             ])
             clean_section = f"""
 **Known Clean Values (correctly classified as clean - for reference):**
@@ -356,9 +479,11 @@ These values satisfy clean rules and should NOT be flagged as dirty.
 
         dirty_section = ""
         if dirty_samples:
+            dirty_only_counts = Counter([s['value'] for s in dirty_samples])
+            top_dirty_only = dirty_only_counts.most_common(10)
             dirty_examples = "\n".join([
-                f"  - Row {s['row_index']}: value='{s['value']}'"
-                for s in dirty_samples[:5]
+                f"  - '{v}' ({c} times)"
+                for v, c in top_dirty_only
             ])
             dirty_section = f"""
 **Known Dirty Values (correctly detected as dirty - for reference):**
@@ -368,9 +493,11 @@ These values are correctly flagged by dirty rules.
 
         gap_section = ""
         if gap_samples:
+            gap_counts = Counter([s['value'] for s in gap_samples])
+            top_gaps = gap_counts.most_common(10)
             gap_examples = "\n".join([
-                f"  - Row {s['row_index']}: value='{s['value']}'"
-                for s in gap_samples[:10]
+                f"  - '{v}' ({c} times)"
+                for v, c in top_gaps
             ])
             gap_section = f"""
 **Gap Values (need classification - neither clean nor dirty):**
@@ -400,8 +527,8 @@ These values failed all clean rules and all dirty rules. Classify them based on 
 **Current Dirty Rules:**
 {dirty_rules_str}
 
-**Modification History:**
-{self.memory.to_context()}
+**Refinement History:**
+{self.memory.to_context() if hasattr(self.memory, 'to_context') else 'N/A'}
 
 **Task:**
 1. **Identify the Culprit Rule (REQUIRED):** First, explicitly identify which SINGLE clean rule is the most likely cause of the gap zone using the per-rule false counts above.
@@ -412,6 +539,7 @@ These values failed all clean rules and all dirty rules. Classify them based on 
 3. **Assume GAP values are erroneous by default.** Propose exactly ONE dirty rule extension that will detect the gap values.
    - If existing dirty rules are insufficient, create a NEW dirty rule and let the LLM name it consistently (global naming strategy).
    - Do NOT split gap values into subsets; use one rule that broadly covers the gap values.
+   - **IMPORTANT: Avoid proposing any rule expressions that are listed as 'rejected' in the Refinement History.** If a similar rule was rejected due to a high violation rate, you must find a more precise or different approach.
 
 **Important Guidelines for Rule Analysis:**
 - A Dirty Rule's purpose is to catch ERRORS.
@@ -421,14 +549,11 @@ These values failed all clean rules and all dirty rules. Classify them based on 
 Return ONLY a JSON object:
 {{
   "culprit_rule": "rule_name",
-  "culprit_analysis": "explanation of why this rule is the culprit based on false counts",
   "classification": "clean" or "dirty" or "mixed",
-  "reasoning": "brief explanation based on comparison",
-  "extend_clean": {{"clean_rule_name": "description of pattern to include"}},
-  "extend_dirty": {{"dirty_rule_name": "description of pattern to include"}}
+  "extend_clean": {{"clean_rule_name": "lambda value, row=None: <expression>"}},
+  "extend_dirty": {{"dirty_rule_name": "lambda value, row=None: <expression>"}}
 }}
 """
-    
     def _extend_rule_single(self, rule: CleanRule, extension_info: str,
                             side: str, gap_values: List[str],
                             clean_values: List[str], dirty_values: List[str]) -> CleanRule:
@@ -442,6 +567,47 @@ Return ONLY a JSON object:
 
         column = getattr(self, 'current_column', 'unknown')
         round_num = getattr(self, 'round_num', 1)
+
+        direct_lambda = extension_info.strip() if extension_info else ""
+        if direct_lambda.startswith("lambda "):
+            new_rule = CleanRule(
+                name=rule.name,
+                rule_str=direct_lambda,
+                rule_func=None,
+                version=rule.version + 1,
+                modification_log=rule.modification_log + [f"Extended: {direct_lambda}"]
+            )
+
+            df = getattr(self, '_current_df', None)
+            if df is not None:
+                is_accepted, violation_rate, reject_reason = self._validate_refined_rule(
+                    df, column, rule, new_rule, side
+                )
+
+                if not is_accepted:
+                    self.logger.log_rejection(
+                        rule_type=side,
+                        rule_name=rule.name,
+                        old_rule=rule.rule_str,
+                        new_rule=direct_lambda,
+                        violation_rate=violation_rate,
+                        reason=reject_reason
+                    )
+
+                    if hasattr(self.memory, 'add'):
+                        self.memory.add(
+                            side,
+                            rule.name,
+                            'rejected',
+                            reject_reason,
+                            direct_lambda,
+                            metrics={"violation_rate": violation_rate},
+                            round_num=getattr(self, 'round_num', None)
+                        )
+
+                    return rule
+
+            return new_rule
 
         # Format sample values for the prompt
         gap_section = ""
@@ -478,7 +644,7 @@ Return ONLY a JSON object:
 {gap_section}
 {clean_section}
 {dirty_section}
-**Modification History:**
+**Refinement History:**
 {self.memory.to_context() if hasattr(self.memory, 'to_context') else 'N/A'}
 
 **Task:**
@@ -500,7 +666,7 @@ lambda value, row=None: <expression>
             if not dual_leg:
                 raise ValueError("No agent available")
 
-            response = dual_leg._call_llm(prompt, max_tokens=300, temperature=0.2)
+            response = dual_leg._call_llm(prompt, temperature=0.2)
 
             # Set response for logging
             self.logger.set_response(response)
@@ -606,7 +772,7 @@ lambda value, row=None: <expression>
 **Extension Required:**
 {extension_info}
 
-**Modification History:**
+**Refinement History:**
 {self.memory.to_context() if hasattr(self.memory, 'to_context') else 'N/A'}
 
 Generate a refined lambda function that ALSO covers the new values.
@@ -624,7 +790,7 @@ lambda value, row=None: <expression>
             if not dual_leg:
                 raise ValueError("No agent available")
 
-            response = dual_leg._call_llm(prompt, max_tokens=300, temperature=0.2)
+            response = dual_leg._call_llm(prompt, temperature=0.2)
 
             # Set response for logging
             self.logger.set_response(response)

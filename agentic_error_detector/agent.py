@@ -13,6 +13,7 @@ from core.pattern_types import PatternSpec
 from core.pattern_explorer import PatternExplorer
 
 DEFAULT_MISSING_TOKENS = ["", "nan", "none", "null", "n/a", "na", "unknown", "empty", "xxxxx"]
+LLM_MAX_TOKENS = 2048
 
 # Configuration for batch processing and pattern exploration
 VALUE_BATCH_SIZE = 30  # Number of unique values per batch for LLM annotation
@@ -73,7 +74,13 @@ class BaseAgent:
         """Get the system prompt for this agent. Override in subclasses."""
         return "You are a data quality expert. Generate Python lambda functions for data validation. Return ONLY the lambda functions, one per line."
 
-    def _call_llm(self, prompt: str, max_tokens: int = 500, system_prompt: str = None, temperature: float = 0.1) -> str:
+    @staticmethod
+    def _strip_think_tags(text: str) -> str:
+        if not text:
+            return ""
+        return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+
+    def _call_llm(self, prompt: str, max_tokens: int = LLM_MAX_TOKENS, system_prompt: str = None, temperature: float = 0.1) -> str:
         """Call the LLM with a prompt."""
         try:
             system_msg = system_prompt if system_prompt else self._get_system_prompt()
@@ -88,8 +95,10 @@ class BaseAgent:
                 temperature=temperature,
                 max_tokens=max_tokens
             )
-            self.last_response = response.choices[0].message.content.strip()
-            return self.last_response
+            raw_content = response.choices[0].message.content or ""
+            cleaned = self._strip_think_tags(raw_content).strip()
+            self.last_response = cleaned
+            return cleaned
         except Exception as e:
             print(f"  ⚠ Error calling LLM: {e}")
             self.last_response = f"Error: {e}"
@@ -219,7 +228,7 @@ Rules:
 Output JSON array:
 [{{"value": "...", "label": "MISSING_TOKEN"}}, {{"value": "...", "label": "VALID"}}]
 """
-        response = self._call_llm(prompt, max_tokens=800)
+        response = self._call_llm(prompt)
 
         try:
             # Extract JSON from response
@@ -332,7 +341,7 @@ class TypoAgent(BaseAgent):
 输出JSON数组:
 [{{"value": "...", "label": "LIKELY_TYPO"}}, {{"value": "...", "label": "VALID_RARE"}}]
 """
-        response = self._call_llm(prompt, max_tokens=1000)
+        response = self._call_llm(prompt)
 
         try:
             json_match = re.search(r'\[[\s\S]*\]', response)
@@ -548,7 +557,9 @@ class LogicAgent(BaseAgent):
         return """You are a data integrity expert specializing in cross-column logical consistency and business rule validation.
 Your role is to generate Python lambda functions that verify relationships between multiple columns (e.g., temporal ordering, value dependencies).
 You understand domain logic, temporal constraints, and referential integrity requirements.
-Return ONLY the lambda functions, one per line. Each function accepts a row (dict) and returns True for logically consistent data."""
+Return ONLY the lambda functions, one per line. Each function accepts a row (dict) and returns True for logically consistent data.
+Be STRINGENT - only accept values that are definitely ACCURATE and follow the expected domain format. Any deviation should be rejected.
+"""
 
     def generate_rules(self, row_data: Dict[str, Any], all_metadata: Dict[str, Any]) -> List[str]:
         """
@@ -581,7 +592,7 @@ Return ONLY the lambda functions, one per line. Each function accepts a row (dic
                         continue
 
                     prompt = self._build_constraint_prompt(column, profile, all_metadata)
-                    rule_text = self._call_llm(prompt, max_tokens=400)
+                    rule_text = self._call_llm(prompt)
                     lambda_rule = self._extract_lambda(rule_text)
                     if lambda_rule:
                         rules.append(lambda_rule)
@@ -664,7 +675,7 @@ Return ONLY the lambda functions, one per line. Each function accepts a row (dic
         prompt = "\n".join(prompt_lines)
 
         # Call LLM to get relationship rules
-        response = self._call_llm(prompt, max_tokens=800)
+        response = self._call_llm(prompt)
 
         if not response or "lambda" not in response.lower():
             return []
@@ -760,6 +771,7 @@ class CleanCompletenessAgent(BaseAgent):
         return """You are a data completeness expert specializing in ensuring data completeness and presence.
 Your role is to generate Python lambda functions that confirm when a value is definitely COMPLETE (present and non-missing).
 You understand various representations of missing data (None, NaN, empty strings, 'N/A', 'null', etc.) and know that clean data should NOT contain these placeholders.
+Be STRINGENT - only accept values that are definitely ACCURATE and follow the expected domain format. Any deviation should be rejected.
 Return ONLY the lambda functions, one per line. Each function should return True for complete/present values."""
 
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
@@ -1107,7 +1119,7 @@ CRITICAL REQUIREMENTS (cover every agent below):
 2. Accuracy: ensure numeric ranges, enumerations, and domain-specific thresholds are respected
 3. Column relationship constraints: when metadata provides relational expectations, enforce them conservatively
 4. Pattern/format consistency: honor regex-like structures, code lengths, and canonical casing
-5. P_clean should remain PERMISSIVE overall—only reject values that clearly break the agent above
+5. P_clean/P_dirty should remain strict overall—only reject values that clearly break the rule OR are highly unlikely to be valid
 6. Must return boolean values (True/False) and handle edge cases gracefully
 
 Return ONLY the lambda function:
@@ -1295,17 +1307,17 @@ Be PRECISE and CONTRACT-ONLY - minimize creative interpretation to avoid new con
         if disjointness_mode:
             # Use disjointness prompt with lower temperature for precision
             rules_text = self._call_llm(
-                prompt, 
-                max_tokens=400, 
+                prompt,
+                max_tokens=LLM_MAX_TOKENS,
                 system_prompt=self.get_p_clean_disjointness_prompt(),
-                temperature=0.2
+                temperature=0.2,
             )
         else:
             # Use standard prompt with default temperature
             rules_text = self._call_llm(
-                prompt, 
-                max_tokens=400, 
-                system_prompt=self.get_p_clean_system_prompt()
+                prompt,
+                max_tokens=LLM_MAX_TOKENS,
+                system_prompt=self.get_p_clean_system_prompt(),
             )
 
         if not rules_text or "lambda" not in rules_text.lower():
@@ -1380,17 +1392,17 @@ Be PRECISE and CONTRACT-ONLY - minimize creative interpretation to avoid new con
         if disjointness_mode:
             # Use disjointness prompt with lower temperature for precision
             rules_text = self._call_llm(
-                prompt, 
-                max_tokens=400, 
+                prompt,
+                max_tokens=LLM_MAX_TOKENS,
                 system_prompt=self.get_p_dirty_disjointness_prompt(),
-                temperature=0.2
+                temperature=0.2,
             )
         else:
             # Use standard prompt with default temperature
             rules_text = self._call_llm(
-                prompt, 
-                max_tokens=400, 
-                system_prompt=self.get_p_dirty_system_prompt()
+                prompt,
+                max_tokens=LLM_MAX_TOKENS,
+                system_prompt=self.get_p_dirty_system_prompt(),
             )
 
         if not rules_text or "lambda" not in rules_text.lower():
@@ -1902,7 +1914,7 @@ class AgentFactory:
         print("="*80)
 
         p_clean_rules = {}
-        dual_agent = DualLegislator(self.base_url, self.model)
+        dual_agent = DualAgent(self.base_url, self.model)
 
         for column, col_metadata in metadata.items():
             print(f"\n{'='*80}")
@@ -1956,7 +1968,7 @@ class AgentFactory:
         print("="*80)
 
         p_dirty_rules = {}
-        dual_agent = DualLegislator(self.base_url, self.model)
+        dual_agent = DualAgent(self.base_url, self.model)
 
         for column, col_metadata in metadata.items():
             print(f"\n{'='*80}")
@@ -1972,7 +1984,7 @@ class AgentFactory:
                     meta["_refine_conflict_samples"] = context.get('conflict_samples', [])
                     meta["_base_rules"] = base_rules.get(column, []) if base_rules else []
 
-                # Generate P_dirty using DualLegislator
+                # Generate P_dirty using DualAgent
                 dirty_rule = dual_agent.generate_p_dirty_rule(column, meta)
 
                 if dirty_rule:
@@ -2072,10 +2084,10 @@ Examples of fixes:
 - If parentheses are unbalanced: add missing )
 - If invalid escape: use raw strings or proper escaping
 
-Return ONLY the fixed lambda:
+        Return ONLY the fixed lambda:
 """
 
-        response = self._call_llm(prompt, max_tokens=300, temperature=0.1)
+        response = self._call_llm(prompt, max_tokens=LLM_MAX_TOKENS, temperature=0.1)
 
         # Extract the lambda from response
         for line in response.split('\n'):
