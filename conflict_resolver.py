@@ -1003,24 +1003,23 @@ These values are clean and should NOT be flagged.
 {conflict_examples}
 """
 
-        prompt = f"""Refine this dirty detection rule to avoid false positives:
+        prompt = f"""Refine this ERROR DETECTION rule:
 
 **Current Rule ({agent_name}):**
 {rule.rule_str}
 {meta_str}
 {dirty_section}
 {conflict_section}
-**Accumulated Issues:**
+**Task**: 
+- Compare "Confirmed Errors" vs "False Positives"
+- Find distinguishing features (date ranges, country codes, prefixes, etc.)
+- Use row.get('column_name') for conditional logic if needed
+- Goal: detect errors WITHOUT catching clean values
+
+**Issues:**
 {combined_reason}
 
-**Refinement History:**
-{self.memory.to_context() if hasattr(self.memory, 'to_context') else 'N/A'}
-
-Generate a refined lambda function that excludes the conflicting values while still detecting dirty-only values.
-Return ONLY the lambda function, no explanation.
-
-Example format:
-lambda value, row=None: <expression>
+Return ONLY lambda: lambda value, row=None: <expression>
 """
 
         # Set prompt for logging

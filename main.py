@@ -4,7 +4,6 @@ Command-line entry point for the agentic error detector.
 Supports a dual verification pipeline with clean rule-level refinement.
 """
 import argparse
-import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Any
@@ -25,17 +24,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dirty_csv",
-        default="data/flights_error-01.csv",
+        default="data/hospital_error-01.csv",
         help="Path to the dirty/error-prone CSV that needs inspection."
     )
     parser.add_argument(
         "--clean_csv",
-        default="data/flights_clean.csv",
+        default="data/hospital_clean.csv",
         help="Optional clean CSV for evaluation against ground truth."
     )
     parser.add_argument(
         "--output_dir",
-        default="agentic_error_detector/results",
+        default="results/agentic_error_detector",
         help="Directory for serialized outputs."
     )
     parser.add_argument(
@@ -237,11 +236,10 @@ def run_clean_rule_refinement(df, metadata, base_rules, clean_rules, factory, ju
 
 def run_dual_mode(args: argparse.Namespace) -> None:
     # Create console log file with the same timestamp format
-    log_dir = os.path.join(args.output_dir, "refinement_logs")
-    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dataset_name = os.path.splitext(os.path.basename(args.dirty_csv))[0]
-    console_log_path = os.path.join(log_dir, f"{timestamp}_{dataset_name}_running_log.log")
+    console_log_path = os.path.join(args.output_dir, f"{timestamp}_{dataset_name}_running_log.log")
 
     # Custom stdout that writes to both terminal and file
     class DualOutput:
@@ -388,48 +386,6 @@ def run_dual_mode(args: argparse.Namespace) -> None:
             )
             judge.print_evaluation_summary(refined_metrics_summary)
 
-        os.makedirs(args.output_dir, exist_ok=True)
-        judge.save_dual_results(
-            best_rules,
-            evaluation_results,
-            refinement_history,
-            detected_dirty_values,
-            coverage_gaps,
-            output_dir=args.output_dir
-        )
-
-        # Save base rules evaluation results
-        print("\nSaving results:")
-
-        # Save base rules evaluation
-        with open(os.path.join(args.output_dir, "base_rules_evaluation.json"), "w") as f:
-            json.dump(_serialize_vr_rules(accepted_base_rules), f, indent=2)
-        print(f"  - base_rules_evaluation.json")
-
-        # Save base rules detected errors
-        with open(os.path.join(args.output_dir, "base_rules_detected_errors.json"), "w") as f:
-            json.dump(base_detected_errors, f, indent=2, default=str)
-        print(f"  - base_rules_detected_errors.json")
-
-        # Save base rules ground truth metrics if available
-        if base_metrics_summary:
-            base_metrics_path = os.path.join(args.output_dir, "base_rules_ground_truth_metrics.json")
-            with open(base_metrics_path, "w") as f:
-                json.dump(base_metrics_summary, f, indent=2)
-            print(f"  - base_rules_ground_truth_metrics.json")
-
-        # Save refined dual rules ground truth metrics if available
-        if 'refined_metrics_summary' in locals() and refined_metrics_summary:
-            refined_metrics_path = os.path.join(args.output_dir, "refined_ground_truth_metrics.json")
-            with open(refined_metrics_path, "w") as f:
-                json.dump(refined_metrics_summary, f, indent=2)
-            print(f"  - refined_ground_truth_metrics.json")
-
-
-        # Save disjointness validation results
-        validation_path = os.path.join(args.output_dir, "disjointness_validation.json")
-        validator.save_results(validation_result, validation_path)
-
         print("\n✓ Dual verification complete.")
 
     finally:
@@ -444,24 +400,6 @@ def _materialize_rule_payload(best_rules) -> Dict[str, List[tuple]]:
     for column, rule in best_rules.items():
         payload[column] = [(rule.agent_name, rule.clean_rule_str, rule.dirty_rule_str)]
     return payload
-
-
-def _serialize_vr_rules(accepted_rules: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
-    """Strip non-serializable fields (e.g., lambda objects) from VR results."""
-    serializable: Dict[str, List[dict]] = {}
-    for column, rules in accepted_rules.items():
-        trimmed: List[dict] = []
-        for result in rules:
-            trimmed.append({
-                'agent': result.get('agent'),
-                'status': result.get('status'),
-                'violation_rate': result.get('violation_rate'),
-                'violation_count': result.get('violation_count'),
-                'total_rows': result.get('total_rows'),
-                'rule_string': result.get('rule_string'),
-            })
-        serializable[column] = trimmed
-    return serializable
 
 
 def main() -> None:

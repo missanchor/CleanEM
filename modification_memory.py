@@ -151,13 +151,12 @@ class RefinementLogger:
     def start(self, output_dir: str, dataset_name: Optional[str] = None) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_id = timestamp
-        log_dir = os.path.join(output_dir, "refinement_logs")
-        os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
         if dataset_name:
             filename = f"{timestamp}_{dataset_name}_clean_dirty_rule_generation.log"
         else:
             filename = f"{timestamp}_clean_dirty_rule_generation.log"
-        self.log_path = os.path.join(log_dir, filename)
+        self.log_path = os.path.join(output_dir, filename)
         self.log_file = open(self.log_path, "w", encoding="utf-8")
         self._write_header()
 
@@ -343,7 +342,7 @@ def get_logger() -> RefinementLogger:
     return _logger
 
 
-def start_logger(output_dir: str = "agentic_error_detector/results", dataset_name: Optional[str] = None) -> RefinementLogger:
+def start_logger(output_dir: str = "results/agentic_error_detector", dataset_name: Optional[str] = None) -> RefinementLogger:
     logger = get_logger()
     logger.start(output_dir, dataset_name)
     return logger

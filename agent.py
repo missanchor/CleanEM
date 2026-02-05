@@ -366,19 +366,19 @@ class TypoAgent(BaseAgent):
         batch_data = [{"value": v, "count": c} for v, c in batch]
 
         prompt = f"""
-对于列 '{column}'，请标注以下低频值是否为拼写错误。
+For column '{column}', annotate the following low-frequency values as potential typos.
 
-高频值参考: {json.dumps(top_values, ensure_ascii=False)}
-高频值的标准化形式: {json.dumps(normalized_top, ensure_ascii=False)}
+High-frequency reference values: {json.dumps(top_values, ensure_ascii=False)}
+Normalized high-frequency values: {json.dumps(normalized_top, ensure_ascii=False)}
 
-本批次待标注的低频值:
+Low-frequency values to annotate in this batch:
 {json.dumps(batch_data, ensure_ascii=False)}
 
-标注规则:
-- "LIKELY_TYPO": 值与高频值相似但有明显拼写特征（字符替换、增删、颠倒、大小写错误）
-- "VALID_RARE": 值是合法的、合理的值，只是出现频率低
+Annotation rules:
+- "LIKELY_TYPO": value resembles a high-frequency one but has obvious spelling issues (character substitution, insertion/deletion, transposition, case error)
+- "VALID_RARE": value is legitimate and reasonable, just infrequent
 
-输出JSON数组:
+Output JSON array:
 [{{"value": "...", "label": "LIKELY_TYPO"}}, {{"value": "...", "label": "VALID_RARE"}}]
 """
         response = self._call_llm(prompt)
@@ -846,10 +846,12 @@ class CleanAccuracyAgent(BaseAgent):
 
     def _get_system_prompt(self) -> str:
         """System prompt for accuracy validation."""
-        return """You are a data accuracy expert specializing in validating value accuracy and reasonableness.
-Your role is to generate Python lambda functions that confirm when a value is definitely ACCURATE (within reasonable domain constraints).
-You understand numeric ranges, enumerations, domain-specific thresholds, and typical value distributions.
-Return ONLY the lambda functions, one per line. Each function should return True for accurate/valid values."""
+        return """You are a data accuracy expert. Generate Python lambda functions that return True for NORMAL/VALID values.
+Rules:
+- Return True only when value is definitely accurate and reasonable
+- Be permissive for edge cases - better to accept borderline values than reject valid data
+- Return False for clearly malformed or impossible values
+Return ONLY lambda functions: lambda value, row=None: <expression>"""
 
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
         """Generate rules to ensure data accuracy."""
@@ -971,19 +973,18 @@ class CleanPatternAgent(BaseAgent):
         top_values = metadata.get('top_values', {})
 
         prompt = f"""
-For column '{column}', generate up to 5 Python lambda functions to validate PATTERN CONSISTENCY.
+For column '{column}', generate up to 5 Python lambda functions describing NORMAL PATTERNS.
+
+Key Point: You are defining what CORRECT values look like, NOT listing error types.
+- Return True for values matching the expected normal pattern
+- Return False for abnormal values (no need to enumerate all errors)
+- Be permissive - accept all reasonably valid values
 
 Column metadata:
 - Pattern analysis: {pattern_analysis}
 - Shape distribution: {shape_distribution}
 - Length distribution: {length_distribution}
 - Top values: {list(top_values.keys())[:10]}
-
-Rules should:
-1. Check expected format
-2. Ensure consistent structure across values
-3. Validate character types for the field type
-4. Be PERMISSIVE - accept all values that look reasonably valid for the domain. Do not overfit to the top values provided. Only reject values that are clearly malformed or impossible.
 
 Return ONLY lambda functions, one per line. Format:
 lambda value, row=None: <expression>
@@ -1060,11 +1061,12 @@ class CleanRelationshipAgent(BaseAgent):
 
     def _get_system_prompt(self) -> str:
         """System prompt for column relationship validation."""
-        return """You are a data relationship validation expert specializing in cross-column consistency and dependencies.
-Your role is to generate Python lambda functions that confirm when column values maintain their EXPECTED RELATIONSHIPS.
-You understand referential integrity, temporal ordering, prefix matching, and inter-column dependencies.
-Return ONLY the lambda functions, one per line. Each function should return True for values that satisfy relationship constraints.
-Note: Functions should accept (value, row) where row contains other column values."""
+        return """You are a relationship validation expert. Generate lambda functions confirming NORMAL cross-column relationships.
+Rules:
+- Return True when relationships are valid (referential integrity, temporal ordering, etc.)
+- You CAN use the 'row' parameter to access other columns (e.g., row.get('country'), row.get('date'))
+- Return False for abnormal relationships or when unsure
+Return ONLY lambda functions: lambda value, row=None: <expression>"""
 
     def generate_rules(self, column: str, metadata: Dict[str, Any]) -> List[str]:
         """Generate rules to ensure column relationship consistency."""
@@ -1075,13 +1077,13 @@ Note: Functions should accept (value, row) where row contains other column value
         if not constraints:
             # Try to infer relationships from metadata
             prompt = f"""
-For column '{column}', generate up to 5 Python lambda functions to validate COLUMN RELATIONSHIPS.
+For column '{column}', generate up to 5 Python lambda functions validating NORMAL COLUMN RELATIONSHIPS.
 
-Column metadata:
-- Top values: {list(top_values.keys())[:10]}
+You CAN use the 'row' parameter to access other columns for conditional validation:
+- Example: row.get('country'), row.get('date'), row.get('variant_id')
 
 Look for hints about relationships in the column name or values.
-Generate rules that validate inter-column dependencies using the 'row' parameter.
+Generate rules that confirm valid inter-column dependencies.
 
 Return ONLY lambda functions, one per line. Format:
 lambda value, row=None: <expression>
@@ -1413,16 +1415,25 @@ Be PRECISE and CONTRACT-ONLY - minimize creative interpretation to avoid new con
 
         # Build prompt for P_dirty
         prompt_parts = [
-            f"Generate P_dirty predicate for column '{column}'",
+            f"Generate DIRTY DETECTION predicate for column '{column}'",
+            f"\nGOAL: Capture ERROR patterns, NOT describe normal data",
             f"\nColumn type: {col_type}",
             f"\nSample values: {sample_values[:10]}",
             f"\nTop values: {list(top_values.keys())[:10]}",
-            f"\nUnique count: {unique_count}",
-            f"\nNull count: {null_count}",
         ]
 
+        # Add refinement context if available
+        if '_refine_dirty_only_samples' in metadata:
+            dirty_samples = metadata['_refine_dirty_only_samples'][:5]
+            prompt_parts.append(f"\nConfirmed Errors (must detect): {dirty_samples}")
+
+        if '_refine_conflict_samples' in metadata:
+            conflict_samples = metadata['_refine_conflict_samples'][:10]
+            prompt_parts.append(f"\nFalse Positives (must NOT detect): {conflict_samples}")
+            prompt_parts.append("\nHint: Look for conditional patterns (country, date ranges, etc.) to separate these groups")
+
         prompt_parts.append("\n\nReturn ONLY the lambda function:")
-        prompt_parts.append("lambda value: <expression>")
+        prompt_parts.append("lambda value, row=None: <expression>")
 
         prompt = "\n".join(prompt_parts)
         

@@ -1286,7 +1286,7 @@ class Judge:
                          refinement_history: Dict[str, List],
                          detected_errors: List[Dict[str, Any]],
                          coverage_gaps: List[str] = None,
-                         output_dir: str = "agentic_error_detector/results"):
+                          output_dir: str = "results/agentic_error_detector"):
         """Save dual rule results to files."""
         import os
         import json
@@ -1548,7 +1548,7 @@ class Judge:
                            conflict_tolerance: float = 0.01,
                            grey_tolerance: float = 0.01,
                            metadata: Dict[str, Any] = None,
-                           output_dir: str = "agentic_error_detector/results",
+                            output_dir: str = "results/agentic_error_detector",
                            logger=None,
                            console: Optional[Callable[[str], None]] = None) -> Tuple['CleanRuleSet', Dict]:
         """
