@@ -37,6 +37,7 @@ class Judge:
         self.threshold = threshold
         self.violation_threshold = violation_threshold
         self.evaluation_results = {}
+        self.default_dirty_rate_prior = 0.2
 
     def evaluate_rules(self, df: pd.DataFrame, rules: Dict[str, list],
                         rule_type: str = "dirty") -> Dict[str, list]:
@@ -574,8 +575,49 @@ class Judge:
     # DUAL VERIFICATION METHODS (P_clean/P_dirty)
     # ============================================================================
 
-    def evaluate_dual_rules(self, df: pd.DataFrame, dual_rules: Dict[str, List[Tuple[str, str, str]]],
-                           grey_tolerance: float = 0.0) -> Dict[str, List[DualEvaluationResult]]:
+    def _estimate_dirty_rate_prior(self, metadata: Optional[Dict[str, Any]]) -> float:
+        if not metadata:
+            return float(self.default_dirty_rate_prior)
+
+        total_rows = int(metadata.get("total_rows") or 0)
+        missing_counts = metadata.get("missing_token_counts") or {}
+        missing_total = sum(int(v) for v in missing_counts.values())
+        missing_ratio = (missing_total / total_rows) if total_rows > 0 else 0.0
+
+        col_type = metadata.get("type")
+        if col_type == "text":
+            base = 0.2
+        elif col_type == "categorical":
+            base = 0.15
+        elif col_type == "pattern":
+            base = 0.12
+        else:
+            base = 0.1
+
+        non_null = metadata.get("non_null_count")
+        if non_null is None:
+            null_count = int(metadata.get("null_count") or 0)
+            non_null = max(total_rows - null_count, 0)
+        unique_count = metadata.get("unique_count")
+        unique_ratio = None
+        if unique_count is not None and non_null:
+            unique_ratio = float(unique_count) / float(non_null)
+
+        prior = max(base, min(0.3, float(missing_ratio) + 0.05))
+        if unique_ratio is not None and unique_ratio > 0.9:
+            prior = min(prior, 0.08)
+        if missing_ratio > 0.4:
+            prior = max(prior, min(0.5, float(missing_ratio) + 0.05))
+
+        return float(max(0.02, min(0.5, prior)))
+
+    def evaluate_dual_rules(
+        self,
+        df: pd.DataFrame,
+        dual_rules: Dict[str, List[Tuple[str, str, str]]],
+        grey_tolerance: float = 0.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, List[DualEvaluationResult]]:
         """
         Evaluate dual rules (P_clean/P_dirty pairs) and classify into four zones.
 
@@ -602,6 +644,8 @@ class Judge:
             print(f"{'='*80}")
 
             col_results = []
+            column_metadata = metadata.get(column, {}) if metadata else None
+            dirty_rate_prior = self._estimate_dirty_rate_prior(column_metadata) if metadata else None
 
             for agent_name, clean_rule_str, dirty_rule_str in candidate_rule_tuples:
                 print(f"\n  Agent: {agent_name}")
@@ -623,6 +667,8 @@ class Judge:
                     grey_samples = []
                     determined_clean_samples = []
                     determined_dirty_samples = []
+                    clean_flags: List[bool] = []
+                    dirty_flags: List[bool] = []
 
                     # Sample collection for debugging
                     from collections import Counter
@@ -639,6 +685,8 @@ class Judge:
                             # Predicate execution error -> grey zone
                             is_clean = False
                             is_dirty = False
+                        clean_flags.append(is_clean)
+                        dirty_flags.append(is_dirty)
 
                         # Four-zone classification
                         if is_clean and is_dirty:
@@ -686,7 +734,11 @@ class Judge:
 
                     # Evaluate against constraints
                     status, violation_message = self._evaluate_dual_constraints(
-                        conflict_rate, grey_rate, dirty_rate, grey_tolerance
+                        conflict_rate,
+                        grey_rate,
+                        dirty_rate,
+                        grey_tolerance,
+                        dirty_rate_prior=dirty_rate_prior,
                     )
 
                     result = DualEvaluationResult(
@@ -713,7 +765,8 @@ class Judge:
                         determined_clean_samples=determined_clean_samples,
                         determined_dirty_samples=determined_dirty_samples,
                         status=status,
-                        violation_message=violation_message
+                        violation_message=violation_message,
+                        dirty_rate_prior=dirty_rate_prior,
                     )
 
                     col_results.append(result)
@@ -761,8 +814,14 @@ class Judge:
 
         return results
 
-    def _evaluate_dual_constraints(self, conflict_rate: float, grey_rate: float,
-                                   dirty_rate: float, grey_tolerance: float) -> Tuple[str, str]:
+    def _evaluate_dual_constraints(
+        self,
+        conflict_rate: float,
+        grey_rate: float,
+        dirty_rate: float,
+        grey_tolerance: float,
+        dirty_rate_prior: Optional[float] = None,
+    ) -> Tuple[str, str]:
         """
         Evaluate if dual rule pair meets hard constraints.
 
@@ -784,10 +843,16 @@ class Judge:
         if grey_rate > grey_tolerance:
             return 'reject_gap', f"Gap zone too large: P_clean AND P_dirty both false (gap_rate={grey_rate:.4f} > {grey_tolerance:.4f})"
 
+        if dirty_rate_prior is not None:
+            prior_limit = min(0.95, float(dirty_rate_prior) * 3.0)
+            if dirty_rate > prior_limit:
+                return 'reject_dirty_prior', f"Dirty rate exceeds prior (dirty_rate={dirty_rate:.4f} > prior={prior_limit:.4f})"
+
         if dirty_rate == 0:
             return 'accept_all_clean', f"Column is clean (dirty_rate={dirty_rate:.4f})"
 
-        return 'accept', f"Valid dual rule (dirty_rate={dirty_rate:.4f})"
+        message = f"Valid dual rule (dirty_rate={dirty_rate:.4f})"
+        return 'accept', message
 
     def _select_refinement_candidate(self, results: List[DualEvaluationResult]) -> DualEvaluationResult:
         """Pick the result that most urgently needs refinement."""
@@ -807,7 +872,8 @@ class Judge:
                                    conflict_samples: List[Dict[str, Any]],
                                    gap_samples: List[Dict[str, Any]],
                                    df: pd.DataFrame, col_metadata: Dict[str, Any],
-                                   factory) -> Dict[str, Tuple[str, str]]:
+                                   factory,
+                                   evaluation_result: Optional[DualEvaluationResult] = None) -> Dict[str, Tuple[str, str]]:
         """
         Generate multiple candidate repairs for a problematic column.
 
@@ -879,17 +945,10 @@ class Judge:
         return candidates
 
     def _score_candidates(self, candidate_results: Dict[str, DualEvaluationResult],
-                         grey_tolerance: float) -> str:
+                         grey_tolerance: float,
+                         dirty_rate_prior: Optional[float] = None) -> str:
         """
-        Score candidates and pick the best.
-
-        Scoring rules (in order):
-        1. conflict_rate == 0 (hard constraint)
-        2. grey_rate <= grey_tolerance (hard constraint)
-        3. Minimize dirty_rate (preference)
-
-        Returns:
-            Best candidate_id or None
+        Score candidates and pick the best based on conflict/grey/dirty rates.
         """
         if not candidate_results:
             return None
@@ -911,8 +970,15 @@ class Judge:
                          ))
             return best_id
 
-        # Among valid, prefer lowest dirty_rate
-        best_id = min(valid.keys(), key=lambda cid: valid[cid].dirty_rate)
+        def candidate_score(result: DualEvaluationResult) -> float:
+            score = float(result.dirty_rate)
+            if dirty_rate_prior is not None:
+                prior_limit = min(0.95, float(dirty_rate_prior) * 3.0)
+                if result.dirty_rate > prior_limit:
+                    score += (result.dirty_rate - prior_limit) * 2.0
+            return score
+
+        best_id = min(valid.keys(), key=lambda cid: candidate_score(valid[cid]))
         return best_id
 
     def _analyze_conflict_topology(self, df: pd.DataFrame, column: str,
@@ -1000,56 +1066,6 @@ class Judge:
         conflict_samples = evaluation_result.conflict_samples
         grey_samples = evaluation_result.grey_samples
 
-        if em_scores:
-            from collections import Counter
-
-            value_counts = Counter()
-            for idx, row in df.iterrows():
-                value_counts[row[column]] += 1
-
-            def build_samples(mask_clean: List[bool], mask_dirty: List[bool],
-                              selector, max_samples: int) -> List[Dict[str, Any]]:
-                indices: List[int] = []
-                for i, row_idx in enumerate(row_indices):
-                    if selector(mask_clean[i], mask_dirty[i]):
-                        indices.append(int(row_idx))
-                if not indices:
-                    return []
-                indices.sort(key=lambda rid: em_scores.get(int(rid), 0.5), reverse=True)
-                indices = indices[:max_samples]
-                samples: List[Dict[str, Any]] = []
-                for rid in indices:
-                    if rid not in df.index:
-                        continue
-                    row = df.loc[rid]
-                    value = row[column]
-                    sample: Dict[str, Any] = {
-                        'row_index': int(rid),
-                        'value': value,
-                        'count': int(value_counts[value]),
-                        'p_error': float(em_scores.get(int(rid), 0.0)),
-                    }
-                    samples.append(sample)
-                return samples
-
-            conflict_samples_em = build_samples(
-                clean_mask,
-                dirty_mask,
-                lambda c, d: c and d,
-                max_samples=10,
-            )
-            grey_samples_em = build_samples(
-                clean_mask,
-                dirty_mask,
-                lambda c, d: (not c) and (not d),
-                max_samples=10,
-            )
-
-            if conflict_samples_em:
-                conflict_samples = conflict_samples_em
-            if grey_samples_em:
-                grey_samples = grey_samples_em
-
         return {
             'column': task.column,
             'conflict_type': task.conflict_type.value,
@@ -1073,7 +1089,8 @@ class Judge:
             evaluation_results = self.evaluate_dual_rules(
                 df,
                 current_rules,
-                grey_tolerance=grey_tolerance
+                grey_tolerance=grey_tolerance,
+                metadata=metadata,
             )
 
             for column, results in evaluation_results.items():
@@ -1086,7 +1103,8 @@ class Judge:
                     'status': result.status,
                     'conflict_rate': result.conflict_rate,
                     'grey_rate': result.grey_rate,
-                    'dirty_rate': result.dirty_rate
+                    'dirty_rate': result.dirty_rate,
+                    'dirty_rate_prior': result.dirty_rate_prior
                 })
 
             if not factory:
@@ -1097,51 +1115,62 @@ class Judge:
                 if not results:
                     continue
                 result = results[0]
-                if result.conflict_rate == 0 and result.grey_rate <= grey_tolerance:
+                if result.status in ("accept", "accept_all_clean"):
                     next_rules[column] = [
                         (result.rule.agent_name, result.rule.clean_rule_str, result.rule.dirty_rule_str)
                     ]
                     continue
 
-                em_scores: Optional[Dict[int, float]] = None
-                try:
-                    from dual_types import CleanRule, CleanRuleSet
-
-                    clean_rule = CleanRule(
-                        name="P_clean",
-                        rule_str=result.rule.clean_rule_str,
-                        rule_func=result.rule.clean_rule_func,
-                        version=0,
-                        modification_log=[],
+                candidates = self._generate_repair_candidates(
+                    column,
+                    result.rule.clean_rule_str,
+                    result.rule.dirty_rule_str,
+                    result.conflict_samples,
+                    result.grey_samples,
+                    df,
+                    metadata.get(column, {}),
+                    factory,
+                    evaluation_result=result,
+                )
+                if candidates:
+                    candidate_ids = list(candidates.keys())
+                    candidate_rules = [
+                        (result.rule.agent_name, candidates[cid][0], candidates[cid][1])
+                        for cid in candidate_ids
+                    ]
+                    candidate_payload = {column: candidate_rules}
+                    candidate_eval = self.evaluate_dual_rules(
+                        df,
+                        candidate_payload,
+                        grey_tolerance=grey_tolerance,
+                        metadata=metadata,
                     )
-                    dirty_rule = CleanRule(
-                        name="P_dirty",
-                        rule_str=result.rule.dirty_rule_str,
-                        rule_func=result.rule.dirty_rule_func,
-                        version=0,
-                        modification_log=[],
+                    candidate_results: Dict[str, DualEvaluationResult] = {}
+                    if column in candidate_eval:
+                        for idx, cand_result in enumerate(candidate_eval[column]):
+                            if idx < len(candidate_ids):
+                                candidate_results[candidate_ids[idx]] = cand_result
+                    best_id = self._score_candidates(
+                        candidate_results,
+                        grey_tolerance,
+                        dirty_rate_prior=result.dirty_rate_prior,
                     )
-                    rule_set = CleanRuleSet(
-                        column=column,
-                        clean_rules={"P_clean": clean_rule},
-                        dirty_rules={"P_dirty": dirty_rule},
-                    )
-                    em_result = self.em_label_model_column(df, column, rule_set)
-                    row_indices = em_result.get("row_indices", [])
-                    posteriors = em_result.get("posteriors", [])
-                    em_scores = {
-                        int(idx): float(p)
-                        for idx, p in zip(row_indices, posteriors)
-                    }
-                except Exception:
-                    em_scores = None
+                    if best_id and best_id in candidate_results:
+                        picked = candidate_results[best_id]
+                        current_penalty = result.conflict_rate + result.grey_rate
+                        picked_penalty = picked.conflict_rate + picked.grey_rate
+                        if picked.status in ("accept", "accept_all_clean") or picked_penalty <= current_penalty:
+                            next_rules[column] = [
+                                (picked.rule.agent_name, picked.rule.clean_rule_str, picked.rule.dirty_rule_str)
+                            ]
+                            continue
 
                 task = self._generate_refinement_task(
                     df,
                     column,
                     result,
                     metadata.get(column, {}),
-                    em_scores=em_scores,
+                    em_scores=None,
                 )
                 updated = self._execute_refinement_with_fallback(
                     df,
@@ -1247,6 +1276,8 @@ class Judge:
                 print(f"  Clean Rate: {result.clean_rate:.4f} ({result.determined_clean_count}/{result.total_rows})")
                 print(f"  Gap Rate (both false): {result.grey_rate:.4f} ({result.grey_count}/{result.total_rows})")
                 print(f"  Conflict Rate (both true): {result.conflict_rate:.4f} ({result.conflict_count}/{result.total_rows})")
+                if result.dirty_rate_prior is not None:
+                    print(f"  Dirty Rate Prior: {result.dirty_rate_prior:.4f}")
                 print(f"\n  P_clean: {rule.clean_rule_str}")
                 print(f"  P_dirty: {rule.dirty_rule_str}")
 
@@ -1288,6 +1319,7 @@ class Judge:
                     'clean_rate': result.clean_rate,
                     'grey_rate': result.grey_rate,
                     'conflict_rate': result.conflict_rate,
+                    'dirty_rate_prior': result.dirty_rate_prior,
                     'violation_message': result.violation_message,
                     'counts': {
                         'conflict': result.conflict_count,
@@ -1592,18 +1624,6 @@ class Judge:
                 })
                 break
 
-            em_scores: Dict[int, float] = {}
-            try:
-                em_result = self.em_label_model_column(df, column, rule_set)
-                row_indices = em_result.get("row_indices", [])
-                posteriors = em_result.get("posteriors", [])
-                em_scores = {
-                    int(idx): float(p)
-                    for idx, p in zip(row_indices, posteriors)
-                }
-            except Exception as e:
-                console_fn(f"  ⚠ EM label model failed for column {column}: {e}")
-
             console_fn("  Resolving gaps...")
             gap_resolver = GapResolver(memory, factory, violation_threshold=self.violation_threshold)
             rule_set = gap_resolver.resolve(
@@ -1612,7 +1632,7 @@ class Judge:
                 rule_set,
                 metadata=metadata,
                 round_num=round_num,
-                em_scores=em_scores or None,
+                em_scores=None,
             )
 
             console_fn("  Resolving conflicts...")
@@ -1623,7 +1643,7 @@ class Judge:
                 rule_set,
                 metadata=metadata,
                 round_num=round_num,
-                em_scores=em_scores or None,
+                em_scores=None,
             )
 
             # Recompile functions after refinement
@@ -1681,175 +1701,6 @@ class Judge:
         history['log_file'] = logger.path if hasattr(logger, 'path') else None
 
         return rule_set, history
-
-    def em_label_model_column(
-        self,
-        df: pd.DataFrame,
-        column: str,
-        rule_set: 'CleanRuleSet',
-        pi: float = 0.05,
-        max_iter: int = 20,
-        tol: float = 1e-3,
-        a1: float = 1.0,
-        b1: float = 1.0,
-        a0: float = 1.0,
-        b0: float = 1.0,
-    ) -> Dict[str, Any]:
-        from dual_types import CleanRuleSet
-
-        rule_set = self._compile_rule_functions(rule_set)
-
-        if column not in df.columns:
-            raise ValueError(f"Column '{column}' not found in DataFrame")
-
-        n = len(df)
-        if n == 0:
-            return {
-                "column": column,
-                "row_indices": [],
-                "posteriors": [],
-                "rule_params": {},
-                "iterations": 0,
-            }
-
-        clean_rules = list(rule_set.clean_rules.values())
-        dirty_rules = list(rule_set.dirty_rules.values())
-        rules = clean_rules + dirty_rules
-
-        if not rules:
-            return {
-                "column": column,
-                "row_indices": list(df.index.astype(int)),
-                "posteriors": [float(pi)] * n,
-                "rule_params": {},
-                "iterations": 0,
-            }
-
-        num_rules = len(rules)
-        polarities = np.concatenate(
-            [
-                np.full(len(clean_rules), -1, dtype=int),
-                np.full(len(dirty_rules), 1, dtype=int),
-            ]
-        )
-
-        Z = np.zeros((num_rules, n), dtype=np.int8)
-        row_indices = list(df.index)
-
-        for j, rule in enumerate(rules):
-            for i, idx in enumerate(row_indices):
-                row = df.loc[idx]
-                value = row[column]
-                try:
-                    pred = self._invoke_predicate(rule.rule_func, value, row)
-                except Exception:
-                    pred = False
-                if polarities[j] == 1:
-                    z = 1 if pred else 0
-                else:
-                    z = 0 if pred else 1
-                Z[j, i] = z
-
-        alpha = np.full(num_rules, 0.9, dtype=float)
-        beta = np.full(num_rules, 0.9, dtype=float)
-        p = np.full(n, pi, dtype=float)
-
-        iterations = 0
-        for iteration in range(max_iter):
-            iterations += 1
-
-            log_p1 = np.log(pi) * np.ones(n, dtype=float)
-            log_p0 = np.log(1.0 - pi) * np.ones(n, dtype=float)
-
-            for j in range(num_rules):
-                z_j = Z[j].astype(float)
-                log_p1 += z_j * np.log(alpha[j]) + (1.0 - z_j) * np.log(1.0 - alpha[j])
-                log_p0 += z_j * np.log(1.0 - beta[j]) + (1.0 - z_j) * np.log(beta[j])
-
-            max_log = np.maximum(log_p1, log_p0)
-            log_p1_adj = log_p1 - max_log
-            log_p0_adj = log_p0 - max_log
-            exp_p1 = np.exp(log_p1_adj)
-            exp_p0 = np.exp(log_p0_adj)
-            denom = exp_p1 + exp_p0 + 1e-12
-            new_p = exp_p1 / denom
-
-            delta = float(np.max(np.abs(new_p - p)))
-            p = new_p
-
-            w1 = p
-            w0 = 1.0 - p
-
-            for j in range(num_rules):
-                z_j = Z[j].astype(float)
-                N11 = float(np.sum(w1 * z_j))
-                N10 = float(np.sum(w1 * (1.0 - z_j)))
-                N01 = float(np.sum(w0 * z_j))
-                N00 = float(np.sum(w0 * (1.0 - z_j)))
-
-                alpha[j] = (N11 + a1) / (N11 + N10 + a1 + b1 + 1e-12)
-                beta[j] = (N00 + a0) / (N00 + N01 + a0 + b0 + 1e-12)
-
-            if delta < tol:
-                break
-
-        rule_params: Dict[str, Any] = {}
-        for idx_rule, rule in enumerate(rules):
-            rule_params[rule.name] = {
-                "alpha": float(alpha[idx_rule]),
-                "beta": float(beta[idx_rule]),
-                "polarity": int(polarities[idx_rule]),
-            }
-
-        posteriors = [float(x) for x in p]
-        row_indices_int = [int(i) for i in row_indices]
-
-        return {
-            "column": column,
-            "row_indices": row_indices_int,
-            "posteriors": posteriors,
-            "rule_params": rule_params,
-            "iterations": iterations,
-        }
-
-    def prune_rules_by_em(
-        self,
-        df: pd.DataFrame,
-        column: str,
-        rule_set: 'CleanRuleSet',
-        reliability_threshold: float = 0.6,
-        **em_kwargs: Any,
-    ) -> Tuple['CleanRuleSet', Dict[str, Any]]:
-        from dual_types import CleanRuleSet
-
-        em_result = self.em_label_model_column(df, column, rule_set, **em_kwargs)
-        rule_params = em_result.get("rule_params", {})
-
-        clean_rules = {}
-        for name, rule in rule_set.clean_rules.items():
-            params = rule_params.get(name)
-            if not params:
-                continue
-            reliability = min(params["alpha"], params["beta"])
-            if reliability >= reliability_threshold:
-                clean_rules[name] = rule
-
-        dirty_rules = {}
-        for name, rule in rule_set.dirty_rules.items():
-            params = rule_params.get(name)
-            if not params:
-                continue
-            reliability = min(params["alpha"], params["beta"])
-            if reliability >= reliability_threshold:
-                dirty_rules[name] = rule
-
-        pruned_rule_set = CleanRuleSet(
-            column=column,
-            clean_rules=clean_rules,
-            dirty_rules=dirty_rules,
-        )
-
-        return pruned_rule_set, em_result
 
     def _compile_rule_functions(self, rule_set: 'CleanRuleSet') -> 'CleanRuleSet':
         """Compile rule functions from strings."""

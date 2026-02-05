@@ -89,16 +89,6 @@ class GapResolver:
             em_scores=em_scores,
         )
 
-        if em_scores:
-            clean_samples = sorted(
-                clean_samples,
-                key=lambda s: (s.get('p_error') is None, s.get('p_error', 0.0))
-            )
-            dirty_samples = sorted(
-                dirty_samples,
-                key=lambda s: (s.get('p_error') is None, -s.get('p_error', 0.0))
-            )
-
         if not gap_samples:
             # End logging without modifications
             self.logger.end_column_refinement(
@@ -257,12 +247,6 @@ class GapResolver:
     def _get_top_gaps(self, gap_samples: List[Dict], k: int = 10) -> List[Dict]:
         if not gap_samples:
             return []
-        if 'p_error' in gap_samples[0] and gap_samples[0].get('p_error') is not None:
-            sorted_samples = sorted(
-                gap_samples,
-                key=lambda s: (-s.get('p_error', 0.0), s['row_index'])
-            )
-            return sorted_samples[:k]
         value_freq = Counter([s['value'] for s in gap_samples])
         top_values = [v for v, _ in value_freq.most_common(k)]
         return [s for s in gap_samples if s['value'] in top_values]

@@ -47,6 +47,7 @@ class DualEvaluationResult:
     # Status
     status: str  # 'accept', 'reject_conflict', 'reject_grey', 'reject_all_dirty', 'reject_all_clean'
     violation_message: str = ""
+    dirty_rate_prior: Optional[float] = None
 
 
 @dataclass

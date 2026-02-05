@@ -371,7 +371,8 @@ def run_dual_mode(args: argparse.Namespace) -> None:
         evaluation_results = judge.evaluate_dual_rules(
             profiler.df,
             evaluation_payload,
-            grey_tolerance=args.grey_tolerance
+            grey_tolerance=args.grey_tolerance,
+            metadata=metadata
         )
         detected_dirty_values = judge.get_detected_dirty_values(best_rules, profiler.df)
         judge.print_dual_summary(best_rules, evaluation_results)

@@ -113,6 +113,46 @@ class BaseAgent:
         }
 
 
+class RuleReviewerAgent(BaseAgent):
+    def _get_system_prompt(self) -> str:
+        return "You are a data quality reviewer. Rewrite or suggest a safer Python lambda rule. Return ONLY one lambda expression."
+
+    @staticmethod
+    def _extract_lambda(text: str) -> Optional[str]:
+        if not text:
+            return None
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("lambda"):
+                return line
+        return None
+
+    def suggest_rule_fix(
+        self,
+        column: str,
+        metadata: Dict[str, Any],
+        clean_rule_str: str,
+        dirty_rule_str: str,
+        stats: Dict[str, Any],
+        samples: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        column_type = metadata.get("type", "unknown")
+        top_values = metadata.get("normalized_top_values") or metadata.get("top_values") or []
+        prompt = "\n".join([
+            "Review the current dirty rule and suggest a safer but less aggressive rewrite.",
+            f"Column: {column}",
+            f"Type: {column_type}",
+            f"Stats: {json.dumps(stats, ensure_ascii=False)}",
+            f"Top values: {json.dumps(top_values[:8], ensure_ascii=False)}",
+            f"Samples: {json.dumps(samples, ensure_ascii=False)}",
+            f"P_clean: {clean_rule_str}",
+            f"P_dirty: {dirty_rule_str}",
+            "Return only one Python lambda expression."
+        ])
+        response = self._call_llm(prompt, temperature=0.2)
+        return self._extract_lambda(response)
+
+
 class MissingAgent(BaseAgent):
     """Agent focused on detecting missing/null values with batch annotation."""
 
@@ -845,7 +885,7 @@ IMPORTANT GUIDELINES:
 2. For numeric: check reasonable value ranges based on statistics with tolerance
 3. For text: check reasonable length and character constraints
 4. NOTE: Top categorical values are **not the only valid values**
-5. Be STRINGENT - only accept values that are definitely ACCURATE and follow the expected domain format. Any deviation should be rejected.
+5. Be PERMISSIVE - accept all values that look reasonably valid for the domain. Do not overfit to the top values provided. Only reject values that are clearly malformed or impossible.
 
 Return ONLY lambda functions, one per line. Format:
 lambda value, row=None: <expression>
@@ -943,7 +983,7 @@ Rules should:
 1. Check expected format
 2. Ensure consistent structure across values
 3. Validate character types for the field type
-4.Be STRINGENT - only accept values that are definitely ACCURATE and follow the expected domain format. Any deviation should be rejected.
+4. Be PERMISSIVE - accept all values that look reasonably valid for the domain. Do not overfit to the top values provided. Only reject values that are clearly malformed or impossible.
 
 Return ONLY lambda functions, one per line. Format:
 lambda value, row=None: <expression>
@@ -1651,6 +1691,9 @@ class AgentFactory:
         self.base_url = base_url
         self.model = model
         self.max_workers = max_workers or 1
+
+    def create_rule_reviewer(self) -> RuleReviewerAgent:
+        return RuleReviewerAgent(self.base_url, self.model)
 
     def create_agents(self, column: str, column_type: str) -> List[BaseAgent]:
         """Create appropriate agents for a column based on its type."""

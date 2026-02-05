@@ -289,16 +289,15 @@ class RefinementLogger:
                 for pillar_name, rule in rules:
                     self._log(f"    [{pillar_name}]")
                     self._log(f"      Rule: {rule}")
-                    if clean_prompts and column in clean_prompts:
-                        col_prompts = clean_prompts[column]
-                        if pillar_name in col_prompts:
-                            prompt_info = col_prompts[pillar_name]
-                            prompt_text = prompt_info.get("prompt")
-                            response_text = prompt_info.get("response")
-                            if prompt_text:
-                                self.set_prompt(prompt_text)
-                            if response_text:
-                                self.set_response(response_text)
+                if clean_prompts and column in clean_prompts:
+                    col_prompts = clean_prompts[column]
+                    for pillar_name, prompt_info in col_prompts.items():
+                        prompt_text = prompt_info.get("prompt")
+                        response_text = prompt_info.get("response")
+                        if prompt_text:
+                            self.set_prompt(prompt_text)
+                        if response_text:
+                            self.set_response(response_text)
         self._log("--- DIRTY RULES (Agent Rules) ---")
         if dirty_rules:
             for column, rules in dirty_rules.items():
@@ -306,16 +305,15 @@ class RefinementLogger:
                 for agent_name, rule in rules:
                     self._log(f"    [{agent_name}]")
                     self._log(f"      Rule: {rule}")
-                    if dirty_prompts and column in dirty_prompts:
-                        col_prompts = dirty_prompts[column]
-                        if agent_name in col_prompts:
-                            prompt_info = col_prompts[agent_name]
-                            prompt_text = prompt_info.get("prompt")
-                            response_text = prompt_info.get("response")
-                            if prompt_text:
-                                self.set_prompt(prompt_text)
-                            if response_text:
-                                self.set_response(response_text)
+                if dirty_prompts and column in dirty_prompts:
+                    col_prompts = dirty_prompts[column]
+                    for agent_name, prompt_info in col_prompts.items():
+                        prompt_text = prompt_info.get("prompt")
+                        response_text = prompt_info.get("response")
+                        if prompt_text:
+                            self.set_prompt(prompt_text)
+                        if response_text:
+                            self.set_response(response_text)
         else:
             self._log("  No dirty rules generated")
         self._log("=" * 60)
