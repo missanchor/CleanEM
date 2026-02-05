@@ -1,0 +1,13 @@
+{
+  "col_type": {
+    "id": "pattern",
+    "beer_name": "categorical",
+    "style": "categorical",
+    "ounces": "categorical",
+    "abv": "numeric",
+    "brewery_id": "categorical",
+    "brewery_name": "categorical",
+    "city": "categorical",
+    "state": "categorical"
+  }
+}

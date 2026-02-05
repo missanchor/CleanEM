@@ -9,6 +9,7 @@ __pycache__/
 .claude/
 .cursor/
 .conda/
+.trae/
 .DS_Store
 
 *.log
@@ -18,8 +19,5 @@ cc.en.300.bin
 cc.en.300.bin.gz
 env.yml
 env_cuda12.yml
-report_inspect_summaries.json
-report_inspect_summaries.pretty.json
-report_inspect_summaries.summary.txt
 condaenv.y2o1848c.requirements.txt
 condaenv.tzdrm5c5.requirements.txt

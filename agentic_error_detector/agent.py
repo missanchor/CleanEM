@@ -1856,9 +1856,9 @@ class AgentFactory:
         Returns:
             List[(agent_name, rule_string)]
         """
-        logic_agent = LogicLegislator(self.base_url, self.model)
+        logic_agent = LogicAgent(self.base_url, self.model)
         rules = logic_agent.generate_rules({}, metadata)
-        return [("LogicLegislator", rule) for rule in rules]
+        return [("LogicAgent", rule) for rule in rules]
 
     def generate_dual_rules_per_column(self, metadata: Dict[str, Any],
                                       base_rules: Dict[str, List[Tuple[str, str]]] = None,

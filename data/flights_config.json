@@ -1,0 +1,10 @@
+{
+  "col_type": {
+    "src": "categorical",
+    "flight": "categorical",
+    "sched_dep_time": "categorical",
+    "act_dep_time": "categorical",
+    "sched_arr_time": "categorical",
+    "act_arr_time": "categorical"
+  }
+}

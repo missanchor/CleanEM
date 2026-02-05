@@ -1,0 +1,66 @@
+{
+  "experiment": "corruption",
+  "device": "cpu",
+  "seed": 123,
+  "mock_data": {
+    "type": "employee",
+    "num_samples": 80,
+    "name": "mock-employee",
+    "seed": 123
+  },
+  "num_epochs": 5,
+  "batch_size": 8,
+  "corruption_prob": 0.3,
+  "tabular_processor": {
+    "d_cell": 64
+  },
+  "text_processor": {
+    "max_seq_len": 128
+  },
+  "tabular_encoder": {
+    "type": "StructureAwareTransformer",
+    "params": {
+      "d_cell": 64,
+      "d_model": 256,
+      "nhead": 8,
+      "num_layers": 2,
+      "dim_feedforward": 512,
+      "dropout": 0.1
+    }
+  },
+  "text_encoder": {
+    "type": "PretrainedTextEncoder",
+    "params": {
+      "vocab_size": 30522,
+      "d_model": 256,
+      "nhead": 8,
+      "num_layers": 2,
+      "max_seq_len": 128,
+      "dropout": 0.1
+    }
+  },
+  "fusion_module": {
+    "type": "CrossAttentionFusion",
+    "params": {
+      "d_model": 256,
+      "nhead": 8,
+      "dropout": 0.1
+    }
+  },
+  "detection_head": {
+    "type": "MLPDetectionHead",
+    "params": {
+      "d_input": 256,
+      "hidden_dim": 128,
+      "output_dim": 1
+    }
+  },
+  "optimizer": {
+    "type": "Adam",
+    "params": {
+      "lr": 0.0001
+    }
+  }
+}
+
+

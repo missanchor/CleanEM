@@ -1,0 +1,21 @@
+{
+  "col_type": {
+    "ProviderNumber": "categorical",
+    "HospitalName": "categorical",
+    "Address": "categorical",
+    "City": "categorical",
+    "State": "categorical",
+    "ZipCode": "pattern",
+    "CountyName": "categorical",
+    "PhoneNumber": "pattern",
+    "HospitalType": "categorical",
+    "HospitalOwner": "categorical",
+    "EmergencyService": "categorical",
+    "Condition": "categorical",
+    "MeasureCode": "pattern",
+    "MeasureName": "categorical",
+    "Score": "numeric",
+    "Sample": "categorical",
+    "Stateavg": "categorical"
+  }
+}

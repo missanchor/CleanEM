@@ -1,0 +1,134 @@
+{
+  "experiment": "ablation",
+  "device": "cpu",
+  "seed": 42,
+  "dataset": "beers_error-01",
+  "data_path": "data/beers_error-01.csv",
+  "num_epochs": 5,
+  "batch_size": 16,
+  "corruption_prob": 0.3,
+  "evaluation": {
+    "clean_data_path": "data/beers_clean.csv",
+    "dirty_data_path": "data/beers_error-01.csv"
+  },
+  "tabular_processor": {
+    "d_cell": 64
+  },
+  "text_processor": {
+    "max_seq_len": 256,
+    "tokenizer_name_or_path": "/data/nw/modelscope_models/Qwen2.5-0.5B-Instruct",
+    "tokenizer_kwargs": {
+      "trust_remote_code": true
+    }
+  },
+  "variants": [
+    {
+      "name": "StructureAware + CrossAttention",
+      "tabular_encoder": {
+        "type": "StructureAwareTransformer",
+        "params": {
+        "d_cell": 64,
+        "d_model": 256,
+        "nhead": 8,
+        "num_layers": 2,
+        "dim_feedforward": 512,
+        "dropout": 0.1
+        }
+      },
+      "fusion_module": {
+        "type": "CrossAttentionFusion",
+        "params": {
+          "d_model": 256,
+          "nhead": 8,
+          "dropout": 0.1
+        }
+      }
+    },
+    {
+      "name": "SimpleMLP + CrossAttention",
+      "tabular_encoder": {
+        "type": "SimpleMLPEncoder",
+        "params": {
+          "d_cell": 64,
+          "d_model": 256,
+          "num_layers": 2
+        }
+      },
+      "fusion_module": {
+        "type": "CrossAttentionFusion",
+        "params": {
+          "d_model": 256,
+          "nhead": 8,
+          "dropout": 0.1
+        }
+      }
+    },
+    {
+      "name": "StructureAware + SimpleConcat",
+      "tabular_encoder": {
+        "type": "StructureAwareTransformer",
+        "params": {
+          "d_cell": 64,
+          "d_model": 256,
+          "nhead": 8,
+          "num_layers": 2,
+          "dim_feedforward": 512,
+          "dropout": 0.1
+        }
+      },
+      "fusion_module": {
+        "type": "SimpleConcatFusion",
+        "params": {
+          "d_model": 256
+        }
+      }
+    },
+    {
+      "name": "SimpleMLP + SimpleConcat",
+      "tabular_encoder": {
+        "type": "SimpleMLPEncoder",
+        "params": {
+          "d_cell": 64,
+          "d_model": 256,
+          "num_layers": 2
+        }
+      },
+      "fusion_module": {
+        "type": "SimpleConcatFusion",
+        "params": {
+          "d_model": 256
+        }
+      }
+    }
+  ],
+  "text_encoder": {
+    "type": "PretrainedTextEncoder",
+    "params": {
+      "d_model": 256,
+      "nhead": 8,
+      "num_layers": 2,
+      "max_seq_len": 256,
+      "dropout": 0.1,
+      "model_name_or_path": "/mnt/data/welkinni/Qwen2.5-3B/qwen/Qwen2.5-3B",
+      "trust_remote_code": true,
+      "output_proj_dim": 256,
+      "freeze_pretrained": true
+    }
+  },
+  "detection_head": {
+    "type": "MLPDetectionHead",
+    "params": {
+      "d_input": 256,
+      "hidden_dim": 128,
+      "output_dim": 1
+    }
+  },
+  "optimizer": {
+    "type": "Adam",
+    "params": {
+      "lr": 0.0001
+    }
+  }
+}
+
+
