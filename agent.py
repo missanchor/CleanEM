@@ -601,6 +601,171 @@ Return ONLY the lambda functions, one per line. Each function accepts a row (dic
 Be STRINGENT - only accept values that are definitely ACCURATE and follow the expected domain format. Any deviation should be rejected.
 """
 
+
+class DirtyExampleAgent(BaseAgent):
+    def generate_dirty_examples(
+        self,
+        column: str,
+        metadata: Dict[str, Any],
+        clean_seeds: List[Any],
+        error_family: str,
+        max_examples: int = 50,
+    ) -> List[Dict[str, Any]]:
+        column_type = metadata.get("type", "text")
+        prompt_lines = [
+            f"Generate synthetic DIRTY examples for column '{column}'.",
+            f"Error family: {error_family}",
+            f"Column type: {column_type}",
+            f"Clean seed examples: {json.dumps(clean_seeds[:20], ensure_ascii=False)}",
+            f"Metadata: {json.dumps({k: v for k, v in metadata.items() if k in ['min','max','mean','std','quantiles','top_values','pattern_analysis','length_distribution','shape_distribution']}, ensure_ascii=False)}",
+            "",
+            "Return JSON array. Each item must have:",
+            "  value: the dirty value",
+            "  reason: short text reason",
+            "The error type is implicitly given by error_family and should not be repeated.",
+            "",
+            "Example:",
+            '[{"value": "N/A", "reason": "placeholder missing token"}, {"value": "", "reason": "empty string"}]',
+        ]
+        prompt = "\n".join(prompt_lines)
+        response = self._call_llm(prompt, temperature=0.3)
+        examples: List[Dict[str, Any]] = []
+        try:
+            match = re.search(r"\[[\s\S]*\]", response)
+            if match:
+                items = json.loads(match.group())
+                if isinstance(items, list):
+                    for item in items[:max_examples]:
+                        val = item.get("value")
+                        reason = item.get("reason") or ""
+                        examples.append(
+                            {
+                                "value": val,
+                                "label": 1,
+                                "error_family": error_family,
+                                "reason": reason,
+                            }
+                        )
+        except Exception:
+            examples = []
+        if examples:
+            return examples
+        return self._fallback_dirty_examples(column, metadata, clean_seeds, error_family, max_examples)
+
+    def _fallback_dirty_examples(
+        self,
+        column: str,
+        metadata: Dict[str, Any],
+        clean_seeds: List[Any],
+        error_family: str,
+        max_examples: int,
+    ) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        column_type = metadata.get("type", "text")
+        seeds = [v for v in clean_seeds if v is not None]
+        seeds = seeds[: max_examples] if seeds else seeds
+        if error_family == "missing":
+            tokens = metadata.get("dominant_missing_tokens") or []
+            if not tokens:
+                tokens = ["", "nan", "none", "null", "n/a", "na", "unknown"]
+            for t in tokens[:max_examples]:
+                results.append(
+                    {
+                        "value": t,
+                        "label": 1,
+                        "error_family": error_family,
+                        "reason": "common missing token",
+                    }
+                )
+        elif error_family == "outlier":
+            min_val = metadata.get("min")
+            max_val = metadata.get("max")
+            mean_val = metadata.get("mean")
+            std_val = metadata.get("std") or 1.0
+            if column_type == "numeric" and min_val is not None and max_val is not None:
+                extreme_low = float(min_val) - 5 * float(std_val or 1.0)
+                extreme_high = float(max_val) + 5 * float(std_val or 1.0)
+                results.append(
+                    {
+                        "value": extreme_low,
+                        "label": 1,
+                        "error_family": error_family,
+                        "reason": "extreme low outlier",
+                    }
+                )
+                results.append(
+                    {
+                        "value": extreme_high,
+                        "label": 1,
+                        "error_family": error_family,
+                        "reason": "extreme high outlier",
+                    }
+                )
+                if mean_val is not None:
+                    results.append(
+                        {
+                            "value": float(mean_val) * 10.0,
+                            "label": 1,
+                            "error_family": error_family,
+                            "reason": "order-of-magnitude error",
+                        }
+                    )
+            else:
+                results.append(
+                    {
+                        "value": "INVALID_OUTLIER",
+                        "label": 1,
+                        "error_family": error_family,
+                        "reason": "synthetic categorical outlier",
+                    }
+                )
+        elif error_family == "pattern":
+            pattern_hint = (metadata.get("pattern_analysis") or "").lower()
+            base = None
+            if seeds:
+                base = str(seeds[0])
+            if base:
+                results.append(
+                    {
+                        "value": base + "X",
+                        "label": 1,
+                        "error_family": error_family,
+                        "reason": "extra character",
+                    }
+                )
+                results.append(
+                    {
+                        "value": base[:-1] if len(base) > 1 else "",
+                        "label": 1,
+                        "error_family": error_family,
+                        "reason": "truncated pattern",
+                    }
+                )
+            elif "zip" in pattern_hint or "postal" in pattern_hint:
+                results.append(
+                    {
+                        "value": "12-345",
+                        "label": 1,
+                        "error_family": error_family,
+                        "reason": "wrong separator",
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "value": "???",
+                        "label": 1,
+                        "error_family": error_family,
+                        "reason": "generic malformed pattern",
+                    }
+                )
+        trimmed: List[Dict[str, Any]] = []
+        for ex in results:
+            if len(trimmed) >= max_examples:
+                break
+            trimmed.append(ex)
+        return trimmed
+
     def generate_rules(self, row_data: Dict[str, Any], all_metadata: Dict[str, Any]) -> List[str]:
         """
         Generate rules for logical consistency across columns.
@@ -1141,6 +1306,60 @@ lambda value, row=None: <expression>
                 )
 
         return rules
+
+
+class CleanRuleReflectionAgent(BaseAgent):
+    def _get_system_prompt(self) -> str:
+        return """You are a data quality expert specializing in refining CLEAN validation rules.
+Your job is to slightly rewrite an existing clean rule so that:
+- It returns True for clearly CLEAN/normal values
+- It returns False for clearly DIRTY/abnormal values
+You are given the current rule and examples where it misbehaves."""
+
+    @staticmethod
+    def _extract_lambda(text: str) -> Optional[str]:
+        if not text:
+            return None
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("lambda"):
+                return line
+        return None
+
+    def refine_clean_rule(
+        self,
+        column: str,
+        metadata: Dict[str, Any],
+        family: str,
+        rule_str: str,
+        clean_mis_examples: List[Dict[str, Any]],
+        dirty_mis_examples: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        column_type = metadata.get("type", "unknown")
+        top_values = metadata.get("normalized_top_values") or metadata.get("top_values") or []
+        prompt_parts = [
+            f"Column: {column}",
+            f"Column type: {column_type}",
+            f"Error family: {family}",
+            f"Current clean rule (returns True for normal/clean values): {rule_str}",
+            "Clean examples that SHOULD return True but currently return False:",
+            json.dumps(clean_mis_examples[:10], ensure_ascii=False),
+            "Dirty examples that SHOULD return False but currently return True:",
+            json.dumps(dirty_mis_examples[:10], ensure_ascii=False),
+            "Representative frequent values in this column:",
+            json.dumps(top_values[:8], ensure_ascii=False),
+            "Task:",
+            "Rewrite the clean rule as a single Python lambda expression.",
+            "Requirements:",
+            "- Keep the semantics: True = value is clean/normal, False = value is abnormal.",
+            "- Make the rule less aggressive on clean examples and more strict on dirty ones.",
+            "- Handle None/NaN and empty strings safely.",
+            "Return ONLY one lambda in the exact format:",
+            "lambda value, row=None: <boolean expression>",
+        ]
+        prompt = "\n".join(prompt_parts)
+        response = self._call_llm(prompt, temperature=0.2)
+        return self._extract_lambda(response)
 
 
 class DualAgent(BaseAgent):
@@ -1867,9 +2086,7 @@ class AgentFactory:
         Returns:
             List[(agent_name, rule_string)]
         """
-        logic_agent = LogicAgent(self.base_url, self.model)
-        rules = logic_agent.generate_rules({}, metadata)
-        return [("LogicAgent", rule) for rule in rules]
+        return []
 
     def generate_dual_rules_per_column(self, metadata: Dict[str, Any],
                                       base_rules: Dict[str, List[Tuple[str, str]]] = None,

@@ -382,10 +382,22 @@ class Judge:
         """
         # Create ground truth error set
         ground_truth_errors = set()
+
+        # Ensure clean_df has the same columns as dirty_df (best-effort intersection)
+        common_columns = [col for col in dirty_df.columns if col in clean_df.columns]
+        if len(common_columns) != len(dirty_df.columns):
+            missing_cols = set(dirty_df.columns) - set(clean_df.columns)
+            if missing_cols:
+                print(f"Warning: clean_df is missing columns: {missing_cols}")
+
         for idx in range(len(dirty_df)):
-            for col in dirty_df.columns:
-                dirty_val = dirty_df.iloc[idx][col]
-                clean_val = clean_df.iloc[idx][col]
+            dirty_row = dirty_df.iloc[idx]
+            clean_row = clean_df.iloc[idx]
+            for col in common_columns:
+                if col not in clean_row.index:
+                    continue
+                dirty_val = dirty_row[col]
+                clean_val = clean_row[col]
                 if str(dirty_val).strip() != str(clean_val).strip():
                     ground_truth_errors.add((idx, col))
 
