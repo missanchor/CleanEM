@@ -30,12 +30,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dirty_csv",
-        default="data/hospital_error-01.csv",
+        default="data/flights_error-01.csv",
         help="Path to the dirty/error-prone CSV that needs inspection."
     )
     parser.add_argument(
         "--clean_csv",
-        default="data/hospital_clean.csv",
+        default="data/flights_clean.csv",
         help="Optional clean CSV for evaluation against ground truth."
     )
     parser.add_argument(
@@ -138,7 +138,10 @@ def _invoke_rule(rule_func, value, row) -> bool:
     try:
         return bool(rule_func(value, row))
     except TypeError:
-        return bool(rule_func(value))
+        try:
+            return bool(rule_func(value))
+        except Exception:
+            return False
     except Exception:
         return False
 
@@ -623,7 +626,7 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         s_missing = scores.get("S_missing", 0.0)
         s_outlier = scores.get("S_outlier", 0.0)
         s_pattern = scores.get("S_pattern", 0.0)
-        s_total = max(s_missing, s_outlier, s_pattern)
+        s_total = (s_missing + s_outlier + s_pattern) / 3.0
         results.append(
             {
                 "row_index": row_idx,
