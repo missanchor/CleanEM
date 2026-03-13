@@ -6,8 +6,10 @@ Supports a dual verification pipeline with clean rule-level refinement.
 import argparse
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Any, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime
 
 import numpy as np
@@ -15,13 +17,41 @@ import pandas as pd
 
 from judge import Judge
 from agent import AgentFactory, DirtyExampleAgent, CleanRuleReflectionAgent
-from profiler import PandasProfiler
+from profiler import PandasProfiler, DEFAULT_MISSING_TOKEN_SET
 from validator import DisjointnessValidator
 from core.utils import safe_dict
 
 
 # CleanEM Logger
 cleanem_logger = logging.getLogger("CleanEM")
+
+FAMILIES = ["missing", "outlier", "pattern"]
+FAMILY_SCORE_KEYS = {
+    "missing": "S_missing",
+    "outlier": "S_outlier",
+    "pattern": "S_pattern",
+}
+ANCHOR_HARD_CLEAN = "hard_clean"
+ANCHOR_HARD_DIRTY = "hard_dirty"
+ANCHOR_UNLABELED = "unlabeled"
+ANCHOR_ABSTAIN = "abstain"
+
+
+@dataclass
+class GroupRecord:
+    normalized_signature: str
+    row_indices: List[int]
+    weight: int
+    rule_outputs_by_family: Dict[str, np.ndarray]
+    anchor_state: str
+    anchor_source: str
+    representative_value: Any
+
+
+@dataclass
+class FamilyRunStatus:
+    status: str
+    reason: str = ""
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,12 +60,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dirty_csv",
-        default="data/flights_error-01.csv",
+        default="data/hospital_error-01.csv",
         help="Path to the dirty/error-prone CSV that needs inspection."
     )
     parser.add_argument(
         "--clean_csv",
-        default="data/flights_clean.csv",
+        default="data/hospital_clean.csv",
         help="Optional clean CSV for evaluation against ground truth."
     )
     parser.add_argument(
@@ -182,26 +212,368 @@ def _build_clean_rule_pool(
     return pool
 
 
-def _select_clean_seeds_for_column(
+def _compute_rule_outputs_for_column(
     df: pd.DataFrame,
     column: str,
     rules: List[Dict[str, Any]],
-    seed_percent: float,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     n_rows = len(df)
     if n_rows == 0 or not rules:
-        return np.array([], dtype=int), np.zeros((0, len(rules)), dtype=int)
+        return np.zeros((0, len(rules)), dtype=int)
     outputs = np.zeros((n_rows, len(rules)), dtype=int)
     for j, rule in enumerate(rules):
         func = rule["rule_func"]
         for i, (_, row) in enumerate(df.iterrows()):
             value = row[column]
             outputs[i, j] = int(_invoke_rule(func, value, row))
-    scores = outputs.mean(axis=1)
-    k = max(1, int(max(seed_percent, 0.0) * n_rows))
-    k = min(k, n_rows)
-    top_indices = np.argsort(-scores)[:k]
-    return top_indices.astype(int), outputs
+    return outputs
+
+
+def _normalize_signature(value: Any) -> str:
+    if value is None:
+        return "<na>"
+    if isinstance(value, float) and np.isnan(value):
+        return "<na>"
+    normalized = str(value).strip().lower()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized if normalized else "<empty>"
+
+
+def _normalize_token(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and np.isnan(value):
+        return ""
+    normalized = str(value).strip().lower()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _shape_signature(value: Any) -> str:
+    if value is None:
+        return "<empty>"
+    tokens: List[str] = []
+    for char in str(value).strip():
+        if char.isdigit():
+            tokens.append("D")
+        elif char.isalpha():
+            tokens.append("A")
+        elif char in "-_/":
+            tokens.append(char)
+        elif char.isspace():
+            tokens.append("S")
+        else:
+            tokens.append(char)
+    return "".join(tokens) if tokens else "<empty>"
+
+
+def _is_missing_like(value: Any, metadata: Dict[str, Any]) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and np.isnan(value):
+        return True
+    normalized = _normalize_token(value)
+    dominant_tokens = set(metadata.get("dominant_missing_tokens") or [])
+    return normalized in DEFAULT_MISSING_TOKEN_SET or normalized in dominant_tokens
+
+
+def _coerce_numeric(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        try:
+            numeric = float(value)
+        except Exception:
+            return None
+        return None if np.isnan(numeric) else numeric
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        numeric = float(text)
+    except Exception:
+        return None
+    return None if np.isnan(numeric) else numeric
+
+
+def _build_signature_weights(df: pd.DataFrame, column: str) -> np.ndarray:
+    signatures = [_normalize_signature(value) for value in df[column].tolist()]
+    counts: Dict[str, int] = {}
+    for signature in signatures:
+        counts[signature] = counts.get(signature, 0) + 1
+    return np.array([counts[signature] for signature in signatures], dtype=int)
+
+
+def _build_anchor_groups(
+    df: pd.DataFrame,
+    column: str,
+    metadata: Dict[str, Any],
+    family: str,
+) -> Tuple[List[GroupRecord], FamilyRunStatus]:
+    groups_by_signature: Dict[str, GroupRecord] = {}
+    for row_idx, value in enumerate(df[column].tolist()):
+        signature = _normalize_signature(value)
+        record = groups_by_signature.get(signature)
+        if record is None:
+            record = GroupRecord(
+                normalized_signature=signature,
+                row_indices=[],
+                weight=0,
+                rule_outputs_by_family={},
+                anchor_state=ANCHOR_UNLABELED,
+                anchor_source="unlabeled",
+                representative_value=value,
+            )
+            groups_by_signature[signature] = record
+        record.row_indices.append(row_idx)
+        record.weight += 1
+
+    groups = list(groups_by_signature.values())
+    if not groups:
+        return [], FamilyRunStatus(status="abstained", reason="empty_column")
+
+    if family == "missing":
+        for record in groups:
+            if _is_missing_like(record.representative_value, metadata):
+                record.anchor_state = ANCHOR_HARD_DIRTY
+                record.anchor_source = "real_missing_token"
+            else:
+                record.anchor_state = ANCHOR_HARD_CLEAN
+                record.anchor_source = "real_non_missing"
+        return groups, FamilyRunStatus(status="ran")
+
+    if family == "outlier":
+        if metadata.get("type") != "numeric":
+            for record in groups:
+                record.anchor_state = ANCHOR_ABSTAIN
+                record.anchor_source = "categorical_outlier_disabled"
+            return groups, FamilyRunStatus(status="abstained", reason="categorical_outlier_disabled")
+        quantiles = metadata.get("quantiles") or {}
+        p25 = quantiles.get("p25")
+        p75 = quantiles.get("p75")
+        p05 = quantiles.get("p05")
+        p95 = quantiles.get("p95")
+        if p25 is None or p75 is None:
+            for record in groups:
+                record.anchor_state = ANCHOR_ABSTAIN
+                record.anchor_source = "missing_numeric_stats"
+            return groups, FamilyRunStatus(status="abstained", reason="missing_numeric_stats")
+        iqr = float(metadata.get("iqr") or 0.0)
+        inner_low = float(p25)
+        inner_high = float(p75)
+        if inner_low == inner_high:
+            inner_low = float(p05 if p05 is not None else p25)
+            inner_high = float(p95 if p95 is not None else p75)
+        if iqr > 0:
+            outer_low = float(p25) - 6.0 * iqr
+            outer_high = float(p75) + 6.0 * iqr
+        else:
+            outer_low = float(p05 if p05 is not None else p25)
+            outer_high = float(p95 if p95 is not None else p75)
+        for record in groups:
+            value = record.representative_value
+            if _is_missing_like(value, metadata):
+                record.anchor_state = ANCHOR_UNLABELED
+                record.anchor_source = "missing_reserved_for_missing_family"
+                continue
+            numeric = _coerce_numeric(value)
+            if numeric is None:
+                record.anchor_state = ANCHOR_HARD_DIRTY
+                record.anchor_source = "non_numeric_value"
+            elif inner_low <= numeric <= inner_high:
+                record.anchor_state = ANCHOR_HARD_CLEAN
+                record.anchor_source = "central_numeric_band"
+            elif numeric < outer_low or numeric > outer_high:
+                record.anchor_state = ANCHOR_HARD_DIRTY
+                record.anchor_source = "extreme_numeric_value"
+            else:
+                record.anchor_state = ANCHOR_UNLABELED
+                record.anchor_source = "numeric_borderline"
+        return groups, FamilyRunStatus(status="ran")
+
+    if family == "pattern":
+        length_distribution = sorted(
+            metadata.get("length_distribution") or [],
+            key=lambda item: item.get("count", 0),
+            reverse=True,
+        )
+        shape_distribution = sorted(
+            metadata.get("shape_distribution") or [],
+            key=lambda item: item.get("count", 0),
+            reverse=True,
+        )
+        top_lengths = [int(item["length"]) for item in length_distribution[:2] if item.get("ratio", 0.0) >= 0.15]
+        top_shapes = [str(item["shape"]) for item in shape_distribution[:2] if item.get("ratio", 0.0) >= 0.15]
+        length_coverage = float(sum(item.get("ratio", 0.0) for item in length_distribution[:2]))
+        shape_coverage = float(sum(item.get("ratio", 0.0) for item in shape_distribution[:2]))
+        if length_coverage < 0.75 and shape_coverage < 0.75:
+            for record in groups:
+                record.anchor_state = ANCHOR_ABSTAIN
+                record.anchor_source = "weak_structure_evidence"
+            return groups, FamilyRunStatus(status="abstained", reason="weak_structure_evidence")
+        for record in groups:
+            value = record.representative_value
+            if _is_missing_like(value, metadata):
+                record.anchor_state = ANCHOR_UNLABELED
+                record.anchor_source = "missing_reserved_for_missing_family"
+                continue
+            text = str(value).strip()
+            length_ok = True if not top_lengths else len(text) in top_lengths
+            shape_ok = True if not top_shapes else _shape_signature(text) in top_shapes
+            if length_ok and shape_ok:
+                record.anchor_state = ANCHOR_HARD_CLEAN
+                record.anchor_source = "stable_structure"
+            elif not length_ok or not shape_ok:
+                record.anchor_state = ANCHOR_HARD_DIRTY
+                record.anchor_source = "structure_violation"
+            else:
+                record.anchor_state = ANCHOR_UNLABELED
+                record.anchor_source = "weak_structure_match"
+        return groups, FamilyRunStatus(status="ran")
+
+    for record in groups:
+        record.anchor_state = ANCHOR_ABSTAIN
+        record.anchor_source = "unsupported_family"
+    return groups, FamilyRunStatus(status="abstained", reason="unsupported_family")
+
+
+def _build_anchor_state_arrays(n_rows: int, anchor_groups: List[GroupRecord]) -> Tuple[np.ndarray, np.ndarray]:
+    anchor_states = np.full(n_rows, ANCHOR_UNLABELED, dtype=object)
+    anchor_sources = np.full(n_rows, "unlabeled", dtype=object)
+    for record in anchor_groups:
+        for row_idx in record.row_indices:
+            anchor_states[row_idx] = record.anchor_state
+            anchor_sources[row_idx] = record.anchor_source
+    return anchor_states, anchor_sources
+
+
+def _build_em_groups(
+    anchor_groups: List[GroupRecord],
+    family: str,
+    family_outputs: np.ndarray,
+    df: pd.DataFrame,
+    column: str,
+) -> List[GroupRecord]:
+    em_groups: Dict[Tuple[str, Tuple[int, ...], str, str], GroupRecord] = {}
+    for anchor_group in anchor_groups:
+        if anchor_group.anchor_state == ANCHOR_ABSTAIN:
+            continue
+        for row_idx in anchor_group.row_indices:
+            obs = tuple(int(v) for v in family_outputs[row_idx].tolist()) if family_outputs.size else tuple()
+            key = (
+                anchor_group.normalized_signature,
+                obs,
+                anchor_group.anchor_state,
+                anchor_group.anchor_source,
+            )
+            if key not in em_groups:
+                em_groups[key] = GroupRecord(
+                    normalized_signature=anchor_group.normalized_signature,
+                    row_indices=[],
+                    weight=0,
+                    rule_outputs_by_family={family: np.array(obs, dtype=int)},
+                    anchor_state=anchor_group.anchor_state,
+                    anchor_source=anchor_group.anchor_source,
+                    representative_value=df.iloc[row_idx][column],
+                )
+            em_groups[key].row_indices.append(int(row_idx))
+            em_groups[key].weight += 1
+    return list(em_groups.values())
+
+
+def _weighted_binary_mean(values: np.ndarray, weights: np.ndarray) -> float:
+    if values.size == 0 or weights.size == 0:
+        return float("nan")
+    total_weight = float(weights.sum())
+    if total_weight <= 0:
+        return float("nan")
+    return float(np.dot(values.astype(float), weights.astype(float)) / total_weight)
+
+
+def _select_representative_values(anchor_groups: List[GroupRecord], limit: int = 20) -> List[Any]:
+    clean_groups = [record for record in anchor_groups if record.anchor_state == ANCHOR_HARD_CLEAN]
+    clean_groups.sort(key=lambda record: record.weight, reverse=True)
+    selected: List[Any] = []
+    seen_signatures = set()
+    for record in clean_groups:
+        if record.normalized_signature in seen_signatures:
+            continue
+        seen_signatures.add(record.normalized_signature)
+        selected.append(record.representative_value)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _run_weighted_em_for_family(
+    group_z: np.ndarray,
+    group_weights: np.ndarray,
+    anchor_states: np.ndarray,
+    max_iters: int,
+    prior_dirty: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    n_groups = group_z.shape[0]
+    n_rules = group_z.shape[1] if group_z.ndim == 2 else 0
+    eps = 1e-3
+    if n_groups == 0 or n_rules == 0:
+        return np.zeros(n_groups), np.zeros(n_rules), np.zeros(n_rules), float("nan")
+
+    clean_mask = anchor_states == ANCHOR_HARD_CLEAN
+    dirty_mask = anchor_states == ANCHOR_HARD_DIRTY
+    unlabeled_mask = anchor_states == ANCHOR_UNLABELED
+
+    alpha = np.full(n_rules, 0.9)
+    beta = np.full(n_rules, 0.3)
+    if clean_mask.any():
+        alpha = np.clip(
+            (group_z[clean_mask] * group_weights[clean_mask, None]).sum(axis=0) / max(group_weights[clean_mask].sum(), eps),
+            eps,
+            1 - eps,
+        )
+    if dirty_mask.any():
+        beta = np.clip(
+            (group_z[dirty_mask] * group_weights[dirty_mask, None]).sum(axis=0) / max(group_weights[dirty_mask].sum(), eps),
+            eps,
+            1 - eps,
+        )
+
+    pi1 = min(max(prior_dirty, eps), 1 - eps)
+    gamma = np.zeros(n_groups, dtype=float)
+    gamma[dirty_mask] = 1.0
+    gamma[clean_mask] = 0.0
+    gamma[unlabeled_mask] = pi1
+
+    for _ in range(max_iters):
+        if unlabeled_mask.any():
+            z_u = group_z[unlabeled_mask]
+            log_p0 = np.full(z_u.shape[0], np.log(1.0 - pi1))
+            log_p1 = np.full(z_u.shape[0], np.log(pi1))
+            for rule_idx in range(n_rules):
+                zr = z_u[:, rule_idx]
+                log_p0 += zr * np.log(alpha[rule_idx] + eps) + (1 - zr) * np.log(1.0 - alpha[rule_idx] + eps)
+                log_p1 += zr * np.log(beta[rule_idx] + eps) + (1 - zr) * np.log(1.0 - beta[rule_idx] + eps)
+            max_log = np.maximum(log_p0, log_p1)
+            p0 = np.exp(log_p0 - max_log)
+            p1 = np.exp(log_p1 - max_log)
+            gamma[unlabeled_mask] = p1 / (p0 + p1 + eps)
+
+        gamma[clean_mask] = 0.0
+        gamma[dirty_mask] = 1.0
+
+        y1_total = float((group_weights * gamma).sum())
+        y0_total = float((group_weights * (1.0 - gamma)).sum())
+        if y0_total <= 0 or y1_total <= 0:
+            break
+
+        weighted_clean = (group_weights * (1.0 - gamma))[:, None]
+        weighted_dirty = (group_weights * gamma)[:, None]
+        alpha = np.clip(weighted_clean.T.dot(group_z).ravel() / y0_total, eps, 1 - eps)
+        beta = np.clip(weighted_dirty.T.dot(group_z).ravel() / y1_total, eps, 1 - eps)
+        total_weight = y0_total + y1_total
+        pi1 = min(max(y1_total / max(total_weight, eps), eps), 1 - eps)
+
+    return gamma, alpha, beta, pi1
 
 
 def _run_em_for_family(
@@ -307,7 +679,7 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
     logger.info("=" * 60)
     logger.info(f"[1/4] Profiling dirty dataset: {args.dirty_csv}")
     logger.info(f"Configuration:")
-    logger.info(f"  - clean_seed_percent: {args.clean_seed_percent}")
+    logger.info(f"  - clean_seed_percent (legacy/unused): {args.clean_seed_percent}")
     logger.info(f"  - synthetic_per_family: {args.synthetic_per_family}")
     logger.info(f"  - em_max_iters: {args.em_max_iters}")
     logger.info(f"  - em_prior_dirty: {args.em_prior_dirty}")
@@ -374,304 +746,422 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
     logger.info("[3/4] Running clean-rule EM calibration")
     dirty_agent = DirtyExampleAgent(base_url=args.base_url, model=args.model)
     reflection_agent = CleanRuleReflectionAgent(base_url=args.base_url, model=args.model)
-    all_scores: Dict[Tuple[int, str], Dict[str, float]] = {}
-    
-    # Track statistics per column and family
-    em_stats = {}
+    n_rows = len(df)
+    column_outputs: Dict[str, Dict[str, np.ndarray]] = {}
+    column_statuses: Dict[str, Dict[str, FamilyRunStatus]] = {}
+    column_anchor_sources: Dict[str, Dict[str, np.ndarray]] = {}
+    column_signature_weights: Dict[str, np.ndarray] = {}
+    em_stats: Dict[str, Dict[str, Dict[str, Any]]] = {}
     
     for col_idx, (column, rules) in enumerate(rule_pool.items(), 1):
         logger.info(f"Processing column {col_idx}/{len(rule_pool)}: '{column}'")
         logger.debug(f"  - Number of rules: {len(rules)}")
-        
-        seed_indices, outputs = _select_clean_seeds_for_column(
-            df,
-            column,
-            rules,
-            args.clean_seed_percent,
-        )
-        
+
+        outputs = _compute_rule_outputs_for_column(df, column, rules)
         if outputs.size == 0:
             logger.warning(f"  - No rule outputs for column '{column}', skipping")
             continue
-        
-        n_seeds = len(seed_indices)
-        n_unlabeled = len(df) - n_seeds
-        logger.info(f"  - Clean seeds selected: {n_seeds} ({args.clean_seed_percent*100:.1f}% of {len(df)} rows)")
-        logger.debug(f"  - Seed indices (first 10): {seed_indices[:10].tolist()}")
-        
-        families = ["missing", "outlier", "pattern"]
-        family_rule_indices: Dict[str, List[int]] = {f: [] for f in families}
+
+        column_outputs[column] = {
+            "S_missing": np.full(n_rows, np.nan, dtype=float),
+            "S_outlier": np.full(n_rows, np.nan, dtype=float),
+            "S_pattern": np.full(n_rows, np.nan, dtype=float),
+        }
+        column_anchor_sources[column] = {
+            "missing": np.full(n_rows, "unlabeled", dtype=object),
+            "outlier": np.full(n_rows, "abstained", dtype=object),
+            "pattern": np.full(n_rows, "abstained", dtype=object),
+        }
+        column_signature_weights[column] = _build_signature_weights(df, column)
+
+        family_rule_indices: Dict[str, List[int]] = {f: [] for f in FAMILIES}
         for idx, rule in enumerate(rules):
             fam = rule["family"]
             if fam in family_rule_indices:
                 family_rule_indices[fam].append(idx)
-        
+
+        column_statuses[column] = {
+            family: FamilyRunStatus(status="abstained", reason="family_not_processed")
+            for family in FAMILIES
+        }
         em_stats[column] = {}
-        
-        for family in families:
+
+        for family in FAMILIES:
             cols = family_rule_indices[family]
             if not cols:
-                logger.info(f"  - Family '{family}': no rules, skipping")
+                logger.info(f"  - Family '{family}': no rules, abstained")
+                column_statuses[column][family] = FamilyRunStatus(status="abstained", reason="no_rules")
+                column_anchor_sources[column][family][:] = "abstained:no_rules"
                 continue
-            
+
             logger.info(f"  - Family '{family}': {len(cols)} rules")
-            
-            # Log specific rules used for this family
             for idx in cols:
                 rule = rules[idx]
                 rule_name = rule.get("rule_name", "unknown")
                 rule_str = rule.get("rule_str", "")
                 logger.info(f"    - Using rule '{rule_name}': {rule_str}")
-            
+
             family_z = outputs[:, cols]
-            seed_mask = np.zeros(len(df), dtype=bool)
-            seed_mask[seed_indices] = True
-            clean_z = family_z[seed_mask]
-            unlabeled_z = family_z[~seed_mask]
-            
-            logger.debug(f"    - Clean Z shape: {clean_z.shape}, Unlabeled Z shape: {unlabeled_z.shape}")
-            
-            seeds_values = [df.iloc[i][column] for i in seed_indices]
-            logger.debug(f"    - Generating dirty examples for family '{family}'")
-            
-            dirty_examples = dirty_agent.generate_dirty_examples(
+            anchor_groups, family_status = _build_anchor_groups(df, column, metadata.get(column, {}), family)
+            column_statuses[column][family] = family_status
+            anchor_states_by_row, anchor_sources_by_row = _build_anchor_state_arrays(n_rows, anchor_groups)
+            column_anchor_sources[column][family] = anchor_sources_by_row.copy()
+
+            hard_clean_groups = [record for record in anchor_groups if record.anchor_state == ANCHOR_HARD_CLEAN]
+            hard_dirty_groups = [record for record in anchor_groups if record.anchor_state == ANCHOR_HARD_DIRTY]
+            weighted_clean_rows = int(sum(record.weight for record in hard_clean_groups))
+            weighted_dirty_rows = int(sum(record.weight for record in hard_dirty_groups))
+            source_counts = {}
+            for record in anchor_groups:
+                source_counts[record.anchor_source] = source_counts.get(record.anchor_source, 0) + record.weight
+
+            logger.info(
+                f"    - Anchor summary: groups={len(anchor_groups)}, "
+                f"hard_clean_groups={len(hard_clean_groups)} ({weighted_clean_rows} rows), "
+                f"hard_dirty_groups={len(hard_dirty_groups)} ({weighted_dirty_rows} rows)"
+            )
+            logger.info(f"    - Anchor sources: {source_counts}")
+
+            if family_status.status == "abstained":
+                logger.info(f"    - Family '{family}' abstained: {family_status.reason}")
+                continue
+
+            hard_clean_values = _select_representative_values(anchor_groups)
+            logger.debug(f"    - Generating synthetic critique examples for family '{family}'")
+            synthetic_critique_examples = dirty_agent.generate_dirty_examples(
                 column,
                 metadata.get(column, {}),
-                seeds_values,
+                hard_clean_values,
                 family,
                 max_examples=args.synthetic_per_family,
             )
-            
-            n_dirty = len(dirty_examples)
-            logger.info(f"    - Generated {n_dirty} dirty examples for family '{family}'")
-            logger.debug(f"    - Dirty example values (first 5): {[ex['value'] for ex in dirty_examples[:5]]}")
-            
-            dirty_vals = [ex["value"] for ex in dirty_examples]
-            dirty_z_list: List[List[int]] = []
-            for val in dirty_vals:
+
+            n_synth = len(synthetic_critique_examples)
+            logger.info(f"    - Generated {n_synth} synthetic critique examples for family '{family}'")
+            logger.debug(
+                f"    - Synthetic critique values (first 5): {[ex['value'] for ex in synthetic_critique_examples[:5]]}"
+            )
+
+            synth_vals = [ex["value"] for ex in synthetic_critique_examples]
+            synth_z_list: List[List[int]] = []
+            for val in synth_vals:
                 row_like = {column: val}
                 row_series = pd.Series(row_like)
                 row_outputs: List[int] = []
                 for idx in cols:
                     func = rules[idx]["rule_func"]
                     row_outputs.append(int(_invoke_rule(func, val, row_series)))
-                dirty_z_list.append(row_outputs)
-            
-            dirty_z = np.array(dirty_z_list, dtype=int) if dirty_z_list else np.zeros((0, len(cols)), dtype=int)
-            logger.debug(f"    - Dirty Z shape: {dirty_z.shape}")
-            
-            if clean_z.size > 0 and dirty_z.size > 0:
-                clean_pass = clean_z.mean(axis=0)
-                dirty_pass = dirty_z.mean(axis=0)
-                bad_clean_threshold = 0.6
-                bad_dirty_threshold = 0.6
-                improve_margin = 0.02
-                max_reflections = 3
-                candidates: List[Tuple[int, int, float, float]] = []
-                for local_idx, rule_idx in enumerate(cols):
-                    cp = float(clean_pass[local_idx])
-                    dp = float(dirty_pass[local_idx])
-                    if cp < bad_clean_threshold or dp > bad_dirty_threshold:
-                        candidates.append((local_idx, rule_idx, cp, dp))
-                reflections_done = 0
-                for local_idx, rule_idx, cp, dp in candidates:
-                    if reflections_done >= max_reflections:
+                synth_z_list.append(row_outputs)
+
+            synth_z = np.array(synth_z_list, dtype=int) if synth_z_list else np.zeros((0, len(cols)), dtype=int)
+
+            clean_mask = anchor_states_by_row == ANCHOR_HARD_CLEAN
+            dirty_mask = anchor_states_by_row == ANCHOR_HARD_DIRTY
+            real_dirty_group_count = len(hard_dirty_groups)
+            real_dirty_row_count = weighted_dirty_rows
+            min_dirty_rows_for_real = max(5, int(np.ceil(0.002 * max(n_rows, 1))))
+
+            clean_pass_real = np.array([
+                _weighted_binary_mean(family_z[clean_mask, local_idx], np.ones(int(clean_mask.sum()), dtype=float))
+                if clean_mask.any() else float("nan")
+                for local_idx in range(len(cols))
+            ])
+            dirty_pass_real = np.array([
+                _weighted_binary_mean(family_z[dirty_mask, local_idx], np.ones(int(dirty_mask.sum()), dtype=float))
+                if dirty_mask.any() else float("nan")
+                for local_idx in range(len(cols))
+            ])
+            dirty_pass_synth = np.array([
+                float(synth_z[:, local_idx].mean()) if synth_z.shape[0] > 0 else float("nan")
+                for local_idx in range(len(cols))
+            ])
+
+            improve_margin = 0.02
+            max_reflections = 3
+            candidates: List[Tuple[int, int, float, float]] = []
+            effective_dirty_pass = np.copy(dirty_pass_real)
+            use_real_dirty = real_dirty_group_count >= 2 and real_dirty_row_count >= min_dirty_rows_for_real
+            if not use_real_dirty:
+                for local_idx in range(len(cols)):
+                    candidates_for_dirty = [v for v in [dirty_pass_real[local_idx], dirty_pass_synth[local_idx]] if not np.isnan(v)]
+                    effective_dirty_pass[local_idx] = max(candidates_for_dirty) if candidates_for_dirty else float("nan")
+
+            for local_idx, rule_idx in enumerate(cols):
+                cp = float(clean_pass_real[local_idx]) if not np.isnan(clean_pass_real[local_idx]) else 0.0
+                dp = float(effective_dirty_pass[local_idx]) if not np.isnan(effective_dirty_pass[local_idx]) else 1.0
+                if cp < args.calib_min_clean_pass or dp > args.calib_max_dirty_pass:
+                    candidates.append((local_idx, rule_idx, cp, dp))
+
+            reflections_done = 0
+            for local_idx, rule_idx, cp, dp in candidates:
+                if reflections_done >= max_reflections:
+                    break
+                rule = rules[rule_idx]
+                rule_name = rule.get("rule_name", "unknown")
+                rule_str = rule.get("rule_str", "")
+
+                clean_mis_examples: List[Dict[str, Any]] = []
+                for record in sorted(hard_clean_groups, key=lambda item: item.weight, reverse=True):
+                    representative_idx = record.row_indices[0]
+                    if family_z[representative_idx, local_idx] == 0:
+                        clean_mis_examples.append({"value": record.representative_value, "source": "real_hard_clean"})
+                    if len(clean_mis_examples) >= 10:
                         break
-                    rule = rules[rule_idx]
-                    rule_name = rule.get("rule_name", "unknown")
-                    rule_str = rule.get("rule_str", "")
-                    clean_mis_indices = np.where(clean_z[:, local_idx] == 0)[0]
-                    dirty_mis_indices = np.where(dirty_z[:, local_idx] == 1)[0]
-                    clean_mis_examples: List[Dict[str, Any]] = []
-                    for idx_seed in clean_mis_indices[:10]:
-                        if idx_seed < len(seeds_values):
-                            clean_mis_examples.append({"value": seeds_values[idx_seed]})
-                    dirty_mis_examples: List[Dict[str, Any]] = []
-                    for idx_dirty in dirty_mis_indices[:10]:
-                        if idx_dirty < len(dirty_examples):
-                            ex = dirty_examples[idx_dirty]
-                            dirty_mis_examples.append(
-                                {"value": ex.get("value"), "reason": ex.get("reason", "")}
-                            )
-                    if not clean_mis_examples and not dirty_mis_examples:
-                        continue
-                    logger.info(
-                        f"    - Reflecting rule '{rule_name}' before calibration "
-                        f"(clean_pass={cp:.3f}, dirty_pass={dp:.3f})"
-                    )
-                    new_rule_str = reflection_agent.refine_clean_rule(
-                        column,
-                        metadata.get(column, {}),
-                        family,
-                        rule_str,
-                        clean_mis_examples,
-                        dirty_mis_examples,
-                    )
-                    if not new_rule_str or new_rule_str == rule_str:
-                        continue
-                    try:
-                        new_rule_func = eval(new_rule_str, safe_dict)
-                    except Exception:
-                        continue
-                    n_rows = len(df)
-                    new_all = np.zeros(n_rows, dtype=int)
-                    for row_idx_df, (_, row_df) in enumerate(df.iterrows()):
-                        value_df = row_df[column]
-                        new_all[row_idx_df] = int(_invoke_rule(new_rule_func, value_df, row_df))
-                    new_clean_col = new_all[seed_mask]
-                    new_unlabeled_col = new_all[~seed_mask]
-                    new_dirty_col = np.zeros(len(dirty_vals), dtype=int)
-                    for idx_dirty_val, val in enumerate(dirty_vals):
-                        row_like = {column: val}
-                        row_series = pd.Series(row_like)
-                        new_dirty_col[idx_dirty_val] = int(_invoke_rule(new_rule_func, val, row_series))
-                    new_cp = float(new_clean_col.mean()) if new_clean_col.size > 0 else 0.0
-                    new_dp = float(new_dirty_col.mean()) if new_dirty_col.size > 0 else 1.0
-                    old_loss = (1.0 - cp) + dp
-                    new_loss = (1.0 - new_cp) + new_dp
-                    if new_loss <= old_loss - improve_margin and new_cp >= args.calib_min_clean_pass:
-                        clean_z[:, local_idx] = new_clean_col
-                        unlabeled_z[:, local_idx] = new_unlabeled_col
-                        dirty_z[:, local_idx] = new_dirty_col
-                        rules[rule_idx]["rule_str"] = new_rule_str
-                        rules[rule_idx]["rule_func"] = new_rule_func
-                        clean_pass[local_idx] = new_cp
-                        dirty_pass[local_idx] = new_dp
-                        reflections_done += 1
-                        logger.info(
-                            f"    - Refined rule '{rule_name}': "
-                            f"clean_pass {cp:.3f}->{new_cp:.3f}, dirty_pass {dp:.3f}->{new_dp:.3f}"
-                        )
-                keep_mask = (clean_pass >= args.calib_min_clean_pass) & (
-                    dirty_pass <= args.calib_max_dirty_pass
-                )
-                for local_idx, rule_idx in enumerate(cols):
-                    rule = rules[rule_idx]
-                    rule_name = rule.get("rule_name", "unknown")
-                    cp = float(clean_pass[local_idx])
-                    dp = float(dirty_pass[local_idx])
-                    decision = "KEEP" if keep_mask[local_idx] else "DROP"
-                    logger.info(
-                        f"    - Calib rule '{rule_name}': "
-                        f"clean_pass={cp:.3f}, dirty_pass={dp:.3f}, decision={decision}"
-                    )
-                if not keep_mask.any():
-                    logger.info(
-                        f"    - All rules rejected by calibration for family '{family}', skipping EM"
-                    )
+
+                dirty_mis_examples: List[Dict[str, Any]] = []
+                for record in sorted(hard_dirty_groups, key=lambda item: item.weight, reverse=True):
+                    representative_idx = record.row_indices[0]
+                    if family_z[representative_idx, local_idx] == 1:
+                        dirty_mis_examples.append({"value": record.representative_value, "source": "real_hard_dirty"})
+                    if len(dirty_mis_examples) >= 10:
+                        break
+
+                if len(dirty_mis_examples) < 10:
+                    for synth_idx, example in enumerate(synthetic_critique_examples[:10]):
+                        if synth_z.shape[0] > synth_idx and synth_z[synth_idx, local_idx] == 1:
+                            dirty_mis_examples.append({
+                                "value": example.get("value"),
+                                "reason": example.get("reason", ""),
+                                "source": "synthetic_dirty",
+                            })
+                        if len(dirty_mis_examples) >= 10:
+                            break
+
+                if not clean_mis_examples and not dirty_mis_examples:
                     continue
-                kept_local_indices = np.where(keep_mask)[0]
-                clean_z = clean_z[:, kept_local_indices]
-                unlabeled_z = unlabeled_z[:, kept_local_indices]
-                dirty_z = dirty_z[:, kept_local_indices]
-                cols = [cols[i] for i in kept_local_indices]
+
                 logger.info(
-                    f"    - {keep_mask.sum()}/{len(keep_mask)} rules kept after calibration"
+                    f"    - Reflecting rule '{rule_name}' before calibration "
+                    f"(clean_pass_real={cp:.3f}, dirty_pass_eval={dp:.3f})"
                 )
-            
-            logger.debug(f"    - Running EM algorithm (max_iters={args.em_max_iters})")
-            gamma, alpha, beta = _run_em_for_family(
-                clean_z,
-                dirty_z,
-                unlabeled_z,
+                new_rule_str = reflection_agent.refine_clean_rule(
+                    column,
+                    metadata.get(column, {}),
+                    family,
+                    rule_str,
+                    clean_mis_examples,
+                    dirty_mis_examples,
+                )
+                if not new_rule_str or new_rule_str == rule_str:
+                    continue
+                try:
+                    new_rule_func = eval(new_rule_str, safe_dict)
+                except Exception:
+                    continue
+
+                new_all = np.zeros(n_rows, dtype=int)
+                for row_idx_df, (_, row_df) in enumerate(df.iterrows()):
+                    value_df = row_df[column]
+                    new_all[row_idx_df] = int(_invoke_rule(new_rule_func, value_df, row_df))
+
+                new_synth_col = np.zeros(len(synth_vals), dtype=int)
+                for synth_idx, val in enumerate(synth_vals):
+                    row_like = {column: val}
+                    row_series = pd.Series(row_like)
+                    new_synth_col[synth_idx] = int(_invoke_rule(new_rule_func, val, row_series))
+
+                new_cp = float(new_all[clean_mask].mean()) if clean_mask.any() else float("nan")
+                new_dp_real = float(new_all[dirty_mask].mean()) if dirty_mask.any() else float("nan")
+                new_dp_synth = float(new_synth_col.mean()) if new_synth_col.size > 0 else float("nan")
+                old_dirty = dp
+                new_dirty = new_dp_real if use_real_dirty and not np.isnan(new_dp_real) else max(
+                    [v for v in [new_dp_real, new_dp_synth] if not np.isnan(v)] or [1.0]
+                )
+                old_loss = (1.0 - cp) + old_dirty
+                new_loss = (1.0 - (new_cp if not np.isnan(new_cp) else 0.0)) + new_dirty
+                if new_loss <= old_loss - improve_margin and (np.isnan(new_cp) or new_cp >= args.calib_min_clean_pass):
+                    family_z[:, local_idx] = new_all
+                    if synth_z.shape[0] > 0:
+                        synth_z[:, local_idx] = new_synth_col
+                    rules[rule_idx]["rule_str"] = new_rule_str
+                    rules[rule_idx]["rule_func"] = new_rule_func
+                    clean_pass_real[local_idx] = new_cp
+                    dirty_pass_real[local_idx] = new_dp_real
+                    dirty_pass_synth[local_idx] = new_dp_synth
+                    if use_real_dirty:
+                        effective_dirty_pass[local_idx] = new_dp_real
+                    else:
+                        candidates_for_dirty = [v for v in [new_dp_real, new_dp_synth] if not np.isnan(v)]
+                        effective_dirty_pass[local_idx] = max(candidates_for_dirty) if candidates_for_dirty else float("nan")
+                    reflections_done += 1
+                    logger.info(
+                        f"    - Refined rule '{rule_name}': "
+                        f"clean_pass_real {cp:.3f}->{clean_pass_real[local_idx]:.3f}, "
+                        f"dirty_pass_eval {dp:.3f}->{effective_dirty_pass[local_idx]:.3f}"
+                    )
+
+            keep_mask = np.zeros(len(cols), dtype=bool)
+            for local_idx, rule_idx in enumerate(cols):
+                cp = float(clean_pass_real[local_idx]) if not np.isnan(clean_pass_real[local_idx]) else 0.0
+                dp_real = float(dirty_pass_real[local_idx]) if not np.isnan(dirty_pass_real[local_idx]) else float("nan")
+                dp_synth = float(dirty_pass_synth[local_idx]) if not np.isnan(dirty_pass_synth[local_idx]) else float("nan")
+                if use_real_dirty:
+                    dirty_eval = dp_real
+                    dirty_evidence = "real"
+                else:
+                    dirty_candidates = [v for v in [dp_real, dp_synth] if not np.isnan(v)]
+                    dirty_eval = max(dirty_candidates) if dirty_candidates else 1.0
+                    dirty_evidence = "synthetic_assist"
+                keep_mask[local_idx] = cp >= args.calib_min_clean_pass and dirty_eval <= args.calib_max_dirty_pass
+                decision = "KEEP" if keep_mask[local_idx] else "DROP"
+                logger.info(
+                    f"    - Calib rule '{rules[rule_idx].get('rule_name', 'unknown')}': "
+                    f"clean_pass_real={cp:.3f}, dirty_pass_real={dp_real if not np.isnan(dp_real) else float('nan'):.3f}, "
+                    f"dirty_pass_synth={dp_synth if not np.isnan(dp_synth) else float('nan'):.3f}, "
+                    f"dirty_evidence={dirty_evidence}, decision={decision}"
+                )
+
+            if not keep_mask.any():
+                logger.info(f"    - All rules rejected by calibration for family '{family}', abstained")
+                column_statuses[column][family] = FamilyRunStatus(status="abstained", reason="all_rules_rejected")
+                column_anchor_sources[column][family][:] = "abstained:all_rules_rejected"
+                continue
+
+            kept_local_indices = np.where(keep_mask)[0]
+            kept_cols = [cols[i] for i in kept_local_indices]
+            family_z = family_z[:, kept_local_indices]
+            logger.info(f"    - {keep_mask.sum()}/{len(keep_mask)} rules kept after calibration")
+
+            min_clean_rows = max(20, int(np.ceil(0.01 * max(n_rows, 1))))
+            min_dirty_rows = max(5, int(np.ceil(0.002 * max(n_rows, 1))))
+            if len(hard_clean_groups) < 3 or len(hard_dirty_groups) < 2 or weighted_clean_rows < min_clean_rows or weighted_dirty_rows < min_dirty_rows:
+                reason = "insufficient_real_anchors"
+                logger.info(f"    - Family '{family}' abstained: {reason}")
+                column_statuses[column][family] = FamilyRunStatus(status="abstained", reason=reason)
+                column_anchor_sources[column][family][:] = anchor_sources_by_row.copy()
+                continue
+
+            em_groups = _build_em_groups(anchor_groups, family, family_z, df, column)
+            if not em_groups:
+                reason = "empty_em_groups"
+                logger.info(f"    - Family '{family}' abstained: {reason}")
+                column_statuses[column][family] = FamilyRunStatus(status="abstained", reason=reason)
+                continue
+
+            group_z = np.vstack([record.rule_outputs_by_family[family] for record in em_groups])
+            group_weights = np.array([record.weight for record in em_groups], dtype=float)
+            group_anchor_states = np.array([record.anchor_state for record in em_groups], dtype=object)
+
+            logger.debug(f"    - Running weighted real-only EM (max_iters={args.em_max_iters})")
+            gamma, alpha, beta, pi1 = _run_weighted_em_for_family(
+                group_z,
+                group_weights,
+                group_anchor_states,
                 args.em_max_iters,
                 args.em_prior_dirty,
             )
-            
-            # Log EM results
-            if len(gamma) > 0:
-                gamma_mean = float(gamma.mean())
-                gamma_std = float(gamma.std())
-                gamma_min = float(gamma.min())
-                gamma_max = float(gamma.max())
-                high_scores = int((gamma > 0.5).sum())
-                logger.info(f"    - EM complete: gamma_mean={gamma_mean:.4f}, "
-                           f"gamma_std={gamma_std:.4f}, range=[{gamma_min:.4f}, {gamma_max:.4f}]")
-                logger.info(f"    - High scores (>0.5): {high_scores}/{len(gamma)}")
-                logger.debug(f"    - Alpha (rule precision on clean): {alpha}")
-                logger.debug(f"    - Beta (rule recall on dirty): {beta}")
-                
-                em_stats[column][family] = {
-                    "n_rules": len(cols),
-                    "n_clean": clean_z.shape[0],
-                    "n_dirty": dirty_z.shape[0],
-                    "n_unlabeled": unlabeled_z.shape[0],
-                    "gamma_mean": gamma_mean,
-                    "gamma_std": gamma_std,
-                    "high_scores": high_scores
-                }
-            
-            unlabeled_indices = np.where(~seed_mask)[0]
-            family_key = {
-                "missing": "S_missing",
-                "outlier": "S_outlier",
-                "pattern": "S_pattern",
-            }[family]
-            
-            scores_assigned = 0
-            for local_idx, row_idx in enumerate(unlabeled_indices):
-                key = (int(row_idx), column)
-                if key not in all_scores:
-                    all_scores[key] = {"S_missing": 0.0, "S_outlier": 0.0, "S_pattern": 0.0}
-                all_scores[key][family_key] = float(gamma[local_idx]) if local_idx < len(gamma) else 0.0
-                scores_assigned += 1
-            
-            logger.debug(f"    - Assigned scores to {scores_assigned} cells for family '{family}'")
+
+            weighted_high_scores = int(sum(record.weight for record, score in zip(em_groups, gamma) if score > 0.5))
+            gamma_mean = _weighted_binary_mean(gamma, group_weights)
+            gamma_min = float(np.min(gamma)) if gamma.size > 0 else float("nan")
+            gamma_max = float(np.max(gamma)) if gamma.size > 0 else float("nan")
+            logger.info(
+                f"    - EM complete: gamma_mean={gamma_mean:.4f}, pi={pi1:.4f}, range=[{gamma_min:.4f}, {gamma_max:.4f}]"
+            )
+            logger.info(f"    - Weighted high scores (>0.5): {weighted_high_scores}/{int(group_weights.sum())}")
+            logger.debug(f"    - Alpha: {alpha}")
+            logger.debug(f"    - Beta: {beta}")
+
+            em_stats[column][family] = {
+                "n_rules": len(kept_cols),
+                "n_groups": len(em_groups),
+                "weighted_clean_rows": weighted_clean_rows,
+                "weighted_dirty_rows": weighted_dirty_rows,
+                "gamma_mean": gamma_mean,
+                "pi": pi1,
+                "weighted_high_scores": weighted_high_scores,
+            }
+            column_statuses[column][family] = FamilyRunStatus(status="ran")
+
+            family_key = FAMILY_SCORE_KEYS[family]
+            for record, score in zip(em_groups, gamma):
+                for row_idx in record.row_indices:
+                    column_outputs[column][family_key][row_idx] = float(score)
+                    column_anchor_sources[column][family][row_idx] = record.anchor_source
     
     logger.info("EM calibration complete for all columns")
     
-    # Build results
     results: List[Dict[str, Any]] = []
-    for (row_idx, column), scores in all_scores.items():
-        s_missing = scores.get("S_missing", 0.0)
-        s_outlier = scores.get("S_outlier", 0.0)
-        s_pattern = scores.get("S_pattern", 0.0)
-        s_total = (s_missing + s_outlier + s_pattern) / 3.0
-        results.append(
-            {
-                "row_index": row_idx,
-                "column": column,
-                "value": df.iloc[row_idx][column],
-                "S_missing": s_missing,
-                "S_outlier": s_outlier,
-                "S_pattern": s_pattern,
-                "S_total": s_total,
-            }
-        )
-    
-    results.sort(key=lambda x: x["S_total"], reverse=True)
-    
-    # Log results statistics
+    for column, family_scores in column_outputs.items():
+        statuses = column_statuses[column]
+        signature_weights = column_signature_weights[column]
+        for row_idx in range(n_rows):
+            s_missing = family_scores["S_missing"][row_idx]
+            s_outlier = family_scores["S_outlier"][row_idx]
+            s_pattern = family_scores["S_pattern"][row_idx]
+            valid_scores = [score for score in [s_missing, s_outlier, s_pattern] if not pd.isna(score)]
+            s_total = float(np.mean(valid_scores)) if valid_scores else float("nan")
+            anchor_source_summary = ";".join(
+                f"{family}={column_anchor_sources[column][family][row_idx]}"
+                for family in FAMILIES
+            )
+            results.append(
+                {
+                    "row_index": row_idx,
+                    "column": column,
+                    "value": df.iloc[row_idx][column],
+                    "group_weight": int(signature_weights[row_idx]),
+                    "anchor_source_summary": anchor_source_summary,
+                    "missing_status": statuses["missing"].status,
+                    "missing_reason": statuses["missing"].reason,
+                    "outlier_status": statuses["outlier"].status,
+                    "outlier_reason": statuses["outlier"].reason,
+                    "pattern_status": statuses["pattern"].status,
+                    "pattern_reason": statuses["pattern"].reason,
+                    "S_missing": s_missing,
+                    "S_outlier": s_outlier,
+                    "S_pattern": s_pattern,
+                    "S_total": s_total,
+                }
+            )
+
+    results.sort(
+        key=lambda item: (
+            pd.notna(item["S_total"]),
+            float(item["S_total"]) if pd.notna(item["S_total"]) else -1.0,
+        ),
+        reverse=True,
+    )
+
     logger.info("=" * 60)
     logger.info("Results Summary")
     logger.info("=" * 60)
     logger.info(f"Total cells scored: {len(results)}")
-    
+
     if results:
-        all_totals = [r["S_total"] for r in results]
+        all_totals = [r["S_total"] for r in results if pd.notna(r["S_total"])]
         logger.info(f"S_total distribution:")
-        logger.info(f"  - Mean: {sum(all_totals)/len(all_totals):.4f}")
-        logger.info(f"  - Min: {min(all_totals):.4f}")
-        logger.info(f"  - Max: {max(all_totals):.4f}")
-        
-        above_threshold = [s for s in all_totals if s >= args.score_threshold]
-        logger.info(f"  - Above threshold ({args.score_threshold}): {len(above_threshold)}/{len(all_totals)} "
-                   f"({len(above_threshold)/len(all_totals)*100:.1f}%)")
-        
-        # Per-family statistics
+        if all_totals:
+            logger.info(f"  - Mean: {sum(all_totals)/len(all_totals):.4f}")
+            logger.info(f"  - Min: {min(all_totals):.4f}")
+            logger.info(f"  - Max: {max(all_totals):.4f}")
+            above_threshold = [s for s in all_totals if s >= args.score_threshold]
+            logger.info(
+                f"  - Above threshold ({args.score_threshold}): {len(above_threshold)}/{len(all_totals)} "
+                f"({len(above_threshold)/len(all_totals)*100:.1f}%)"
+            )
+        else:
+            logger.info("  - No active family scores available")
+
         for family_key in ["S_missing", "S_outlier", "S_pattern"]:
-            scores = [r[family_key] for r in results]
+            scores = [r[family_key] for r in results if pd.notna(r[family_key])]
             above = sum(1 for s in scores if s >= args.score_threshold)
-            logger.info(f"  - {family_key}: mean={sum(scores)/len(scores):.4f}, "
-                       f"above_threshold={above}/{len(scores)}")
-    
+            if scores:
+                logger.info(
+                    f"  - {family_key}: mean={sum(scores)/len(scores):.4f}, "
+                    f"above_threshold={above}/{len(scores)}"
+                )
+            else:
+                logger.info(f"  - {family_key}: no active scores")
+
     top_k = min(args.top_k, len(results))
     logger.info(f"\nTop {top_k} highest scoring cells by S_total:")
     print(f"\nTop {top_k} highest scoring cells by S_total:")
-    
+
     for item in results[:top_k]:
         log_msg = (f"Row {item['row_index']}, Column '{item['column']}': "
                   f"value={item['value']!r}, "
+                  f"group_weight={item['group_weight']}, "
                   f"S_missing={item['S_missing']:.4f}, "
                   f"S_outlier={item['S_outlier']:.4f}, "
                   f"S_pattern={item['S_pattern']:.4f}, "
@@ -698,7 +1188,7 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
             detected_errors = [
                 {"row_index": r["row_index"], "column": r["column"]}
                 for r in results
-                if r["S_total"] >= args.score_threshold
+                if pd.notna(r["S_total"]) and r["S_total"] >= args.score_threshold
             ]
             logger.info(f"Detected {len(detected_errors)} cells with S_total >= {args.score_threshold}")
             print(f"Detected {len(detected_errors)} cells with S_total >= {args.score_threshold}")
