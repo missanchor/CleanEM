@@ -31,6 +31,9 @@ MAX_SHAPE_ENTRIES = 20
 MAX_REGEX_CANDIDATES = 3
 MAX_COOCCURRENCES = 15
 MAX_VIOLATION_SAMPLES = 10
+MAX_GRAMMAR_VARIANTS = 15
+MAX_TOKEN_ENTRIES = 20
+MAX_CHAR_NGRAMS = 20
 
 
 class PandasProfiler:
@@ -96,6 +99,7 @@ class PandasProfiler:
 
         self._infer_relationship_constraints()
         self._attach_relationship_profiles()
+        self._attach_available_families()
 
     def _determine_column_type(self, column: str, enable_pattern_detection: bool = False, csv_path: str = None) -> str:
         """
@@ -317,6 +321,10 @@ class PandasProfiler:
 
         shape_distribution = self._shape_distribution(str_series)
         regex_candidates = self._generate_regex_candidates(str_series)
+        grammar_metadata = self._analyze_grammar_properties(str_series)
+        prototype_candidates = self._summarize_prototype_candidates(normalized_top_values)
+        token_support = self._top_token_support(normalized_series)
+        char_ngram_support = self._top_char_ngrams(str_series)
 
         return {
             'normalized_top_values': normalized_top_values,
@@ -324,7 +332,11 @@ class PandasProfiler:
             'low_frequency_values': low_frequency_values,
             'length_distribution': length_distribution,
             'shape_distribution': shape_distribution,
-            'regex_candidates': regex_candidates
+            'regex_candidates': regex_candidates,
+            'prototype_candidates': prototype_candidates,
+            'top_tokens': token_support,
+            'char_ngram_support': char_ngram_support,
+            **grammar_metadata,
         }
 
     def _shape_distribution(self, values: pd.Series) -> List[Dict[str, Any]]:
@@ -361,6 +373,161 @@ class PandasProfiler:
             else:
                 tokens.append("?")
         return "".join(tokens) or "<empty>"
+
+    def _segment_signature(self, token: str) -> str:
+        """Encode a token segment for grammar-aware pattern modeling."""
+        token = str(token)
+        if token == "":
+            return "<empty>"
+        if token.isspace():
+            return f"S{len(token)}"
+        if all(char.isdigit() for char in token):
+            return f"D{len(token)}"
+        if all(char.isalpha() for char in token):
+            return f"A{len(token)}"
+        if all(char.isalnum() for char in token):
+            return f"M{len(token)}"
+        return f"X{len(token)}"
+
+    def _grammar_signature(self, value: str) -> str:
+        """Build a delimiter-aware grammar signature for a value."""
+        text = str(value).strip()
+        if not text:
+            return "<empty>"
+        parts = re.split(r'([\-_/.:\s]+)', text)
+        signature_parts = []
+        for part in parts:
+            if not part:
+                continue
+            if re.fullmatch(r'[\-_/.:\s]+', part):
+                delimiter = part[0]
+                if delimiter.isspace():
+                    delimiter = ' '
+                signature_parts.append(f"<{delimiter}:{len(part)}>")
+            else:
+                signature_parts.append(self._segment_signature(part))
+        return "|".join(signature_parts) if signature_parts else "<empty>"
+
+    def _analyze_grammar_properties(self, values: pd.Series) -> Dict[str, Any]:
+        """Summarize delimiter-aware grammar variants for string columns."""
+        cleaned = values.dropna().astype(str).str.strip()
+        cleaned = cleaned[cleaned != ""]
+        if cleaned.empty:
+            return {
+                'delimiter_distribution': [],
+                'segment_count_distribution': [],
+                'grammar_variants': [],
+                'grammar_variant_coverage': 0.0,
+            }
+
+        total = len(cleaned)
+        delimiter_counter = Counter()
+        segment_counter = Counter()
+        grammar_counter = Counter()
+
+        for value in cleaned:
+            delimiters = re.findall(r'[\-_/.:\s]', value)
+            for delimiter in delimiters:
+                delimiter_counter[' ' if delimiter.isspace() else delimiter] += 1
+            non_empty_segments = [part for part in re.split(r'[\-_/.:\s]+', value) if part]
+            segment_counter[len(non_empty_segments)] += 1
+            grammar_counter[self._grammar_signature(value)] += 1
+
+        delimiter_distribution = []
+        total_delimiters = sum(delimiter_counter.values())
+        for delimiter, count in delimiter_counter.most_common(MAX_TOKEN_ENTRIES):
+            delimiter_distribution.append({
+                'delimiter': delimiter,
+                'count': int(count),
+                'ratio': round(float(count) / total_delimiters, 3) if total_delimiters else 0.0,
+            })
+
+        segment_count_distribution = []
+        for seg_count, count in sorted(segment_counter.items())[:MAX_LENGTH_ENTRIES]:
+            segment_count_distribution.append({
+                'segments': int(seg_count),
+                'count': int(count),
+                'ratio': round(float(count) / total, 3),
+            })
+
+        grammar_variants = []
+        coverage = 0.0
+        for signature, count in grammar_counter.most_common(MAX_GRAMMAR_VARIANTS):
+            ratio = round(float(count) / total, 3)
+            grammar_variants.append({
+                'signature': signature,
+                'count': int(count),
+                'ratio': ratio,
+            })
+            coverage += ratio
+
+        return {
+            'delimiter_distribution': delimiter_distribution,
+            'segment_count_distribution': segment_count_distribution,
+            'grammar_variants': grammar_variants,
+            'grammar_variant_coverage': round(float(coverage), 3),
+        }
+
+    def _top_token_support(self, normalized_series: pd.Series) -> List[Dict[str, Any]]:
+        """Collect frequent word tokens for prototype/lexical matching."""
+        token_counter = Counter()
+        total = 0
+        for value in normalized_series.tolist():
+            for token in re.findall(r"[a-z0-9]+", str(value)):
+                token_counter[token] += 1
+                total += 1
+        results = []
+        for token, count in token_counter.most_common(MAX_TOKEN_ENTRIES):
+            results.append({
+                'token': token,
+                'count': int(count),
+                'ratio': round(float(count) / total, 3) if total else 0.0,
+            })
+        return results
+
+    def _top_char_ngrams(self, values: pd.Series, n: int = 3) -> List[Dict[str, Any]]:
+        """Collect frequent character n-grams for lexical prototype matching."""
+        ngram_counter = Counter()
+        total = 0
+        for value in values.dropna().astype(str).str.strip().tolist():
+            text = value.lower()
+            if len(text) < n:
+                continue
+            seen = set()
+            for idx in range(len(text) - n + 1):
+                gram = text[idx: idx + n]
+                if gram.isspace() or gram in seen:
+                    continue
+                seen.add(gram)
+                ngram_counter[gram] += 1
+                total += 1
+        results = []
+        for gram, count in ngram_counter.most_common(MAX_CHAR_NGRAMS):
+            results.append({
+                'ngram': gram,
+                'count': int(count),
+                'ratio': round(float(count) / total, 3) if total else 0.0,
+            })
+        return results
+
+    def _summarize_prototype_candidates(self, normalized_top_values: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Summarize representative high-support prototypes for lexical family."""
+        if not normalized_top_values:
+            return {'coverage': 0.0, 'candidates': []}
+        candidates = []
+        coverage = 0.0
+        for item in normalized_top_values[:10]:
+            coverage += float(item.get('ratio', 0.0))
+            candidates.append({
+                'value': item.get('value'),
+                'example': item.get('example'),
+                'count': int(item.get('count', 0)),
+                'ratio': float(item.get('ratio', 0.0)),
+            })
+        return {
+            'coverage': round(float(coverage), 3),
+            'candidates': candidates,
+        }
 
     def _generate_regex_candidates(self, values: pd.Series) -> List[Dict[str, Any]]:
         """Propose regex patterns that cover majority patterns."""
@@ -600,6 +767,10 @@ class PandasProfiler:
         # Shape distribution for numeric columns
         shape_distribution = self._shape_distribution(str_series)
         regex_candidates = self._generate_regex_candidates(str_series)
+        grammar_metadata = self._analyze_grammar_properties(str_series)
+        prototype_candidates = self._summarize_prototype_candidates(normalized_top_values)
+        token_support = self._top_token_support(normalized_series)
+        char_ngram_support = self._top_char_ngrams(str_series)
 
         return {
             'normalized_top_values': normalized_top_values,
@@ -607,7 +778,11 @@ class PandasProfiler:
             'low_frequency_values': low_frequency_values,
             'length_distribution': length_distribution,
             'shape_distribution': shape_distribution,
-            'regex_candidates': regex_candidates
+            'regex_candidates': regex_candidates,
+            'prototype_candidates': prototype_candidates,
+            'top_tokens': token_support,
+            'char_ngram_support': char_ngram_support,
+            **grammar_metadata,
         }
 
     def _analyze_text(self, column: str) -> Dict[str, Any]:
@@ -730,6 +905,22 @@ class PandasProfiler:
 
             if profiles:
                 metadata['relationship_profiles'] = profiles
+
+    def _attach_available_families(self):
+        """Annotate which evidence families look applicable for each column."""
+        for metadata in self.metadata.values():
+            families = ['missing', 'pattern']
+            if metadata.get('type') == 'numeric':
+                families.append('outlier')
+            if metadata.get('type') in {'categorical', 'pattern', 'text'}:
+                families.append('prototype_lexical')
+            if metadata.get('relationship_profiles'):
+                families.append('relationship')
+            seen = []
+            for family in families:
+                if family not in seen:
+                    seen.append(family)
+            metadata['available_families'] = seen
 
     def _summarize_relationship_constraint(self, column: str, other_column: str,
                                            constraint_type: str) -> Dict[str, Any]:

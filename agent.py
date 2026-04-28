@@ -1945,14 +1945,18 @@ class AgentFactory:
         
         return agents
 
-    def create_clean_agents(self, column: str, column_type: str) -> List[BaseAgent]:
+    def create_clean_agents(self, column: str, column_type: str,
+                            col_metadata: Dict[str, Any] = None) -> List[BaseAgent]:
         """Create clean-rule agents that cover completeness/accuracy/relationships/patterns."""
-        return [
+        agents: List[BaseAgent] = [
             CleanCompletenessAgent(self.base_url, self.model),
             CleanAccuracyAgent(self.base_url, self.model),
-            # CleanRelationshipAgent(self.base_url, self.model),
             CleanPatternAgent(self.base_url, self.model),
         ]
+        metadata = col_metadata or {}
+        if metadata.get('relationship_constraints') or metadata.get('relationship_profiles'):
+            agents.append(CleanRelationshipAgent(self.base_url, self.model))
+        return agents
 
     def _generate_rules_for_single_column(self, column: str, col_metadata: Dict[str, Any]) -> Tuple[str, List[Tuple[str, str]], Dict[str, Dict[str, str]], List[str]]:
         col_type = col_metadata.get('type', 'text')
@@ -2020,7 +2024,7 @@ class AgentFactory:
 
     def _generate_clean_rules_for_single_column(self, column: str, col_metadata: Dict[str, Any]) -> Tuple[str, List[Tuple[str, str]], Dict[str, Dict[str, str]], List[str]]:
         column_type = col_metadata.get('type', 'text')
-        agents = self.create_clean_agents(column, column_type)
+        agents = self.create_clean_agents(column, column_type, col_metadata)
         column_rules: List[Tuple[str, str]] = []
         column_prompts: Dict[str, Dict[str, str]] = {}
         log_lines: List[str] = []

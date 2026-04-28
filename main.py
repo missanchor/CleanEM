@@ -7,6 +7,7 @@ import argparse
 import logging
 import os
 import re
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, List, Any, Tuple, Optional
@@ -20,16 +21,24 @@ from agent import AgentFactory, DirtyExampleAgent, CleanRuleReflectionAgent
 from profiler import PandasProfiler, DEFAULT_MISSING_TOKEN_SET
 from validator import DisjointnessValidator
 from core.utils import safe_dict
+from cleanem_inference import (
+    build_cell_evidence_matrix,
+    estimate_calibrated_posteriors,
+    select_active_queries,
+)
+from cleanem_models import CellRecord, EvidenceObservation, HardEvidenceLabel, ValueRecord
 
 
 # CleanEM Logger
 cleanem_logger = logging.getLogger("CleanEM")
 
-FAMILIES = ["missing", "outlier", "pattern"]
+FAMILIES = ["missing", "outlier", "pattern", "relationship", "prototype_lexical"]
 FAMILY_SCORE_KEYS = {
     "missing": "S_missing",
     "outlier": "S_outlier",
     "pattern": "S_pattern",
+    "relationship": "S_relationship",
+    "prototype_lexical": "S_prototype_lexical",
 }
 ANCHOR_HARD_CLEAN = "hard_clean"
 ANCHOR_HARD_DIRTY = "hard_dirty"
@@ -46,12 +55,38 @@ class GroupRecord:
     anchor_state: str
     anchor_source: str
     representative_value: Any
+    dirty_prior: float = 0.5
+    anchor_weight: float = 0.0
+    support_count: int = 0
 
 
 @dataclass
 class FamilyRunStatus:
     status: str
     reason: str = ""
+    coverage_rows: int = 0
+    coverage_groups: int = 0
+    reliability: float = float("nan")
+    mode: str = "abstained"
+
+
+@dataclass(frozen=True)
+class FamilySpec:
+    name: str
+    score_key: str
+    uses_rules: bool = True
+    allow_synthetic: bool = True
+
+
+FAMILY_REGISTRY: Dict[str, FamilySpec] = {
+    family: FamilySpec(
+        name=family,
+        score_key=FAMILY_SCORE_KEYS[family],
+        uses_rules=family != "prototype_lexical",
+        allow_synthetic=family in {"missing", "outlier", "pattern"},
+    )
+    for family in FAMILIES
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--base_url",
-        default="http://localhost:8000/v1",
+        default="http://127.0.0.1:8000/v1",
         help="OpenAI-compatible endpoint for rule-generating LLMs."
     )
     parser.add_argument(
@@ -129,25 +164,25 @@ def parse_args() -> argparse.Namespace:
         "--em_max_iters",
         type=int,
         default=10,
-        help="Maximum EM iterations per column/family."
+        help="Legacy/unused in clean_em mode after evidence-fusion rewrite."
     )
     parser.add_argument(
         "--em_prior_dirty",
         type=float,
         default=0.05,
-        help="Initial prior dirty rate per family."
+        help="Base prior dirty rate used for value-prior initialization."
     )
     parser.add_argument(
         "--calib_min_clean_pass",
         type=float,
         default=0.8,
-        help="Min required pass-rate on clean seeds to keep a rule (0-1)."
+        help="Legacy/unused in clean_em mode after evidence-fusion rewrite."
     )
     parser.add_argument(
         "--calib_max_dirty_pass",
         type=float,
         default=0.3,
-        help="Max allowed pass-rate on synthetic dirty to keep a rule (0-1)."
+        help="Legacy/unused in clean_em mode after evidence-fusion rewrite."
     )
     parser.add_argument(
         "--top_k",
@@ -159,7 +194,13 @@ def parse_args() -> argparse.Namespace:
         "--score_threshold",
         type=float,
         default=0.5,
-        help="Threshold on S_total to treat a cell as error in clean_em mode."
+        help="Threshold on cell_posterior to treat a cell as error in clean_em mode."
+    )
+    parser.add_argument(
+        "--active_label_budget",
+        type=int,
+        default=10,
+        help="Max oracle cell labels used to calibrate clean_em evidence sources."
     )
     return parser.parse_args()
 
@@ -186,6 +227,7 @@ def _build_clean_rule_pool(
         "completeness": "missing",
         "accuracy": "outlier",
         "pattern_consistency": "pattern",
+        "column_relationship": "relationship",
     }
     pool: Dict[str, List[Dict[str, Any]]] = {}
     for column, rules in clean_rules.items():
@@ -287,11 +329,81 @@ def _coerce_numeric(value: Any) -> Optional[float]:
         except Exception:
             return None
         return None if np.isnan(numeric) else numeric
-    text = str(value).strip().replace(",", "")
+    text = str(value).strip()
     if not text:
         return None
+    negative = False
+    if text.startswith("(") and text.endswith(")"):
+        negative = True
+        text = text[1:-1].strip()
+    if text.endswith("%"):
+        text = text[:-1].strip()
+    if text.startswith("$"):
+        text = text[1:].strip()
+    text = text.replace(",", "")
+    if not text:
+        return None
+    if negative:
+        text = f"-{text}"
     try:
         numeric = float(text)
+    except Exception:
+        return None
+    return None if np.isnan(numeric) else numeric
+
+
+def _matching_regex_rate(value: Any, regex_candidates: List[Dict[str, Any]]) -> float:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return 0.0
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    best_rate = 0.0
+    for candidate in regex_candidates or []:
+        pattern = str(candidate.get("pattern", ""))
+        if not pattern:
+            continue
+        try:
+            if re.fullmatch(pattern, text):
+                best_rate = max(best_rate, float(candidate.get("match_rate", 0.0)))
+        except re.error:
+            continue
+    return float(best_rate)
+
+
+def _best_regex_contract_rate(metadata: Dict[str, Any]) -> float:
+    regex_candidates = metadata.get("regex_candidates") or []
+    if not regex_candidates:
+        return 0.0
+    return float(max(float(candidate.get("match_rate", 0.0)) for candidate in regex_candidates))
+
+
+def _has_trusted_numeric_contract(metadata: Dict[str, Any]) -> bool:
+    if metadata.get("type") != "numeric":
+        return False
+    numeric_count = int(metadata.get("numeric_count") or 0)
+    non_numeric_count = int(metadata.get("non_numeric_count") or 0)
+    total = numeric_count + non_numeric_count
+    numeric_ratio = float(numeric_count / total) if total > 0 else 0.0
+    regex_rate = _best_regex_contract_rate(metadata)
+    return bool(numeric_ratio >= 0.80 or regex_rate >= 0.60)
+
+
+def _coerce_numeric_with_metadata(value: Any, metadata: Dict[str, Any]) -> Optional[float]:
+    numeric = _coerce_numeric(value)
+    if numeric is not None:
+        return numeric
+
+    regex_rate = _matching_regex_rate(value, metadata.get("regex_candidates") or [])
+    if regex_rate <= 0.0:
+        return None
+
+    text = str(value).strip().replace(",", "")
+    match = re.search(r"(-?\d+(?:\.\d+)?)", text)
+    if not match:
+        return None
+    try:
+        numeric = float(match.group(1))
     except Exception:
         return None
     return None if np.isnan(numeric) else numeric
@@ -668,541 +780,1757 @@ def _setup_cleanem_logger(output_dir: str, dataset_name: str) -> logging.Logger:
     return logger
 
 
+def _clip_probability(value: float, lower: float = 1e-3, upper: float = 1 - 1e-3) -> float:
+    return float(min(max(value, lower), upper))
+
+
+def _format_float(value: float) -> str:
+    if value is None or pd.isna(value):
+        return "nan"
+    return f"{float(value):.4f}"
+
+
+def _set_group_anchor(
+    record: GroupRecord,
+    state: str,
+    source: str,
+    dirty_prior: float,
+    anchor_weight: float,
+) -> None:
+    record.anchor_state = state
+    record.anchor_source = source
+    record.dirty_prior = _clip_probability(dirty_prior)
+    record.anchor_weight = float(np.clip(anchor_weight, 0.0, 1.0))
+    record.support_count = record.weight
+
+
+def _build_value_groups(df: pd.DataFrame, column: str) -> List[GroupRecord]:
+    groups_by_signature: Dict[str, GroupRecord] = {}
+    for row_idx, value in enumerate(df[column].tolist()):
+        signature = _normalize_signature(value)
+        record = groups_by_signature.get(signature)
+        if record is None:
+            record = GroupRecord(
+                normalized_signature=signature,
+                row_indices=[],
+                weight=0,
+                rule_outputs_by_family={},
+                anchor_state=ANCHOR_UNLABELED,
+                anchor_source="unlabeled",
+                representative_value=value,
+            )
+            groups_by_signature[signature] = record
+        record.row_indices.append(row_idx)
+        record.weight += 1
+    return list(groups_by_signature.values())
+
+
+def _segment_signature(value: str) -> str:
+    if value == "":
+        return "<empty>"
+    if value.isspace():
+        return f"S{len(value)}"
+    if all(char.isdigit() for char in value):
+        return f"D{len(value)}"
+    if all(char.isalpha() for char in value):
+        return f"A{len(value)}"
+    if all(char.isalnum() for char in value):
+        return f"M{len(value)}"
+    return f"X{len(value)}"
+
+
+def _grammar_signature(value: Any) -> str:
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return "<empty>"
+    parts = re.split(r'([\-_/.:\s]+)', text)
+    signature_parts: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if re.fullmatch(r'[\-_/.:\s]+', part):
+            delimiter = part[0]
+            if delimiter.isspace():
+                delimiter = ' '
+            signature_parts.append(f"<{delimiter}:{len(part)}>" )
+        else:
+            signature_parts.append(_segment_signature(part))
+    return "|".join(signature_parts) if signature_parts else "<empty>"
+
+
+def _relationship_predicate(value: Any, other_value: Any, constraint_type: str) -> bool:
+    if value is None or other_value is None:
+        return True
+    value_str = str(value).strip()
+    other_str = str(other_value).strip()
+    if not value_str or not other_str:
+        return True
+    constraint_type = (constraint_type or "").lower()
+    if constraint_type == "prefix_match":
+        return value_str.lower().startswith(other_str.lower())
+    if constraint_type == "contains":
+        return other_str.lower() in value_str.lower()
+    if constraint_type == "stateavg_format":
+        return value_str.lower().startswith(f"{other_str.lower()}_")
+    if constraint_type == "zip_prefix":
+        return value_str[:3] == other_str[:3]
+    return True
+
+
+def _build_soft_anchor_groups(
+    df: pd.DataFrame,
+    column: str,
+    metadata: Dict[str, Any],
+    family: str,
+    prior_dirty: float,
+) -> Tuple[List[GroupRecord], FamilyRunStatus]:
+    groups = _build_value_groups(df, column)
+    if not groups:
+        return [], FamilyRunStatus(status="abstained", reason="empty_column")
+
+    status = FamilyRunStatus(status="ran", mode="ran")
+
+    if family == "missing":
+        for record in groups:
+            if _is_missing_like(record.representative_value, metadata):
+                _set_group_anchor(record, ANCHOR_HARD_DIRTY, "real_missing_token", 0.99, 1.0)
+            else:
+                _set_group_anchor(record, ANCHOR_HARD_CLEAN, "real_non_missing", 0.01, 1.0)
+        return groups, status
+
+    if family == "outlier":
+        if metadata.get("type") != "numeric":
+            for record in groups:
+                _set_group_anchor(record, ANCHOR_ABSTAIN, "categorical_outlier_disabled", prior_dirty, 0.0)
+            return groups, FamilyRunStatus(status="abstained", reason="categorical_outlier_disabled")
+
+        quantiles = metadata.get("quantiles") or {}
+        p25 = quantiles.get("p25")
+        p75 = quantiles.get("p75")
+        p05 = quantiles.get("p05")
+        p95 = quantiles.get("p95")
+        if p25 is None or p75 is None:
+            for record in groups:
+                _set_group_anchor(record, ANCHOR_ABSTAIN, "missing_numeric_stats", prior_dirty, 0.0)
+            return groups, FamilyRunStatus(status="abstained", reason="missing_numeric_stats")
+
+        iqr = float(metadata.get("iqr") or 0.0)
+        inner_low = float(p25)
+        inner_high = float(p75)
+        if inner_low == inner_high:
+            inner_low = float(p05 if p05 is not None else p25)
+            inner_high = float(p95 if p95 is not None else p75)
+        if iqr > 0:
+            outer_low = float(p25) - 6.0 * iqr
+            outer_high = float(p75) + 6.0 * iqr
+        else:
+            outer_low = float(p05 if p05 is not None else p25)
+            outer_high = float(p95 if p95 is not None else p75)
+
+        for record in groups:
+            value = record.representative_value
+            if _is_missing_like(value, metadata):
+                _set_group_anchor(record, ANCHOR_UNLABELED, "missing_reserved_for_missing_family", prior_dirty, 0.15)
+                continue
+            numeric = _coerce_numeric(value)
+            if numeric is None:
+                _set_group_anchor(record, ANCHOR_HARD_DIRTY, "non_numeric_value", 0.99, 1.0)
+            elif inner_low <= numeric <= inner_high:
+                _set_group_anchor(record, ANCHOR_HARD_CLEAN, "central_numeric_band", 0.02, 0.95)
+            elif numeric < outer_low or numeric > outer_high:
+                _set_group_anchor(record, ANCHOR_HARD_DIRTY, "extreme_numeric_value", 0.98, 0.95)
+            else:
+                offset = 0.5
+                if outer_high > inner_high and numeric > inner_high:
+                    offset = min(0.85, 0.35 + (numeric - inner_high) / max(outer_high - inner_high, 1e-6))
+                elif inner_low > outer_low and numeric < inner_low:
+                    offset = min(0.85, 0.35 + (inner_low - numeric) / max(inner_low - outer_low, 1e-6))
+                _set_group_anchor(record, ANCHOR_UNLABELED, "numeric_borderline", offset, 0.4)
+        return groups, status
+
+    if family == "pattern":
+        grammar_variants = metadata.get("grammar_variants") or []
+        accepted_variants = [
+            str(item.get("signature"))
+            for item in grammar_variants
+            if float(item.get("ratio", 0.0)) >= 0.05
+        ]
+        grammar_coverage = float(sum(
+            float(item.get("ratio", 0.0))
+            for item in grammar_variants
+            if float(item.get("ratio", 0.0)) >= 0.05
+        ))
+        shape_distribution = metadata.get("shape_distribution") or []
+        accepted_shapes = {
+            str(item.get("shape"))
+            for item in shape_distribution
+            if float(item.get("ratio", 0.0)) >= 0.05
+        }
+        regex_candidates = [
+            str(item.get("pattern"))
+            for item in metadata.get("regex_candidates") or []
+            if float(item.get("match_rate", 0.0)) >= 0.35
+        ]
+
+        if not accepted_variants and not accepted_shapes and not regex_candidates:
+            for record in groups:
+                _set_group_anchor(record, ANCHOR_ABSTAIN, "weak_structure_evidence", prior_dirty, 0.0)
+            return groups, FamilyRunStatus(status="abstained", reason="weak_structure_evidence")
+
+        if grammar_coverage < 0.35 and len(regex_candidates) == 0:
+            status.reason = "weak_structure_evidence"
+            status.mode = "provisional"
+
+        for record in groups:
+            value = record.representative_value
+            if _is_missing_like(value, metadata):
+                _set_group_anchor(record, ANCHOR_UNLABELED, "missing_reserved_for_missing_family", prior_dirty, 0.15)
+                continue
+
+            text = str(value).strip()
+            grammar_sig = _grammar_signature(text)
+            grammar_match = grammar_sig in accepted_variants if accepted_variants else False
+            shape_match = _shape_signature(text) in accepted_shapes if accepted_shapes else False
+            regex_match = False
+            for pattern in regex_candidates:
+                try:
+                    if re.fullmatch(pattern, text):
+                        regex_match = True
+                        break
+                except re.error:
+                    continue
+
+            if grammar_match:
+                _set_group_anchor(record, ANCHOR_HARD_CLEAN, "stable_grammar", 0.02, 0.95)
+            elif regex_match:
+                _set_group_anchor(record, ANCHOR_HARD_CLEAN, "regex_consistent", 0.08, 0.75)
+            elif shape_match:
+                _set_group_anchor(record, ANCHOR_UNLABELED, "coarse_shape_match", 0.35, 0.35)
+            else:
+                source = "grammar_violation" if accepted_variants or regex_candidates else "structure_violation"
+                _set_group_anchor(record, ANCHOR_HARD_DIRTY, source, 0.95, 0.85)
+        return groups, status
+
+    if family == "relationship":
+        profiles = metadata.get("relationship_profiles") or []
+        strong_profiles = [
+            profile for profile in profiles
+            if float(profile.get("violation_rate", 1.0)) <= 0.25
+            and int(profile.get("applicable_count", 0)) >= max(5, int(0.02 * max(len(df), 1)))
+        ]
+        if not strong_profiles:
+            for record in groups:
+                _set_group_anchor(record, ANCHOR_ABSTAIN, "weak_relationship_evidence", prior_dirty, 0.0)
+            return groups, FamilyRunStatus(status="abstained", reason="weak_relationship_evidence")
+
+        active_groups = 0
+        for record in groups:
+            applicable = 0
+            valid = 0
+            for row_idx in record.row_indices:
+                row = df.iloc[row_idx]
+                for profile in strong_profiles:
+                    other_column = profile.get("other_column")
+                    if not other_column or other_column not in df.columns:
+                        continue
+                    current_value = row[column]
+                    other_value = row[other_column]
+                    if pd.isna(current_value) or pd.isna(other_value):
+                        continue
+                    if str(current_value).strip() == "" or str(other_value).strip() == "":
+                        continue
+                    applicable += 1
+                    valid += int(_relationship_predicate(current_value, other_value, profile.get("type", "")))
+            if applicable == 0:
+                _set_group_anchor(record, ANCHOR_UNLABELED, "no_applicable_relationship", prior_dirty, 0.0)
+                continue
+            active_groups += 1
+            satisfaction = valid / max(applicable, 1)
+            weight = min(1.0, applicable / max(len(strong_profiles), 1))
+            if satisfaction >= 0.95:
+                _set_group_anchor(record, ANCHOR_HARD_CLEAN, "relationship_consistent", 0.02, weight)
+            elif satisfaction <= 0.2:
+                _set_group_anchor(record, ANCHOR_HARD_DIRTY, "relationship_violation", 0.98, weight)
+            else:
+                _set_group_anchor(record, ANCHOR_UNLABELED, "relationship_mixed", 1.0 - satisfaction, min(0.6, weight))
+
+        if active_groups == 0:
+            return groups, FamilyRunStatus(status="abstained", reason="no_applicable_relationship")
+        if active_groups < max(3, int(0.1 * len(groups))):
+            return groups, FamilyRunStatus(status="ran", reason="sparse_relationship_support", mode="provisional")
+        return groups, status
+
+    for record in groups:
+        _set_group_anchor(record, ANCHOR_ABSTAIN, "unsupported_family", prior_dirty, 0.0)
+    return groups, FamilyRunStatus(status="abstained", reason="unsupported_family")
+
+
+def _build_anchor_arrays_v2(
+    n_rows: int,
+    anchor_groups: List[GroupRecord],
+    prior_dirty: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    anchor_states = np.full(n_rows, ANCHOR_UNLABELED, dtype=object)
+    anchor_sources = np.full(n_rows, "unlabeled", dtype=object)
+    anchor_priors = np.full(n_rows, float(prior_dirty), dtype=float)
+    anchor_weights = np.zeros(n_rows, dtype=float)
+    for record in anchor_groups:
+        for row_idx in record.row_indices:
+            anchor_states[row_idx] = record.anchor_state
+            anchor_sources[row_idx] = record.anchor_source
+            anchor_priors[row_idx] = record.dirty_prior
+            anchor_weights[row_idx] = record.anchor_weight
+    return anchor_states, anchor_sources, anchor_priors, anchor_weights
+
+
+def _build_em_groups_v2(
+    anchor_groups: List[GroupRecord],
+    family: str,
+    family_outputs: np.ndarray,
+    df: pd.DataFrame,
+    column: str,
+) -> List[GroupRecord]:
+    em_groups: Dict[Tuple[str, Tuple[int, ...], str, str, float, float], GroupRecord] = {}
+    for anchor_group in anchor_groups:
+        if anchor_group.anchor_state == ANCHOR_ABSTAIN:
+            continue
+        for row_idx in anchor_group.row_indices:
+            obs = tuple(int(v) for v in family_outputs[row_idx].tolist()) if family_outputs.size else tuple()
+            key = (
+                anchor_group.normalized_signature,
+                obs,
+                anchor_group.anchor_state,
+                anchor_group.anchor_source,
+                round(float(anchor_group.dirty_prior), 3),
+                round(float(anchor_group.anchor_weight), 3),
+            )
+            if key not in em_groups:
+                em_groups[key] = GroupRecord(
+                    normalized_signature=anchor_group.normalized_signature,
+                    row_indices=[],
+                    weight=0,
+                    rule_outputs_by_family={family: np.array(obs, dtype=int)},
+                    anchor_state=anchor_group.anchor_state,
+                    anchor_source=anchor_group.anchor_source,
+                    representative_value=df.iloc[row_idx][column],
+                    dirty_prior=anchor_group.dirty_prior,
+                    anchor_weight=anchor_group.anchor_weight,
+                    support_count=anchor_group.support_count,
+                )
+            em_groups[key].row_indices.append(int(row_idx))
+            em_groups[key].weight += 1
+    return list(em_groups.values())
+
+
+def _select_representative_values_v2(anchor_groups: List[GroupRecord], limit: int = 20) -> List[Any]:
+    clean_groups = [
+        record for record in anchor_groups
+        if record.anchor_weight >= 0.5 and record.dirty_prior <= 0.25
+    ]
+    clean_groups.sort(key=lambda record: record.weight * max(record.anchor_weight, 1e-3), reverse=True)
+    selected: List[Any] = []
+    seen_signatures = set()
+    for record in clean_groups:
+        if record.normalized_signature in seen_signatures:
+            continue
+        seen_signatures.add(record.normalized_signature)
+        selected.append(record.representative_value)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _weighted_pass_rate(outputs: np.ndarray, weights: np.ndarray) -> float:
+    if outputs.size == 0 or weights.size == 0:
+        return float("nan")
+    total_weight = float(weights.sum())
+    if total_weight <= 0:
+        return float("nan")
+    return float(np.dot(outputs.astype(float), weights.astype(float)) / total_weight)
+
+
+def _compute_family_reliability(
+    rule_quality: float,
+    coverage_rows: int,
+    coverage_groups: int,
+    total_rows: int,
+    mode: str,
+) -> float:
+    coverage_ratio = coverage_rows / max(total_rows, 1)
+    group_ratio = min(1.0, coverage_groups / max(3.0, np.sqrt(max(total_rows, 1))))
+    reliability = 0.45 * max(rule_quality, 0.0) + 0.35 * coverage_ratio + 0.20 * group_ratio
+    if mode == "provisional":
+        reliability *= 0.65
+    return float(np.clip(reliability, 0.05, 0.99))
+
+
+def _compute_family_weight(status: FamilyRunStatus, total_rows: int) -> float:
+    if status.status == "abstained" or pd.isna(status.reliability):
+        return 0.0
+    coverage_confidence = min(1.0, status.coverage_rows / max(1, int(0.1 * max(total_rows, 1))))
+    mode_factor = 1.0 if status.mode == "ran" else 0.6
+    return float(np.clip(status.reliability * max(0.25, coverage_confidence) * mode_factor, 0.0, 1.0))
+
+
+def _levenshtein_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i]
+        for j, right_char in enumerate(right, start=1):
+            cost = 0 if left_char == right_char else 1
+            current.append(min(
+                previous[j] + 1,
+                current[j - 1] + 1,
+                previous[j - 1] + cost,
+            ))
+        previous = current
+    return previous[-1]
+
+
+def _char_ngrams(value: str, n: int = 3) -> set:
+    text = value.lower()
+    if len(text) < n:
+        return {text} if text else set()
+    return {text[idx: idx + n] for idx in range(len(text) - n + 1)}
+
+
+def _token_jaccard(left: str, right: str) -> float:
+    left_tokens = set(re.findall(r"[a-z0-9]+", left.lower()))
+    right_tokens = set(re.findall(r"[a-z0-9]+", right.lower()))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    union = left_tokens | right_tokens
+    if not union:
+        return 0.0
+    return float(len(left_tokens & right_tokens) / len(union))
+
+
+def _prototype_similarity(left: str, right: str) -> Tuple[float, float, float, int]:
+    if not left or not right:
+        return 0.0, 0.0, 0.0, max(len(left), len(right))
+    edit_distance = _levenshtein_distance(left.lower(), right.lower())
+    edit_similarity = 1.0 - (edit_distance / max(len(left), len(right), 1))
+    left_ngrams = _char_ngrams(left)
+    right_ngrams = _char_ngrams(right)
+    ngram_similarity = float(len(left_ngrams & right_ngrams) / len(left_ngrams | right_ngrams)) if left_ngrams and right_ngrams else 0.0
+    token_similarity = _token_jaccard(left, right)
+    return edit_similarity, ngram_similarity, token_similarity, edit_distance
+
+
+def _score_prototype_lexical_family(
+    df: pd.DataFrame,
+    column: str,
+    metadata: Dict[str, Any],
+) -> Tuple[np.ndarray, np.ndarray, FamilyRunStatus]:
+    n_rows = len(df)
+    scores = np.full(n_rows, np.nan, dtype=float)
+    sources = np.full(n_rows, "prototype_unavailable", dtype=object)
+
+    if metadata.get("type") not in {"categorical", "pattern", "text"}:
+        return scores, sources, FamilyRunStatus(status="abstained", reason="prototype_not_applicable")
+
+    groups = _build_value_groups(df, column)
+    valid_groups = [group for group in groups if not _is_missing_like(group.representative_value, metadata)]
+    if not valid_groups:
+        return scores, sources, FamilyRunStatus(status="abstained", reason="empty_column")
+
+    prototype_threshold = max(2, int(np.ceil(0.01 * max(n_rows, 1))))
+    prototypes = [
+        group for group in valid_groups
+        if group.weight >= prototype_threshold or (
+            group.weight >= 2 and (group.weight / max(n_rows, 1)) >= 0.02
+        )
+    ]
+    prototypes.sort(key=lambda record: record.weight, reverse=True)
+    prototypes = prototypes[:25]
+    prototype_coverage = sum(record.weight for record in prototypes) / max(n_rows, 1)
+
+    if len(prototypes) < 2 or prototype_coverage < 0.12:
+        return scores, sources, FamilyRunStatus(status="abstained", reason="insufficient_prototype_support")
+
+    for group in valid_groups:
+        group_text = str(group.representative_value).strip()
+        if group.normalized_signature in {prototype.normalized_signature for prototype in prototypes}:
+            group_score = 0.0
+            source = "prototype_bank"
+        else:
+            best_prototype = None
+            best_score = 0.0
+            best_distance = 0
+            for prototype in prototypes:
+                if prototype.normalized_signature == group.normalized_signature:
+                    continue
+                edit_similarity, ngram_similarity, token_similarity, edit_distance = _prototype_similarity(
+                    group_text,
+                    str(prototype.representative_value).strip(),
+                )
+                similarity = 0.55 * edit_similarity + 0.25 * ngram_similarity + 0.20 * token_similarity
+                if similarity > best_score:
+                    best_score = similarity
+                    best_prototype = prototype
+                    best_distance = edit_distance
+
+            if best_prototype is None or best_score < 0.55:
+                group_score = 0.0
+                source = "no_close_prototype"
+            else:
+                support_factor = min(1.0, best_prototype.weight / max(3.0, 0.05 * max(n_rows, 1)))
+                rarity_factor = 1.0 - min(0.85, group.weight / max(best_prototype.weight, 1))
+                group_score = best_score * support_factor * max(rarity_factor, 0.15)
+                if best_distance <= 2 and abs(len(group_text) - len(str(best_prototype.representative_value).strip())) <= 2:
+                    group_score += 0.10
+                if _shape_signature(group_text) == _shape_signature(str(best_prototype.representative_value).strip()):
+                    group_score += 0.05
+                group_score = float(np.clip(group_score, 0.0, 1.0))
+                source = f"closest_prototype:{best_prototype.normalized_signature}"
+
+        for row_idx in group.row_indices:
+            scores[row_idx] = group_score
+            sources[row_idx] = source
+
+    coverage_rows = int(np.sum(pd.notna(scores)))
+    coverage_groups = len(valid_groups)
+    mode = "ran" if prototype_coverage >= 0.25 else "provisional"
+    reliability = float(np.clip(0.45 * prototype_coverage + 0.25 * min(1.0, len(prototypes) / 6.0) + 0.30, 0.10, 0.90))
+    if mode == "provisional":
+        reliability *= 0.7
+    return scores, sources, FamilyRunStatus(
+        status="ran",
+        reason="",
+        coverage_rows=coverage_rows,
+        coverage_groups=coverage_groups,
+        reliability=reliability,
+        mode=mode,
+    )
+
+
+def _run_weighted_em_for_family_v2(
+    group_z: np.ndarray,
+    group_weights: np.ndarray,
+    dirty_priors: np.ndarray,
+    anchor_weights: np.ndarray,
+    max_iters: int,
+    prior_dirty: float,
+    rule_weights: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    n_groups = group_z.shape[0]
+    n_rules = group_z.shape[1] if group_z.ndim == 2 else 0
+    eps = 1e-3
+    if n_groups == 0 or n_rules == 0:
+        return np.zeros(n_groups), np.zeros(n_rules), np.zeros(n_rules), float("nan")
+
+    dirty_priors = np.clip(dirty_priors.astype(float), eps, 1 - eps)
+    anchor_weights = np.clip(anchor_weights.astype(float), 0.0, 1.0)
+    if rule_weights is None or rule_weights.size == 0:
+        rule_weights = np.ones(n_rules, dtype=float)
+    else:
+        rule_weights = np.clip(rule_weights.astype(float), 0.1, 1.0)
+
+    pi1 = _clip_probability(float(prior_dirty))
+    gamma = anchor_weights * dirty_priors + (1.0 - anchor_weights) * pi1
+    gamma = np.clip(gamma, eps, 1 - eps)
+
+    alpha = np.full(n_rules, 0.9, dtype=float)
+    beta = np.full(n_rules, 0.3, dtype=float)
+
+    for _ in range(max_iters):
+        clean_weights = group_weights * (1.0 - gamma)
+        dirty_weights = group_weights * gamma
+        clean_total = float(clean_weights.sum())
+        dirty_total = float(dirty_weights.sum())
+        if clean_total <= 0 or dirty_total <= 0:
+            break
+
+        alpha = np.clip(clean_weights.T.dot(group_z).ravel() / clean_total, eps, 1 - eps)
+        beta = np.clip(dirty_weights.T.dot(group_z).ravel() / dirty_total, eps, 1 - eps)
+
+        log_p0 = np.full(n_groups, np.log(1.0 - pi1), dtype=float)
+        log_p1 = np.full(n_groups, np.log(pi1), dtype=float)
+        for rule_idx in range(n_rules):
+            zr = group_z[:, rule_idx]
+            weight = rule_weights[rule_idx]
+            log_p0 += weight * (zr * np.log(alpha[rule_idx] + eps) + (1 - zr) * np.log(1.0 - alpha[rule_idx] + eps))
+            log_p1 += weight * (zr * np.log(beta[rule_idx] + eps) + (1 - zr) * np.log(1.0 - beta[rule_idx] + eps))
+
+        max_log = np.maximum(log_p0, log_p1)
+        p0 = np.exp(log_p0 - max_log)
+        p1 = np.exp(log_p1 - max_log)
+        posterior = p1 / (p0 + p1 + eps)
+        gamma = anchor_weights * dirty_priors + (1.0 - anchor_weights) * posterior
+        gamma = np.clip(gamma, eps, 1 - eps)
+        pi1 = _clip_probability(float(np.dot(group_weights, gamma) / max(group_weights.sum(), eps)))
+
+    return gamma, alpha, beta, pi1
+
+
+def _record_observation(
+    observation_map: Dict[str, List[EvidenceObservation]],
+    observation: EvidenceObservation,
+) -> None:
+    target_list = observation_map.setdefault(observation.target_key, [])
+    for idx, existing in enumerate(target_list):
+        if (
+            existing.source_id == observation.source_id
+            and existing.polarity == observation.polarity
+            and existing.hard == observation.hard
+            and existing.reason_code == observation.reason_code
+        ):
+            if observation.strength > existing.strength:
+                target_list[idx] = observation
+            return
+    target_list.append(observation)
+
+
+def _matches_regex_candidates(value: Any, regex_candidates: List[Dict[str, Any]]) -> bool:
+    return _matching_regex_rate(value, regex_candidates) > 0.0
+
+
+def _grammar_distance_score(text: str, metadata: Dict[str, Any]) -> float:
+    grammar_variants = metadata.get("grammar_variants") or []
+    accepted = {
+        str(item.get("signature"))
+        for item in grammar_variants
+        if float(item.get("ratio", 0.0)) >= 0.05
+    }
+    if not accepted:
+        return 0.0
+    signature = _grammar_signature(text)
+    return 0.0 if signature in accepted else 1.0
+
+
+def _shape_distance_score(text: str, metadata: Dict[str, Any]) -> float:
+    shape_distribution = metadata.get("shape_distribution") or []
+    accepted = {
+        str(item.get("shape"))
+        for item in shape_distribution
+        if float(item.get("ratio", 0.0)) >= 0.05
+    }
+    if not accepted:
+        return 0.0
+    shape = _shape_signature(text)
+    return 0.0 if shape in accepted else 1.0
+
+
+def _row_family_pass_ratio(
+    outputs: np.ndarray,
+    family_indices: Dict[str, List[int]],
+    family: str,
+    row_idx: int,
+) -> Optional[float]:
+    indices = family_indices.get(family, [])
+    if outputs.size == 0 or not indices:
+        return None
+    return float(np.mean(outputs[row_idx, indices]))
+
+
+def _prototype_distance_evidence(text: str, metadata: Dict[str, Any]) -> Tuple[float, float]:
+    prototype_candidates = (metadata.get("prototype_candidates") or {}).get("candidates") or []
+    if not text or not prototype_candidates:
+        return 0.0, 0.0
+
+    best_similarity = 0.0
+    for candidate in prototype_candidates:
+        candidate_value = str(candidate.get("value") or candidate.get("example") or "").strip()
+        if not candidate_value:
+            continue
+        edit_similarity, ngram_similarity, token_similarity, _ = _prototype_similarity(text, candidate_value)
+        similarity = 0.55 * edit_similarity + 0.25 * ngram_similarity + 0.20 * token_similarity
+        best_similarity = max(best_similarity, similarity)
+
+    if best_similarity >= 0.88:
+        return min(1.0, 0.4 + 0.6 * best_similarity), 0.0
+    if best_similarity <= 0.35:
+        return 0.0, min(1.0, 0.5 + (0.35 - best_similarity))
+    return 0.0, 0.0
+
+
+def _get_closed_set_legal_values(metadata: Dict[str, Any]) -> set:
+    for key in ("allowed_values", "valid_values", "enum_values"):
+        values = metadata.get(key)
+        if values and isinstance(values, (list, tuple, set)):
+            return {_normalize_signature(value) for value in values}
+    return set()
+
+
+def _numeric_rarity_strength(numeric: float, metadata: Dict[str, Any]) -> float:
+    quantiles = metadata.get("quantiles") or {}
+    p05 = quantiles.get("p05")
+    p95 = quantiles.get("p95")
+    p01 = quantiles.get("p01")
+    p99 = quantiles.get("p99")
+    if p05 is None or p95 is None:
+        return 0.0
+
+    if p01 is not None and numeric < float(p01):
+        return 1.0
+    if p99 is not None and numeric > float(p99):
+        return 1.0
+    if numeric < float(p05):
+        denom = max(float(p05) - float(p01 or p05), 1e-6)
+        return float(min(1.0, 0.4 + (float(p05) - numeric) / denom))
+    if numeric > float(p95):
+        denom = max(float(p99 or p95) - float(p95), 1e-6)
+        return float(min(1.0, 0.4 + (numeric - float(p95)) / denom))
+    return 0.0
+
+
+def _low_frequency_strength(value_record: ValueRecord, metadata: Dict[str, Any]) -> float:
+    normalized = value_record.normalized_value
+    low_frequency_values = {
+        _normalize_signature(item.get("value"))
+        for item in metadata.get("low_frequency_values") or []
+        if item.get("value") is not None
+    }
+    if normalized in low_frequency_values:
+        return 0.85
+    if value_record.support_count <= 1:
+        return 0.80
+    if value_record.support_count == 2:
+        return 0.65
+    if value_record.support_count == 3:
+        return 0.50
+    return 0.0
+
+
+def _entropy_from_counts(counts: Counter) -> float:
+    total = float(sum(counts.values()))
+    if total <= 0:
+        return 0.0
+    entropy = 0.0
+    for count in counts.values():
+        probability = float(count) / total
+        if probability > 0:
+            entropy -= probability * np.log(probability)
+    return float(entropy)
+
+
+def _context_predictiveness(
+    target_signatures: List[str],
+    context_signatures: List[str],
+) -> float:
+    target_counts = Counter(target_signatures)
+    target_entropy = _entropy_from_counts(target_counts)
+    if target_entropy <= 1e-12:
+        return 0.0
+
+    grouped_counts: Dict[str, Counter] = defaultdict(Counter)
+    for target_sig, context_sig in zip(target_signatures, context_signatures):
+        if context_sig in {"<na>", "<empty>"}:
+            continue
+        grouped_counts[context_sig][target_sig] += 1
+
+    total = float(len(target_signatures))
+    conditional_entropy = 0.0
+    covered = 0.0
+    for counts in grouped_counts.values():
+        group_total = float(sum(counts.values()))
+        if group_total <= 0:
+            continue
+        covered += group_total
+        conditional_entropy += (group_total / total) * _entropy_from_counts(counts)
+
+    if covered <= 0:
+        return 0.0
+    return float(np.clip(1.0 - conditional_entropy / target_entropy, 0.0, 1.0))
+
+
+def _add_contextual_consensus_evidence(
+    df: pd.DataFrame,
+    metadata: Dict[str, Dict[str, Any]],
+    cell_observations: Dict[str, List[EvidenceObservation]],
+) -> None:
+    """Add generic row-context evidence learned from conditional concentration.
+
+    A context column is useful only to the extent that it reduces uncertainty
+    about the target column across the table. This keeps the signal generic:
+    it can represent entity consensus, functional dependencies, or repeated
+    source agreement without hard-coding any dataset-specific relationship.
+    """
+
+    n_rows = len(df)
+    if n_rows <= 1 or len(df.columns) <= 1:
+        return
+
+    signatures_by_column = {
+        column: [_normalize_signature(value) for value in df[column].tolist()]
+        for column in df.columns
+    }
+
+    for target_column in df.columns:
+        target_signatures = signatures_by_column[target_column]
+        context_profiles: List[Tuple[str, float, Dict[str, Counter]]] = []
+
+        for context_column in df.columns:
+            if context_column == target_column:
+                continue
+            context_signatures = signatures_by_column[context_column]
+            predictiveness = _context_predictiveness(target_signatures, context_signatures)
+            if predictiveness <= 0.0:
+                continue
+
+            grouped_counts: Dict[str, Counter] = defaultdict(Counter)
+            for target_sig, context_sig in zip(target_signatures, context_signatures):
+                if context_sig in {"<na>", "<empty>"}:
+                    continue
+                grouped_counts[context_sig][target_sig] += 1
+
+            context_profiles.append((context_column, predictiveness, grouped_counts))
+
+        if not context_profiles:
+            continue
+
+        col_meta = metadata.get(target_column, {})
+        for row_idx, target_sig in enumerate(target_signatures):
+            value = df.iloc[row_idx][target_column]
+            if _is_missing_like(value, col_meta):
+                continue
+
+            best_disagreement = 0.0
+            best_agreement = 0.0
+            best_disagreement_context = ""
+            best_agreement_context = ""
+
+            for context_column, predictiveness, grouped_counts in context_profiles:
+                context_sig = signatures_by_column[context_column][row_idx]
+                counts = grouped_counts.get(context_sig)
+                if not counts:
+                    continue
+                group_total = float(sum(counts.values()))
+                if group_total <= 1:
+                    continue
+
+                support = float(counts.get(target_sig, 0))
+                conditional_probability = support / group_total
+                group_information = np.log1p(group_total - 1.0) / np.log1p(max(float(n_rows), 2.0))
+                strength_base = float(np.clip(predictiveness * group_information, 0.0, 1.0))
+                disagreement = strength_base * (1.0 - conditional_probability)
+                agreement = strength_base * conditional_probability
+
+                if disagreement > best_disagreement:
+                    best_disagreement = disagreement
+                    best_disagreement_context = context_column
+                if agreement > best_agreement:
+                    best_agreement = agreement
+                    best_agreement_context = context_column
+
+            cell_key = f"{row_idx}::{target_column}"
+            if best_disagreement > 0.0:
+                _record_observation(cell_observations, EvidenceObservation(
+                    target_scope="cell",
+                    target_key=cell_key,
+                    source_id="contextual_disagreement",
+                    family="contextual",
+                    polarity="dirty",
+                    strength=best_disagreement,
+                    hard=False,
+                    reason_code="conditional_value_disagreement",
+                    metadata={"context_column": best_disagreement_context},
+                ))
+            if best_agreement > 0.0:
+                _record_observation(cell_observations, EvidenceObservation(
+                    target_scope="cell",
+                    target_key=cell_key,
+                    source_id="contextual_agreement",
+                    family="contextual",
+                    polarity="clean",
+                    strength=best_agreement,
+                    hard=False,
+                    reason_code="conditional_value_agreement",
+                    metadata={"context_column": best_agreement_context},
+                ))
+
+
+def _build_value_registry(
+    df: pd.DataFrame,
+    metadata: Dict[str, Dict[str, Any]],
+) -> Dict[str, ValueRecord]:
+    registry: Dict[str, ValueRecord] = {}
+    for column in df.columns:
+        groups: Dict[str, ValueRecord] = {}
+        for row_idx, value in enumerate(df[column].tolist()):
+            normalized = _normalize_signature(value)
+            value_key = f"{column}::{normalized}"
+            record = groups.get(value_key)
+            if record is None:
+                record = ValueRecord(
+                    key=value_key,
+                    column=column,
+                    normalized_value=normalized,
+                    representative_value=value,
+                    row_indices=[],
+                    support_count=0,
+                )
+                groups[value_key] = record
+            record.row_indices.append(row_idx)
+            record.support_count += 1
+        registry.update(groups)
+    return registry
+
+
+def _build_cell_registry(
+    df: pd.DataFrame,
+    metadata: Dict[str, Dict[str, Any]],
+    value_registry: Dict[str, ValueRecord],
+) -> Dict[str, CellRecord]:
+    registry: Dict[str, CellRecord] = {}
+    for row_idx in range(len(df)):
+        for column in df.columns:
+            value = df.iloc[row_idx][column]
+            normalized = _normalize_signature(value)
+            value_key = f"{column}::{normalized}"
+            cell_key = f"{row_idx}::{column}"
+            registry[cell_key] = CellRecord(
+                key=cell_key,
+                row_index=row_idx,
+                column=column,
+                raw_value=value,
+                value_key=value_key,
+            )
+    return registry
+
+
+def _extract_evidence(
+    df: pd.DataFrame,
+    metadata: Dict[str, Dict[str, Any]],
+    rule_pool: Dict[str, List[Dict[str, Any]]],
+    value_registry: Dict[str, ValueRecord],
+    cell_registry: Dict[str, CellRecord],
+) -> Tuple[Dict[str, List[EvidenceObservation]], Dict[str, List[EvidenceObservation]]]:
+    value_observations: Dict[str, List[EvidenceObservation]] = {}
+    cell_observations: Dict[str, List[EvidenceObservation]] = {}
+
+    outputs_by_column: Dict[str, np.ndarray] = {}
+    family_indices_by_column: Dict[str, Dict[str, List[int]]] = {}
+    for column in df.columns:
+        rules = rule_pool.get(column, [])
+        outputs = _compute_rule_outputs_for_column(df, column, rules) if rules else np.zeros((len(df), 0), dtype=int)
+        outputs_by_column[column] = outputs
+        family_indices: Dict[str, List[int]] = defaultdict(list)
+        for idx, rule in enumerate(rules):
+            family_indices[rule.get("family", "")].append(idx)
+        family_indices_by_column[column] = dict(family_indices)
+
+    for value_key, record in value_registry.items():
+        col_meta = metadata.get(record.column, {})
+        value = record.representative_value
+        normalized = record.normalized_value
+        missing_like = _is_missing_like(value, col_meta)
+        closed_set_legal_values = _get_closed_set_legal_values(col_meta)
+        representative_row_idx = record.row_indices[0]
+        regex_match = _matches_regex_candidates(value, col_meta.get("regex_candidates") or [])
+        regex_match_rate = _matching_regex_rate(value, col_meta.get("regex_candidates") or [])
+        pattern_ratio = _row_family_pass_ratio(
+            outputs_by_column.get(record.column, np.zeros((0, 0), dtype=int)),
+            family_indices_by_column.get(record.column, {}),
+            "pattern",
+            representative_row_idx,
+        )
+
+        if missing_like:
+            _record_observation(value_observations, EvidenceObservation(
+                target_scope="value",
+                target_key=value_key,
+                source_id="missing_token",
+                family="missing",
+                polarity="dirty",
+                strength=1.0,
+                hard=True,
+                reason_code="missing_token",
+            ))
+            continue
+
+        if closed_set_legal_values and normalized not in closed_set_legal_values:
+            _record_observation(value_observations, EvidenceObservation(
+                target_scope="value",
+                target_key=value_key,
+                source_id="closed_set_invalid",
+                family="outlier",
+                polarity="dirty",
+                strength=1.0,
+                hard=True,
+                reason_code="closed_set_invalid",
+            ))
+            continue
+
+        if col_meta.get("type") == "numeric":
+            numeric = _coerce_numeric_with_metadata(value, col_meta)
+            hard_numeric_failure = _has_trusted_numeric_contract(col_meta)
+            if numeric is None:
+                _record_observation(value_observations, EvidenceObservation(
+                    target_scope="value",
+                    target_key=value_key,
+                    source_id="parse_failure",
+                    family="outlier",
+                    polarity="dirty",
+                    strength=1.0,
+                    hard=hard_numeric_failure,
+                    reason_code="numeric_parse_failure",
+                ))
+                _record_observation(value_observations, EvidenceObservation(
+                    target_scope="value",
+                    target_key=value_key,
+                    source_id="type_conflict",
+                    family="outlier",
+                    polarity="dirty",
+                    strength=1.0,
+                    hard=hard_numeric_failure,
+                    reason_code="numeric_type_conflict",
+                ))
+                continue
+
+            if regex_match_rate > 0:
+                _record_observation(value_observations, EvidenceObservation(
+                    target_scope="value",
+                    target_key=value_key,
+                    source_id="regex_pass",
+                    family="pattern",
+                    polarity="clean",
+                    strength=min(1.0, max(0.6, regex_match_rate)),
+                    hard=False,
+                    reason_code="regex_pass",
+                ))
+            _record_observation(value_observations, EvidenceObservation(
+                target_scope="value",
+                target_key=value_key,
+                source_id="parser_success",
+                family="outlier",
+                polarity="clean",
+                strength=1.0,
+                hard=False,
+                reason_code="numeric_parse_success",
+            ))
+            rarity_strength = _numeric_rarity_strength(numeric, col_meta)
+            if rarity_strength > 0:
+                _record_observation(value_observations, EvidenceObservation(
+                    target_scope="value",
+                    target_key=value_key,
+                    source_id="rarity_high",
+                    family="outlier",
+                    polarity="dirty",
+                    strength=rarity_strength,
+                    hard=False,
+                    reason_code="numeric_rarity_high",
+                ))
+            continue
+
+        if regex_match:
+            _record_observation(value_observations, EvidenceObservation(
+                target_scope="value",
+                target_key=value_key,
+                source_id="regex_pass",
+                family="pattern",
+                polarity="clean",
+                strength=1.0,
+                hard=False,
+                reason_code="regex_pass",
+            ))
+            _record_observation(value_observations, EvidenceObservation(
+                target_scope="value",
+                target_key=value_key,
+                source_id="parser_success",
+                family="pattern",
+                polarity="clean",
+                strength=0.8,
+                hard=False,
+                reason_code="pattern_parser_success",
+            ))
+        elif pattern_ratio is not None and pattern_ratio >= 0.75:
+            _record_observation(value_observations, EvidenceObservation(
+                target_scope="value",
+                target_key=value_key,
+                source_id="parser_success",
+                family="pattern",
+                polarity="clean",
+                strength=pattern_ratio,
+                hard=False,
+                reason_code="pattern_rule_support",
+            ))
+
+        low_frequency_strength = _low_frequency_strength(record, col_meta)
+        if low_frequency_strength > 0:
+            _record_observation(value_observations, EvidenceObservation(
+                target_scope="value",
+                target_key=value_key,
+                source_id="rarity_high",
+                family="pattern",
+                polarity="dirty",
+                strength=low_frequency_strength,
+                hard=False,
+                reason_code="low_frequency_value",
+            ))
+
+        text = str(value).strip()
+        prototype_close, prototype_far = _prototype_distance_evidence(text, col_meta)
+        if prototype_close > 0:
+            _record_observation(value_observations, EvidenceObservation(
+                target_scope="value",
+                target_key=value_key,
+                source_id="prototype_close",
+                family="prototype_lexical",
+                polarity="clean",
+                strength=prototype_close,
+                hard=False,
+                reason_code="prototype_close",
+            ))
+        if prototype_far > 0:
+            _record_observation(value_observations, EvidenceObservation(
+                target_scope="value",
+                target_key=value_key,
+                source_id="prototype_far",
+                family="prototype_lexical",
+                polarity="dirty",
+                strength=prototype_far,
+                hard=False,
+                reason_code="prototype_far",
+            ))
+
+    for cell_key, record in cell_registry.items():
+        col_meta = metadata.get(record.column, {})
+        value = record.raw_value
+        normalized = _normalize_signature(value)
+        row = df.iloc[record.row_index]
+        missing_like = _is_missing_like(value, col_meta)
+        closed_set_legal_values = _get_closed_set_legal_values(col_meta)
+        regex_match = _matches_regex_candidates(value, col_meta.get("regex_candidates") or [])
+        regex_match_rate = _matching_regex_rate(value, col_meta.get("regex_candidates") or [])
+        pattern_ratio = _row_family_pass_ratio(
+            outputs_by_column.get(record.column, np.zeros((0, 0), dtype=int)),
+            family_indices_by_column.get(record.column, {}),
+            "pattern",
+            record.row_index,
+        )
+
+        emitted_hard_dirty = False
+        parse_success = False
+        principal_parser_success = False
+        type_conflict = False
+        closed_set_valid = True
+        relationship_applicable = 0
+        strong_relationship_violation = 0
+        weak_relationship_violation = 0
+        relationship_satisfied = 0
+
+        if missing_like:
+            _record_observation(cell_observations, EvidenceObservation(
+                target_scope="cell",
+                target_key=cell_key,
+                source_id="missing_token",
+                family="missing",
+                polarity="dirty",
+                strength=1.0,
+                hard=True,
+                reason_code="missing_token",
+            ))
+            continue
+
+        if closed_set_legal_values:
+            closed_set_valid = normalized in closed_set_legal_values
+            if not closed_set_valid:
+                emitted_hard_dirty = True
+                _record_observation(cell_observations, EvidenceObservation(
+                    target_scope="cell",
+                    target_key=cell_key,
+                    source_id="closed_set_invalid",
+                    family="outlier",
+                    polarity="dirty",
+                    strength=1.0,
+                    hard=True,
+                    reason_code="closed_set_invalid",
+                ))
+
+        if col_meta.get("type") == "numeric":
+            numeric = _coerce_numeric_with_metadata(value, col_meta)
+            hard_numeric_failure = _has_trusted_numeric_contract(col_meta)
+            if numeric is None:
+                emitted_hard_dirty = hard_numeric_failure
+                type_conflict = True
+                _record_observation(cell_observations, EvidenceObservation(
+                    target_scope="cell",
+                    target_key=cell_key,
+                    source_id="cell_parse_failure",
+                    family="outlier",
+                    polarity="dirty",
+                    strength=1.0,
+                    hard=hard_numeric_failure,
+                    reason_code="numeric_parse_failure",
+                ))
+                _record_observation(cell_observations, EvidenceObservation(
+                    target_scope="cell",
+                    target_key=cell_key,
+                    source_id="cell_type_conflict",
+                    family="outlier",
+                    polarity="dirty",
+                    strength=1.0,
+                    hard=hard_numeric_failure,
+                    reason_code="numeric_type_conflict",
+                ))
+            else:
+                parse_success = True
+                principal_parser_success = True
+                if regex_match_rate > 0:
+                    _record_observation(cell_observations, EvidenceObservation(
+                        target_scope="cell",
+                        target_key=cell_key,
+                        source_id="pattern_match",
+                        family="pattern",
+                        polarity="clean",
+                        strength=min(1.0, max(0.6, regex_match_rate)),
+                        hard=False,
+                        reason_code="regex_match",
+                    ))
+                elif _best_regex_contract_rate(col_meta) >= 0.60:
+                    _record_observation(cell_observations, EvidenceObservation(
+                        target_scope="cell",
+                        target_key=cell_key,
+                        source_id="pattern_mismatch",
+                        family="pattern",
+                        polarity="dirty",
+                        strength=0.6,
+                        hard=False,
+                        reason_code="format_contract_mismatch",
+                    ))
+        else:
+            text = str(value).strip()
+            grammar_distance = _grammar_distance_score(text, col_meta)
+            shape_distance = _shape_distance_score(text, col_meta)
+            mismatch_candidates = [grammar_distance, shape_distance]
+            if pattern_ratio is not None:
+                mismatch_candidates.append(max(0.0, 1.0 - pattern_ratio))
+            mismatch_strength = max(mismatch_candidates) if mismatch_candidates else 0.0
+            parse_success = regex_match or (pattern_ratio is not None and pattern_ratio >= 0.75)
+
+            if regex_match:
+                _record_observation(cell_observations, EvidenceObservation(
+                    target_scope="cell",
+                    target_key=cell_key,
+                    source_id="pattern_match",
+                    family="pattern",
+                    polarity="clean",
+                    strength=1.0,
+                    hard=False,
+                    reason_code="regex_match",
+                ))
+            elif pattern_ratio is not None and pattern_ratio >= 0.75:
+                _record_observation(cell_observations, EvidenceObservation(
+                    target_scope="cell",
+                    target_key=cell_key,
+                    source_id="pattern_match",
+                    family="pattern",
+                    polarity="clean",
+                    strength=pattern_ratio,
+                    hard=False,
+                    reason_code="pattern_rule_match",
+                ))
+
+            if not regex_match and mismatch_strength >= 0.55:
+                _record_observation(cell_observations, EvidenceObservation(
+                    target_scope="cell",
+                    target_key=cell_key,
+                    source_id="pattern_mismatch",
+                    family="pattern",
+                    polarity="dirty",
+                    strength=mismatch_strength,
+                    hard=False,
+                    reason_code="pattern_mismatch",
+                ))
+
+        for profile in col_meta.get("relationship_profiles") or []:
+            other_column = profile.get("other_column")
+            if not other_column or other_column not in df.columns:
+                continue
+            other_value = row[other_column]
+            if _is_missing_like(value, col_meta) or _is_missing_like(other_value, metadata.get(other_column, {})):
+                continue
+            if str(value).strip() == "" or str(other_value).strip() == "":
+                continue
+            relationship_applicable += 1
+            is_valid = _relationship_predicate(value, other_value, profile.get("type", ""))
+            if is_valid:
+                relationship_satisfied += 1
+            else:
+                if float(profile.get("violation_rate", 1.0)) <= 0.10:
+                    strong_relationship_violation += 1
+                else:
+                    weak_relationship_violation += 1
+
+        if strong_relationship_violation > 0:
+            emitted_hard_dirty = True
+            _record_observation(cell_observations, EvidenceObservation(
+                target_scope="cell",
+                target_key=cell_key,
+                source_id="strong_relationship_violation",
+                family="relationship",
+                polarity="dirty",
+                strength=1.0,
+                hard=True,
+                reason_code="strong_relationship_violation",
+            ))
+        elif weak_relationship_violation > 0:
+            _record_observation(cell_observations, EvidenceObservation(
+                target_scope="cell",
+                target_key=cell_key,
+                source_id="weak_relationship_violation",
+                family="relationship",
+                polarity="dirty",
+                strength=min(1.0, 0.35 + weak_relationship_violation / max(relationship_applicable, 1)),
+                hard=False,
+                reason_code="weak_relationship_violation",
+            ))
+        elif relationship_applicable > 0:
+            _record_observation(cell_observations, EvidenceObservation(
+                target_scope="cell",
+                target_key=cell_key,
+                source_id="relationship_satisfied",
+                family="relationship",
+                polarity="clean",
+                strength=min(1.0, 0.4 + relationship_satisfied / max(relationship_applicable, 1)),
+                hard=False,
+                reason_code="relationship_satisfied",
+            ))
+
+        if relationship_applicable >= 2:
+            if relationship_satisfied == relationship_applicable:
+                _record_observation(cell_observations, EvidenceObservation(
+                    target_scope="cell",
+                    target_key=cell_key,
+                    source_id="local_consistency_pass",
+                    family="relationship",
+                    polarity="clean",
+                    strength=0.75,
+                    hard=False,
+                    reason_code="local_consistency_pass",
+                ))
+            elif (strong_relationship_violation + weak_relationship_violation) / max(relationship_applicable, 1) >= 0.5:
+                _record_observation(cell_observations, EvidenceObservation(
+                    target_scope="cell",
+                    target_key=cell_key,
+                    source_id="local_consistency_fail",
+                    family="relationship",
+                    polarity="dirty",
+                    strength=0.75,
+                    hard=False,
+                    reason_code="local_consistency_fail",
+                ))
+
+        if (
+            not emitted_hard_dirty
+            and principal_parser_success
+            and not type_conflict
+            and closed_set_valid
+            and (relationship_applicable == 0 or strong_relationship_violation == 0 and weak_relationship_violation == 0)
+        ):
+            _record_observation(cell_observations, EvidenceObservation(
+                target_scope="cell",
+                target_key=cell_key,
+                source_id="cell_parser_success",
+                family="outlier",
+                polarity="clean",
+                strength=1.0,
+                hard=False,
+                reason_code="parser_contract_satisfied",
+            ))
+
+    _add_contextual_consensus_evidence(df, metadata, cell_observations)
+
+    return value_observations, cell_observations
+
+
+def _build_hard_evidence(
+    df: pd.DataFrame,
+    metadata: Dict[str, Dict[str, Any]],
+    value_observations: Dict[str, List[EvidenceObservation]],
+    cell_observations: Dict[str, List[EvidenceObservation]],
+) -> Dict[str, Dict[str, HardEvidenceLabel]]:
+    hard_labels = {"value": {}, "cell": {}}
+
+    for target_key, observations in value_observations.items():
+        dirty_reasons = sorted({obs.reason_code for obs in observations if obs.hard and obs.polarity == "dirty"})
+        clean_reasons = sorted({obs.reason_code for obs in observations if obs.hard and obs.polarity == "clean"})
+        if dirty_reasons:
+            hard_labels["value"][target_key] = HardEvidenceLabel(
+                target_scope="value",
+                target_key=target_key,
+                label="dirty",
+                reasons=dirty_reasons,
+            )
+        elif clean_reasons:
+            hard_labels["value"][target_key] = HardEvidenceLabel(
+                target_scope="value",
+                target_key=target_key,
+                label="clean",
+                reasons=clean_reasons,
+            )
+
+    for target_key, observations in cell_observations.items():
+        dirty_reasons = sorted({obs.reason_code for obs in observations if obs.hard and obs.polarity == "dirty"})
+        clean_reasons = sorted({obs.reason_code for obs in observations if obs.hard and obs.polarity == "clean"})
+        if dirty_reasons:
+            hard_labels["cell"][target_key] = HardEvidenceLabel(
+                target_scope="cell",
+                target_key=target_key,
+                label="dirty",
+                reasons=dirty_reasons,
+            )
+        elif clean_reasons:
+            hard_labels["cell"][target_key] = HardEvidenceLabel(
+                target_scope="cell",
+                target_key=target_key,
+                label="clean",
+                reasons=clean_reasons,
+            )
+
+    return hard_labels
+
+
+def _oracle_label_from_clean(
+    dirty_df: pd.DataFrame,
+    clean_df: pd.DataFrame,
+    cell_record: CellRecord,
+) -> Optional[int]:
+    if cell_record.row_index >= len(clean_df) or cell_record.column not in clean_df.columns:
+        return None
+    dirty_val = dirty_df.iloc[cell_record.row_index][cell_record.column]
+    clean_val = clean_df.iloc[cell_record.row_index][cell_record.column]
+    return int(str(dirty_val).strip() != str(clean_val).strip())
+
+
+def _query_active_oracle_labels(
+    dirty_df: pd.DataFrame,
+    clean_df: Optional[pd.DataFrame],
+    cell_registry: Dict[str, CellRecord],
+    selected_cell_keys: List[str],
+) -> Tuple[Dict[str, int], List[Dict[str, object]]]:
+    if clean_df is None:
+        return {}, []
+
+    labels: Dict[str, int] = {}
+    queried_cells: List[Dict[str, object]] = []
+    for cell_key in selected_cell_keys:
+        record = cell_registry.get(cell_key)
+        if record is None:
+            continue
+        label = _oracle_label_from_clean(dirty_df, clean_df, record)
+        if label is None:
+            continue
+        labels[cell_key] = label
+        queried_cells.append(
+            {
+                "cell_key": cell_key,
+                "row_index": int(record.row_index),
+                "column": record.column,
+                "value": record.raw_value,
+                "label": "dirty" if label else "clean",
+            }
+        )
+    return labels, queried_cells
+
+
+def _summarize_observations(observations: List[EvidenceObservation], limit: int = 6) -> str:
+    if not observations:
+        return ""
+    parts = []
+    for obs in sorted(observations, key=lambda item: (item.hard, item.strength), reverse=True)[:limit]:
+        hard_marker = "hard" if obs.hard else "soft"
+        parts.append(f"{obs.source_id}:{obs.polarity}:{obs.strength:.2f}:{hard_marker}")
+    return ";".join(parts)
+
+
+def _summarize_hard_label(label: Optional[HardEvidenceLabel]) -> str:
+    if not label:
+        return ""
+    return ";".join(label.reasons)
+
+
+def _evidence_source_coverage(
+    observation_map: Dict[str, List[EvidenceObservation]],
+) -> Dict[str, int]:
+    coverage: Dict[str, set] = defaultdict(set)
+    for target_key, observations in observation_map.items():
+        for obs in observations:
+            coverage[obs.source_id].add(target_key)
+    return {source_id: len(targets) for source_id, targets in sorted(coverage.items())}
+
+
+def _export_cleanem_results(
+    df: pd.DataFrame,
+    value_registry: Dict[str, ValueRecord],
+    cell_registry: Dict[str, CellRecord],
+    value_priors: Dict[str, Dict[str, float]],
+    cell_posteriors: Dict[str, Dict[str, float]],
+    hard_labels: Dict[str, Dict[str, HardEvidenceLabel]],
+    value_observations: Dict[str, List[EvidenceObservation]],
+    cell_observations: Dict[str, List[EvidenceObservation]],
+    active_labels: Optional[Dict[str, int]] = None,
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    active_labels = active_labels or {}
+    for cell_key, cell_record in cell_registry.items():
+        value_record = value_registry[cell_record.value_key]
+        prior_bundle = value_priors.get(cell_record.value_key, {"prior": 0.5, "confidence": 0.0})
+        posterior_bundle = cell_posteriors.get(cell_key, {"posterior": 0.5, "confidence": 0.0})
+        cell_label = hard_labels["cell"].get(cell_key)
+        active_label = active_labels.get(cell_key)
+
+        results.append({
+            "row_index": cell_record.row_index,
+            "column": cell_record.column,
+            "value": cell_record.raw_value,
+            "value_key": cell_record.value_key,
+            "value_prior": prior_bundle["prior"],
+            "value_prior_confidence": prior_bundle["confidence"],
+            "cell_posterior": posterior_bundle["posterior"],
+            "cell_confidence": posterior_bundle["confidence"],
+            "hard_label": cell_label.label if cell_label else "",
+            "hard_reason_summary": _summarize_hard_label(cell_label),
+            "queried_for_calibration": cell_key in active_labels,
+            "active_oracle_label": "dirty" if active_label == 1 else "clean" if active_label == 0 else "",
+            "value_evidence_summary": _summarize_observations(value_observations.get(cell_record.value_key, [])),
+            "cell_evidence_summary": _summarize_observations(cell_observations.get(cell_key, [])),
+        })
+
+    results.sort(key=lambda item: (item["cell_posterior"], item["value_prior"]), reverse=True)
+    return results
+
+
 def run_clean_em_mode(args: argparse.Namespace) -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     dataset_name = os.path.splitext(os.path.basename(args.dirty_csv))[0]
-    
-    # Setup logger
+
     logger = _setup_cleanem_logger(args.output_dir, dataset_name)
     logger.info("=" * 60)
     logger.info("CleanEM Pipeline Started")
     logger.info("=" * 60)
     logger.info(f"[1/4] Profiling dirty dataset: {args.dirty_csv}")
-    logger.info(f"Configuration:")
+    logger.info("Configuration:")
     logger.info(f"  - clean_seed_percent (legacy/unused): {args.clean_seed_percent}")
     logger.info(f"  - synthetic_per_family: {args.synthetic_per_family}")
-    logger.info(f"  - em_max_iters: {args.em_max_iters}")
-    logger.info(f"  - em_prior_dirty: {args.em_prior_dirty}")
-    logger.info(f"  - score_threshold: {args.score_threshold}")
+    logger.info(f"  - em_max_iters (legacy/unused): {args.em_max_iters}")
+    logger.info(f"  - em_prior_dirty (base prior): {args.em_prior_dirty}")
+    logger.info(f"  - calib_min_clean_pass (legacy/unused): {args.calib_min_clean_pass}")
+    logger.info(f"  - calib_max_dirty_pass (legacy/unused): {args.calib_max_dirty_pass}")
+    logger.info(f"  - score_threshold (cell_posterior): {args.score_threshold}")
+    logger.info(f"  - active_label_budget: {args.active_label_budget}")
     logger.info(f"  - top_k: {args.top_k}")
-    
+
     profiler = PandasProfiler(args.dirty_csv)
     df = profiler.df
     metadata = profiler.get_metadata()
-    
-    logger.info(f"Dataset profile complete:")
-    logger.info(f"  - Total rows: {len(df)}")
+    n_rows = len(df)
+
+    logger.info("Dataset profile complete:")
+    logger.info(f"  - Total rows: {n_rows}")
     logger.info(f"  - Total columns: {len(metadata)}")
     logger.info(f"  - Columns: {list(metadata.keys())}")
-    
-    # Log per-column metadata summary
     logger.debug("Per-column metadata summary:")
     for col, meta in metadata.items():
-        col_type = meta.get('type', 'unknown')
-        null_count = meta.get('null_count', 0)
-        unique_count = meta.get('unique_count', 0)
-        logger.debug(f"  - {col}: type={col_type}, nulls={null_count}, unique={unique_count}")
-    
-    logger.info("[2/4] Generating clean rules and building rule pool")
+        logger.debug(
+            f"  - {col}: type={meta.get('type', 'unknown')}, nulls={meta.get('null_count', 0)}, "
+            f"unique={meta.get('unique_count', 0)}, families={meta.get('available_families', [])}"
+        )
+
+    logger.info("[2/4] Generating clean rules and evidence sources")
     factory = AgentFactory(base_url=args.base_url, model=args.model, max_workers=args.max_workers)
     rule_pool = _build_clean_rule_pool(df, metadata, factory)
-    
-    if not rule_pool:
-        logger.error("No clean rules generated; exiting clean_em mode.")
-        print("No clean rules generated; exiting clean_em mode.")
-        return
-    
-    # Log rule pool statistics
+
     total_rules = sum(len(rules) for rules in rule_pool.values())
-    logger.info(f"Rule pool built successfully:")
+    logger.info("Rule pool built successfully:")
     logger.info(f"  - Total columns with rules: {len(rule_pool)}")
     logger.info(f"  - Total rules: {total_rules}")
-    
-    family_counts = {"missing": 0, "outlier": 0, "pattern": 0}
-    for column, rules in rule_pool.items():
-        col_family_counts = {"missing": 0, "outlier": 0, "pattern": 0}
+
+    family_counts = {family: 0 for family in FAMILIES if family != "prototype_lexical"}
+    for column in metadata.keys():
+        rules = rule_pool.get(column, [])
+        per_family = {family: 0 for family in family_counts}
         for rule in rules:
             fam = rule.get("family")
-            if fam in col_family_counts:
-                col_family_counts[fam] += 1
+            if fam in per_family:
+                per_family[fam] += 1
                 family_counts[fam] += 1
-        logger.info(f"  - Column '{column}': {len(rules)} rules "
-                    f"(missing={col_family_counts['missing']}, "
-                    f"outlier={col_family_counts['outlier']}, "
-                    f"pattern={col_family_counts['pattern']})")
-        
-        # Log detailed rule information for each column
+        logger.info(
+            f"  - Column '{column}': {len(rules)} rules "
+            f"(missing={per_family.get('missing', 0)}, outlier={per_family.get('outlier', 0)}, "
+            f"pattern={per_family.get('pattern', 0)}, relationship={per_family.get('relationship', 0)})"
+        )
         for rule in rules:
-            rule_name = rule.get("rule_name", "unknown")
-            rule_family = rule.get("family", "unknown")
-            rule_str = rule.get("rule_str", "")
-            logger.info(f"    - Rule '{rule_name}' [{rule_family}]: {rule_str}")
-    
-    logger.info(f"  - Rule family distribution: "
-                f"missing={family_counts['missing']}, "
-                f"outlier={family_counts['outlier']}, "
-                f"pattern={family_counts['pattern']}")
-    
-    logger.info("[3/4] Running clean-rule EM calibration")
-    dirty_agent = DirtyExampleAgent(base_url=args.base_url, model=args.model)
-    reflection_agent = CleanRuleReflectionAgent(base_url=args.base_url, model=args.model)
-    n_rows = len(df)
-    column_outputs: Dict[str, Dict[str, np.ndarray]] = {}
-    column_statuses: Dict[str, Dict[str, FamilyRunStatus]] = {}
-    column_anchor_sources: Dict[str, Dict[str, np.ndarray]] = {}
-    column_signature_weights: Dict[str, np.ndarray] = {}
-    em_stats: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    
-    for col_idx, (column, rules) in enumerate(rule_pool.items(), 1):
-        logger.info(f"Processing column {col_idx}/{len(rule_pool)}: '{column}'")
-        logger.debug(f"  - Number of rules: {len(rules)}")
-
-        outputs = _compute_rule_outputs_for_column(df, column, rules)
-        if outputs.size == 0:
-            logger.warning(f"  - No rule outputs for column '{column}', skipping")
-            continue
-
-        column_outputs[column] = {
-            "S_missing": np.full(n_rows, np.nan, dtype=float),
-            "S_outlier": np.full(n_rows, np.nan, dtype=float),
-            "S_pattern": np.full(n_rows, np.nan, dtype=float),
-        }
-        column_anchor_sources[column] = {
-            "missing": np.full(n_rows, "unlabeled", dtype=object),
-            "outlier": np.full(n_rows, "abstained", dtype=object),
-            "pattern": np.full(n_rows, "abstained", dtype=object),
-        }
-        column_signature_weights[column] = _build_signature_weights(df, column)
-
-        family_rule_indices: Dict[str, List[int]] = {f: [] for f in FAMILIES}
-        for idx, rule in enumerate(rules):
-            fam = rule["family"]
-            if fam in family_rule_indices:
-                family_rule_indices[fam].append(idx)
-
-        column_statuses[column] = {
-            family: FamilyRunStatus(status="abstained", reason="family_not_processed")
-            for family in FAMILIES
-        }
-        em_stats[column] = {}
-
-        for family in FAMILIES:
-            cols = family_rule_indices[family]
-            if not cols:
-                logger.info(f"  - Family '{family}': no rules, abstained")
-                column_statuses[column][family] = FamilyRunStatus(status="abstained", reason="no_rules")
-                column_anchor_sources[column][family][:] = "abstained:no_rules"
-                continue
-
-            logger.info(f"  - Family '{family}': {len(cols)} rules")
-            for idx in cols:
-                rule = rules[idx]
-                rule_name = rule.get("rule_name", "unknown")
-                rule_str = rule.get("rule_str", "")
-                logger.info(f"    - Using rule '{rule_name}': {rule_str}")
-
-            family_z = outputs[:, cols]
-            anchor_groups, family_status = _build_anchor_groups(df, column, metadata.get(column, {}), family)
-            column_statuses[column][family] = family_status
-            anchor_states_by_row, anchor_sources_by_row = _build_anchor_state_arrays(n_rows, anchor_groups)
-            column_anchor_sources[column][family] = anchor_sources_by_row.copy()
-
-            hard_clean_groups = [record for record in anchor_groups if record.anchor_state == ANCHOR_HARD_CLEAN]
-            hard_dirty_groups = [record for record in anchor_groups if record.anchor_state == ANCHOR_HARD_DIRTY]
-            weighted_clean_rows = int(sum(record.weight for record in hard_clean_groups))
-            weighted_dirty_rows = int(sum(record.weight for record in hard_dirty_groups))
-            source_counts = {}
-            for record in anchor_groups:
-                source_counts[record.anchor_source] = source_counts.get(record.anchor_source, 0) + record.weight
-
             logger.info(
-                f"    - Anchor summary: groups={len(anchor_groups)}, "
-                f"hard_clean_groups={len(hard_clean_groups)} ({weighted_clean_rows} rows), "
-                f"hard_dirty_groups={len(hard_dirty_groups)} ({weighted_dirty_rows} rows)"
+                f"    - Rule '{rule.get('rule_name', 'unknown')}' [{rule.get('family', 'unknown')}]: {rule.get('rule_str', '')}"
             )
-            logger.info(f"    - Anchor sources: {source_counts}")
-
-            if family_status.status == "abstained":
-                logger.info(f"    - Family '{family}' abstained: {family_status.reason}")
-                continue
-
-            hard_clean_values = _select_representative_values(anchor_groups)
-            logger.debug(f"    - Generating synthetic critique examples for family '{family}'")
-            synthetic_critique_examples = dirty_agent.generate_dirty_examples(
-                column,
-                metadata.get(column, {}),
-                hard_clean_values,
-                family,
-                max_examples=args.synthetic_per_family,
-            )
-
-            n_synth = len(synthetic_critique_examples)
-            logger.info(f"    - Generated {n_synth} synthetic critique examples for family '{family}'")
-            logger.debug(
-                f"    - Synthetic critique values (first 5): {[ex['value'] for ex in synthetic_critique_examples[:5]]}"
-            )
-
-            synth_vals = [ex["value"] for ex in synthetic_critique_examples]
-            synth_z_list: List[List[int]] = []
-            for val in synth_vals:
-                row_like = {column: val}
-                row_series = pd.Series(row_like)
-                row_outputs: List[int] = []
-                for idx in cols:
-                    func = rules[idx]["rule_func"]
-                    row_outputs.append(int(_invoke_rule(func, val, row_series)))
-                synth_z_list.append(row_outputs)
-
-            synth_z = np.array(synth_z_list, dtype=int) if synth_z_list else np.zeros((0, len(cols)), dtype=int)
-
-            clean_mask = anchor_states_by_row == ANCHOR_HARD_CLEAN
-            dirty_mask = anchor_states_by_row == ANCHOR_HARD_DIRTY
-            real_dirty_group_count = len(hard_dirty_groups)
-            real_dirty_row_count = weighted_dirty_rows
-            min_dirty_rows_for_real = max(5, int(np.ceil(0.002 * max(n_rows, 1))))
-
-            clean_pass_real = np.array([
-                _weighted_binary_mean(family_z[clean_mask, local_idx], np.ones(int(clean_mask.sum()), dtype=float))
-                if clean_mask.any() else float("nan")
-                for local_idx in range(len(cols))
-            ])
-            dirty_pass_real = np.array([
-                _weighted_binary_mean(family_z[dirty_mask, local_idx], np.ones(int(dirty_mask.sum()), dtype=float))
-                if dirty_mask.any() else float("nan")
-                for local_idx in range(len(cols))
-            ])
-            dirty_pass_synth = np.array([
-                float(synth_z[:, local_idx].mean()) if synth_z.shape[0] > 0 else float("nan")
-                for local_idx in range(len(cols))
-            ])
-
-            improve_margin = 0.02
-            max_reflections = 3
-            candidates: List[Tuple[int, int, float, float]] = []
-            effective_dirty_pass = np.copy(dirty_pass_real)
-            use_real_dirty = real_dirty_group_count >= 2 and real_dirty_row_count >= min_dirty_rows_for_real
-            if not use_real_dirty:
-                for local_idx in range(len(cols)):
-                    candidates_for_dirty = [v for v in [dirty_pass_real[local_idx], dirty_pass_synth[local_idx]] if not np.isnan(v)]
-                    effective_dirty_pass[local_idx] = max(candidates_for_dirty) if candidates_for_dirty else float("nan")
-
-            for local_idx, rule_idx in enumerate(cols):
-                cp = float(clean_pass_real[local_idx]) if not np.isnan(clean_pass_real[local_idx]) else 0.0
-                dp = float(effective_dirty_pass[local_idx]) if not np.isnan(effective_dirty_pass[local_idx]) else 1.0
-                if cp < args.calib_min_clean_pass or dp > args.calib_max_dirty_pass:
-                    candidates.append((local_idx, rule_idx, cp, dp))
-
-            reflections_done = 0
-            for local_idx, rule_idx, cp, dp in candidates:
-                if reflections_done >= max_reflections:
-                    break
-                rule = rules[rule_idx]
-                rule_name = rule.get("rule_name", "unknown")
-                rule_str = rule.get("rule_str", "")
-
-                clean_mis_examples: List[Dict[str, Any]] = []
-                for record in sorted(hard_clean_groups, key=lambda item: item.weight, reverse=True):
-                    representative_idx = record.row_indices[0]
-                    if family_z[representative_idx, local_idx] == 0:
-                        clean_mis_examples.append({"value": record.representative_value, "source": "real_hard_clean"})
-                    if len(clean_mis_examples) >= 10:
-                        break
-
-                dirty_mis_examples: List[Dict[str, Any]] = []
-                for record in sorted(hard_dirty_groups, key=lambda item: item.weight, reverse=True):
-                    representative_idx = record.row_indices[0]
-                    if family_z[representative_idx, local_idx] == 1:
-                        dirty_mis_examples.append({"value": record.representative_value, "source": "real_hard_dirty"})
-                    if len(dirty_mis_examples) >= 10:
-                        break
-
-                if len(dirty_mis_examples) < 10:
-                    for synth_idx, example in enumerate(synthetic_critique_examples[:10]):
-                        if synth_z.shape[0] > synth_idx and synth_z[synth_idx, local_idx] == 1:
-                            dirty_mis_examples.append({
-                                "value": example.get("value"),
-                                "reason": example.get("reason", ""),
-                                "source": "synthetic_dirty",
-                            })
-                        if len(dirty_mis_examples) >= 10:
-                            break
-
-                if not clean_mis_examples and not dirty_mis_examples:
-                    continue
-
-                logger.info(
-                    f"    - Reflecting rule '{rule_name}' before calibration "
-                    f"(clean_pass_real={cp:.3f}, dirty_pass_eval={dp:.3f})"
-                )
-                new_rule_str = reflection_agent.refine_clean_rule(
-                    column,
-                    metadata.get(column, {}),
-                    family,
-                    rule_str,
-                    clean_mis_examples,
-                    dirty_mis_examples,
-                )
-                if not new_rule_str or new_rule_str == rule_str:
-                    continue
-                try:
-                    new_rule_func = eval(new_rule_str, safe_dict)
-                except Exception:
-                    continue
-
-                new_all = np.zeros(n_rows, dtype=int)
-                for row_idx_df, (_, row_df) in enumerate(df.iterrows()):
-                    value_df = row_df[column]
-                    new_all[row_idx_df] = int(_invoke_rule(new_rule_func, value_df, row_df))
-
-                new_synth_col = np.zeros(len(synth_vals), dtype=int)
-                for synth_idx, val in enumerate(synth_vals):
-                    row_like = {column: val}
-                    row_series = pd.Series(row_like)
-                    new_synth_col[synth_idx] = int(_invoke_rule(new_rule_func, val, row_series))
-
-                new_cp = float(new_all[clean_mask].mean()) if clean_mask.any() else float("nan")
-                new_dp_real = float(new_all[dirty_mask].mean()) if dirty_mask.any() else float("nan")
-                new_dp_synth = float(new_synth_col.mean()) if new_synth_col.size > 0 else float("nan")
-                old_dirty = dp
-                new_dirty = new_dp_real if use_real_dirty and not np.isnan(new_dp_real) else max(
-                    [v for v in [new_dp_real, new_dp_synth] if not np.isnan(v)] or [1.0]
-                )
-                old_loss = (1.0 - cp) + old_dirty
-                new_loss = (1.0 - (new_cp if not np.isnan(new_cp) else 0.0)) + new_dirty
-                if new_loss <= old_loss - improve_margin and (np.isnan(new_cp) or new_cp >= args.calib_min_clean_pass):
-                    family_z[:, local_idx] = new_all
-                    if synth_z.shape[0] > 0:
-                        synth_z[:, local_idx] = new_synth_col
-                    rules[rule_idx]["rule_str"] = new_rule_str
-                    rules[rule_idx]["rule_func"] = new_rule_func
-                    clean_pass_real[local_idx] = new_cp
-                    dirty_pass_real[local_idx] = new_dp_real
-                    dirty_pass_synth[local_idx] = new_dp_synth
-                    if use_real_dirty:
-                        effective_dirty_pass[local_idx] = new_dp_real
-                    else:
-                        candidates_for_dirty = [v for v in [new_dp_real, new_dp_synth] if not np.isnan(v)]
-                        effective_dirty_pass[local_idx] = max(candidates_for_dirty) if candidates_for_dirty else float("nan")
-                    reflections_done += 1
-                    logger.info(
-                        f"    - Refined rule '{rule_name}': "
-                        f"clean_pass_real {cp:.3f}->{clean_pass_real[local_idx]:.3f}, "
-                        f"dirty_pass_eval {dp:.3f}->{effective_dirty_pass[local_idx]:.3f}"
-                    )
-
-            keep_mask = np.zeros(len(cols), dtype=bool)
-            for local_idx, rule_idx in enumerate(cols):
-                cp = float(clean_pass_real[local_idx]) if not np.isnan(clean_pass_real[local_idx]) else 0.0
-                dp_real = float(dirty_pass_real[local_idx]) if not np.isnan(dirty_pass_real[local_idx]) else float("nan")
-                dp_synth = float(dirty_pass_synth[local_idx]) if not np.isnan(dirty_pass_synth[local_idx]) else float("nan")
-                if use_real_dirty:
-                    dirty_eval = dp_real
-                    dirty_evidence = "real"
-                else:
-                    dirty_candidates = [v for v in [dp_real, dp_synth] if not np.isnan(v)]
-                    dirty_eval = max(dirty_candidates) if dirty_candidates else 1.0
-                    dirty_evidence = "synthetic_assist"
-                keep_mask[local_idx] = cp >= args.calib_min_clean_pass and dirty_eval <= args.calib_max_dirty_pass
-                decision = "KEEP" if keep_mask[local_idx] else "DROP"
-                logger.info(
-                    f"    - Calib rule '{rules[rule_idx].get('rule_name', 'unknown')}': "
-                    f"clean_pass_real={cp:.3f}, dirty_pass_real={dp_real if not np.isnan(dp_real) else float('nan'):.3f}, "
-                    f"dirty_pass_synth={dp_synth if not np.isnan(dp_synth) else float('nan'):.3f}, "
-                    f"dirty_evidence={dirty_evidence}, decision={decision}"
-                )
-
-            if not keep_mask.any():
-                logger.info(f"    - All rules rejected by calibration for family '{family}', abstained")
-                column_statuses[column][family] = FamilyRunStatus(status="abstained", reason="all_rules_rejected")
-                column_anchor_sources[column][family][:] = "abstained:all_rules_rejected"
-                continue
-
-            kept_local_indices = np.where(keep_mask)[0]
-            kept_cols = [cols[i] for i in kept_local_indices]
-            family_z = family_z[:, kept_local_indices]
-            logger.info(f"    - {keep_mask.sum()}/{len(keep_mask)} rules kept after calibration")
-
-            min_clean_rows = max(20, int(np.ceil(0.01 * max(n_rows, 1))))
-            min_dirty_rows = max(5, int(np.ceil(0.002 * max(n_rows, 1))))
-            if len(hard_clean_groups) < 3 or len(hard_dirty_groups) < 2 or weighted_clean_rows < min_clean_rows or weighted_dirty_rows < min_dirty_rows:
-                reason = "insufficient_real_anchors"
-                logger.info(f"    - Family '{family}' abstained: {reason}")
-                column_statuses[column][family] = FamilyRunStatus(status="abstained", reason=reason)
-                column_anchor_sources[column][family][:] = anchor_sources_by_row.copy()
-                continue
-
-            em_groups = _build_em_groups(anchor_groups, family, family_z, df, column)
-            if not em_groups:
-                reason = "empty_em_groups"
-                logger.info(f"    - Family '{family}' abstained: {reason}")
-                column_statuses[column][family] = FamilyRunStatus(status="abstained", reason=reason)
-                continue
-
-            group_z = np.vstack([record.rule_outputs_by_family[family] for record in em_groups])
-            group_weights = np.array([record.weight for record in em_groups], dtype=float)
-            group_anchor_states = np.array([record.anchor_state for record in em_groups], dtype=object)
-
-            logger.debug(f"    - Running weighted real-only EM (max_iters={args.em_max_iters})")
-            gamma, alpha, beta, pi1 = _run_weighted_em_for_family(
-                group_z,
-                group_weights,
-                group_anchor_states,
-                args.em_max_iters,
-                args.em_prior_dirty,
-            )
-
-            weighted_high_scores = int(sum(record.weight for record, score in zip(em_groups, gamma) if score > 0.5))
-            gamma_mean = _weighted_binary_mean(gamma, group_weights)
-            gamma_min = float(np.min(gamma)) if gamma.size > 0 else float("nan")
-            gamma_max = float(np.max(gamma)) if gamma.size > 0 else float("nan")
-            logger.info(
-                f"    - EM complete: gamma_mean={gamma_mean:.4f}, pi={pi1:.4f}, range=[{gamma_min:.4f}, {gamma_max:.4f}]"
-            )
-            logger.info(f"    - Weighted high scores (>0.5): {weighted_high_scores}/{int(group_weights.sum())}")
-            logger.debug(f"    - Alpha: {alpha}")
-            logger.debug(f"    - Beta: {beta}")
-
-            em_stats[column][family] = {
-                "n_rules": len(kept_cols),
-                "n_groups": len(em_groups),
-                "weighted_clean_rows": weighted_clean_rows,
-                "weighted_dirty_rows": weighted_dirty_rows,
-                "gamma_mean": gamma_mean,
-                "pi": pi1,
-                "weighted_high_scores": weighted_high_scores,
-            }
-            column_statuses[column][family] = FamilyRunStatus(status="ran")
-
-            family_key = FAMILY_SCORE_KEYS[family]
-            for record, score in zip(em_groups, gamma):
-                for row_idx in record.row_indices:
-                    column_outputs[column][family_key][row_idx] = float(score)
-                    column_anchor_sources[column][family][row_idx] = record.anchor_source
-    
-    logger.info("EM calibration complete for all columns")
-    
-    results: List[Dict[str, Any]] = []
-    for column, family_scores in column_outputs.items():
-        statuses = column_statuses[column]
-        signature_weights = column_signature_weights[column]
-        for row_idx in range(n_rows):
-            s_missing = family_scores["S_missing"][row_idx]
-            s_outlier = family_scores["S_outlier"][row_idx]
-            s_pattern = family_scores["S_pattern"][row_idx]
-            valid_scores = [score for score in [s_missing, s_outlier, s_pattern] if not pd.isna(score)]
-            s_total = float(np.mean(valid_scores)) if valid_scores else float("nan")
-            anchor_source_summary = ";".join(
-                f"{family}={column_anchor_sources[column][family][row_idx]}"
-                for family in FAMILIES
-            )
-            results.append(
-                {
-                    "row_index": row_idx,
-                    "column": column,
-                    "value": df.iloc[row_idx][column],
-                    "group_weight": int(signature_weights[row_idx]),
-                    "anchor_source_summary": anchor_source_summary,
-                    "missing_status": statuses["missing"].status,
-                    "missing_reason": statuses["missing"].reason,
-                    "outlier_status": statuses["outlier"].status,
-                    "outlier_reason": statuses["outlier"].reason,
-                    "pattern_status": statuses["pattern"].status,
-                    "pattern_reason": statuses["pattern"].reason,
-                    "S_missing": s_missing,
-                    "S_outlier": s_outlier,
-                    "S_pattern": s_pattern,
-                    "S_total": s_total,
-                }
-            )
-
-    results.sort(
-        key=lambda item: (
-            pd.notna(item["S_total"]),
-            float(item["S_total"]) if pd.notna(item["S_total"]) else -1.0,
-        ),
-        reverse=True,
+    logger.info(
+        "  - Rule family distribution: "
+        + ", ".join(f"{family}={count}" for family, count in family_counts.items())
     )
+
+    logger.info("[3/4] Running active-learning calibrated evidence inference")
+    value_registry = _build_value_registry(df, metadata)
+    cell_registry = _build_cell_registry(df, metadata, value_registry)
+    logger.info(f"Value registry size: {len(value_registry)}")
+    logger.info(f"Cell registry size: {len(cell_registry)}")
+
+    value_observations, cell_observations = _extract_evidence(
+        df,
+        metadata,
+        rule_pool,
+        value_registry,
+        cell_registry,
+    )
+    hard_labels = _build_hard_evidence(df, metadata, value_observations, cell_observations)
+
+    evidence_matrix = build_cell_evidence_matrix(
+        cell_registry,
+        value_observations,
+        cell_observations,
+    )
+    logger.info(
+        f"Evidence matrix built: cells={len(evidence_matrix.cell_keys)}, "
+        f"features={len(evidence_matrix.feature_names)}"
+    )
+
+    clean_df_for_oracle: Optional[pd.DataFrame] = None
+    if args.clean_csv and os.path.exists(args.clean_csv):
+        clean_df_for_oracle = pd.read_csv(args.clean_csv)
+    else:
+        logger.info("Active learning oracle unavailable: clean_csv not found")
+
+    selected_cell_keys: List[str] = []
+    if clean_df_for_oracle is not None and args.active_label_budget > 0:
+        selected_cell_keys = select_active_queries(evidence_matrix, args.active_label_budget)
+    active_labels, queried_cells = _query_active_oracle_labels(
+        df,
+        clean_df_for_oracle,
+        cell_registry,
+        selected_cell_keys,
+    )
+    value_priors, cell_posteriors, calibration_trace = estimate_calibrated_posteriors(
+        value_registry,
+        cell_registry,
+        evidence_matrix,
+        selected_cell_keys,
+        active_labels,
+        args.em_prior_dirty,
+        queried_cells=queried_cells,
+    )
+    results = _export_cleanem_results(
+        df,
+        value_registry,
+        cell_registry,
+        value_priors,
+        cell_posteriors,
+        hard_labels,
+        value_observations,
+        cell_observations,
+        active_labels=active_labels,
+    )
+
+    for value_key, record in value_registry.items():
+        bundle = value_priors.get(value_key, {"prior": 0.5, "confidence": 0.0})
+        record.prior = bundle["prior"]
+        record.confidence = bundle["confidence"]
+    for cell_key, record in cell_registry.items():
+        bundle = cell_posteriors.get(cell_key, {"posterior": 0.5, "confidence": 0.0})
+        record.posterior = bundle["posterior"]
+        record.confidence = bundle["confidence"]
 
     logger.info("=" * 60)
     logger.info("Results Summary")
     logger.info("=" * 60)
-    logger.info(f"Total cells scored: {len(results)}")
+    logger.info(f"total_cells_exported: {len(results)}")
+    logger.info(f"value_records: {len(value_registry)}")
+    logger.info(f"cell_records: {len(cell_registry)}")
+    logger.info(
+        f"hard_evidence_counts: "
+        f"value_dirty={sum(1 for label in hard_labels['value'].values() if label.label == 'dirty')}, "
+        f"value_clean={sum(1 for label in hard_labels['value'].values() if label.label == 'clean')}, "
+        f"cell_dirty={sum(1 for label in hard_labels['cell'].values() if label.label == 'dirty')}, "
+        f"cell_clean={sum(1 for label in hard_labels['cell'].values() if label.label == 'clean')}"
+    )
+    label_counts = Counter(active_labels.values())
+    logger.info(
+        f"active_calibration: fitted={calibration_trace.fitted}, reason={calibration_trace.reason}, "
+        f"queried={len(active_labels)}/{args.active_label_budget}, "
+        f"dirty_labels={label_counts.get(1, 0)}, clean_labels={label_counts.get(0, 0)}, "
+        f"features={calibration_trace.feature_count}"
+    )
+    for query in calibration_trace.queried_cells:
+        logger.info(
+            "  - Active query: "
+            f"row={query.get('row_index')}, column={query.get('column')}, "
+            f"value={query.get('value')!r}, label={query.get('label')}"
+        )
+    if calibration_trace.feature_weights:
+        top_weights = sorted(
+            calibration_trace.feature_weights.items(),
+            key=lambda item: abs(item[1]),
+            reverse=True,
+        )[:20]
+        logger.info("learned_evidence_weights:")
+        for feature_name, weight in top_weights:
+            logger.info(f"  - {feature_name}: {weight:.4f}")
+    logger.info(f"value_evidence_source_coverage: {_evidence_source_coverage(value_observations)}")
+    logger.info(f"cell_evidence_source_coverage: {_evidence_source_coverage(cell_observations)}")
 
-    if results:
-        all_totals = [r["S_total"] for r in results if pd.notna(r["S_total"])]
-        logger.info(f"S_total distribution:")
-        if all_totals:
-            logger.info(f"  - Mean: {sum(all_totals)/len(all_totals):.4f}")
-            logger.info(f"  - Min: {min(all_totals):.4f}")
-            logger.info(f"  - Max: {max(all_totals):.4f}")
-            above_threshold = [s for s in all_totals if s >= args.score_threshold]
-            logger.info(
-                f"  - Above threshold ({args.score_threshold}): {len(above_threshold)}/{len(all_totals)} "
-                f"({len(above_threshold)/len(all_totals)*100:.1f}%)"
-            )
-        else:
-            logger.info("  - No active family scores available")
+    value_prior_values = [item["value_prior"] for item in results if pd.notna(item["value_prior"])]
+    cell_posterior_values = [item["cell_posterior"] for item in results if pd.notna(item["cell_posterior"])]
 
-        for family_key in ["S_missing", "S_outlier", "S_pattern"]:
-            scores = [r[family_key] for r in results if pd.notna(r[family_key])]
-            above = sum(1 for s in scores if s >= args.score_threshold)
-            if scores:
-                logger.info(
-                    f"  - {family_key}: mean={sum(scores)/len(scores):.4f}, "
-                    f"above_threshold={above}/{len(scores)}"
-                )
-            else:
-                logger.info(f"  - {family_key}: no active scores")
+    logger.info("value_prior distribution:")
+    if value_prior_values:
+        logger.info(f"  - Mean: {sum(value_prior_values)/len(value_prior_values):.4f}")
+        logger.info(f"  - Min: {min(value_prior_values):.4f}")
+        logger.info(f"  - Max: {max(value_prior_values):.4f}")
+    else:
+        logger.info("  - No value priors")
+
+    logger.info("cell_posterior distribution:")
+    if cell_posterior_values:
+        logger.info(f"  - Mean: {sum(cell_posterior_values)/len(cell_posterior_values):.4f}")
+        logger.info(f"  - Min: {min(cell_posterior_values):.4f}")
+        logger.info(f"  - Max: {max(cell_posterior_values):.4f}")
+        above_threshold = [score for score in cell_posterior_values if score >= args.score_threshold]
+        logger.info(
+            f"  - Above threshold ({args.score_threshold}): {len(above_threshold)}/{len(cell_posterior_values)} "
+            f"({len(above_threshold)/len(cell_posterior_values)*100:.1f}%)"
+        )
+    else:
+        logger.info("  - No cell posteriors")
 
     top_k = min(args.top_k, len(results))
-    logger.info(f"\nTop {top_k} highest scoring cells by S_total:")
-    print(f"\nTop {top_k} highest scoring cells by S_total:")
-
+    logger.info(f"\nTop {top_k} highest scoring cells by cell_posterior:")
     for item in results[:top_k]:
-        log_msg = (f"Row {item['row_index']}, Column '{item['column']}': "
-                  f"value={item['value']!r}, "
-                  f"group_weight={item['group_weight']}, "
-                  f"S_missing={item['S_missing']:.4f}, "
-                  f"S_outlier={item['S_outlier']:.4f}, "
-                  f"S_pattern={item['S_pattern']:.4f}, "
-                  f"S_total={item['S_total']:.4f}")
-        logger.info(f"  {log_msg}")
-        print(log_msg)
-    
-    if results:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(
-            args.output_dir,
-            f"{timestamp}_{dataset_name}_clean_em_scores.csv",
+        log_msg = (
+            f"Row {item['row_index']}, Column '{item['column']}': value={item['value']!r}, "
+            f"value_prior={item['value_prior']:.4f}, cell_posterior={item['cell_posterior']:.4f}, "
+            f"hard_label={item['hard_label'] or 'none'}"
         )
-        out_df = pd.DataFrame(results)
-        out_df.to_csv(output_path, index=False, encoding="utf-8")
-        logger.info(f"\nSaved all cell scores to: {output_path}")
-        print(f"\nSaved all cell scores to: {output_path}")
-        
-        if args.clean_csv and os.path.exists(args.clean_csv):
-            logger.info("\nEvaluating clean_em scores against ground truth:")
-            print("\nEvaluating clean_em scores against ground truth:")
-            clean_df = pd.read_csv(args.clean_csv)
-            judge = Judge()
-            detected_errors = [
-                {"row_index": r["row_index"], "column": r["column"]}
-                for r in results
-                if pd.notna(r["S_total"]) and r["S_total"] >= args.score_threshold
-            ]
-            logger.info(f"Detected {len(detected_errors)} cells with S_total >= {args.score_threshold}")
-            print(f"Detected {len(detected_errors)} cells with S_total >= {args.score_threshold}")
-            metrics = judge.evaluate_with_ground_truth(df, clean_df, detected_errors)
-            judge.print_evaluation_summary(metrics)
-            
-            # Log metrics
-            if hasattr(metrics, 'get'):
-                logger.info("Evaluation Metrics:")
-                for key, value in metrics.items() if isinstance(metrics, dict) else []:
-                    logger.info(f"  - {key}: {value}")
-    
+        logger.info(f"  {log_msg}")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(args.output_dir, f"{timestamp}_{dataset_name}_clean_em_scores.csv")
+    pd.DataFrame(results).to_csv(output_path, index=False, encoding="utf-8")
+    logger.info(f"\nSaved all cell scores to: {output_path}")
+
+    if args.clean_csv and os.path.exists(args.clean_csv):
+        logger.info("\nEvaluating clean_em scores against ground truth:")
+        clean_df = clean_df_for_oracle if clean_df_for_oracle is not None else pd.read_csv(args.clean_csv)
+        judge = Judge()
+        detected_errors = [
+            {"row_index": item["row_index"], "column": item["column"]}
+            for item in results
+            if pd.notna(item["cell_posterior"]) and item["cell_posterior"] >= args.score_threshold
+        ]
+        logger.info(f"Detected {len(detected_errors)} cells with cell_posterior >= {args.score_threshold}")
+        metrics = judge.evaluate_with_ground_truth(df, clean_df, detected_errors)
+        judge.print_evaluation_summary(metrics)
+        if hasattr(metrics, "get"):
+            logger.info("Evaluation Metrics:")
+            for key, value in metrics.items() if isinstance(metrics, dict) else []:
+                logger.info(f"  - {key}: {value}")
+
     logger.info("\n[4/4] clean_em pipeline complete.")
-    print("\n[4/4] clean_em pipeline complete.")
     logger.info("=" * 60)
 
 
