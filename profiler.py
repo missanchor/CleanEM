@@ -95,6 +95,35 @@ class PandasProfiler:
                 metadata.update(self._analyze_text(column))
                 metadata.update(self._analyze_string_properties(column))
 
+            # Generic semantic-profile features consumed by the column
+            # archetype agent. These stay independent of the coarse type so
+            # numeric, categorical, text, and pattern columns are comparable.
+            non_null = self.df[column].dropna()
+            non_null_count = int(len(non_null))
+            unique_count = int(non_null.nunique()) if non_null_count else 0
+            metadata['unique_count'] = int(metadata.get('unique_count', unique_count))
+            metadata['unique_ratio'] = (
+                float(unique_count / non_null_count)
+                if non_null_count > 0 else 0.0
+            )
+
+            if non_null_count > 0:
+                normalized_values = non_null.astype(str).str.strip()
+                value_counts = normalized_values.value_counts()
+                metadata['singleton_ratio'] = float(
+                    (value_counts == 1).sum() / max(len(value_counts), 1)
+                )
+                metadata['top_value_coverage'] = float(
+                    value_counts.head(10).sum() / non_null_count
+                )
+                metadata['percent_marker_ratio'] = float(
+                    normalized_values.str.endswith('%').mean()
+                )
+            else:
+                metadata['singleton_ratio'] = 0.0
+                metadata['top_value_coverage'] = 0.0
+                metadata['percent_marker_ratio'] = 0.0
+
             self.metadata[column] = metadata
 
         self._infer_relationship_constraints()

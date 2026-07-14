@@ -9,6 +9,7 @@ from openai import OpenAI
 
 import pandas as pd
 
+from cleanem_models import ColumnSemantics
 from core.pattern_types import PatternSpec
 from core.pattern_explorer import PatternExplorer
 
@@ -111,6 +112,353 @@ class BaseAgent:
             'system_prompt': self.last_system_prompt or '',
             'response': self.last_response or ''
         }
+
+
+class ColumnArchetypeAgent(BaseAgent):
+    """Infer semantic column types before downstream evidence generation."""
+
+    ALLOWED_ARCHETYPES = {
+        "closed_enum",
+        "identifier",
+        "open_entity",
+        "geo_name",
+        "numeric_measure",
+        "unit_measure",
+        "free_text",
+    }
+
+    MECHANISMS_BY_ARCHETYPE = {
+        "closed_enum": ["missing", "closed_set_violation", "value_contamination"],
+        "identifier": ["missing", "format_violation", "entity_swap"],
+        "open_entity": ["missing", "encoding_artifact", "entity_swap"],
+        "geo_name": ["missing", "geo_suffix_shift", "value_contamination"],
+        "numeric_measure": ["missing", "numeric_outlier", "percent_marker_contamination"],
+        "unit_measure": ["missing", "unit_variant", "suffix_pollution"],
+        "free_text": ["missing", "encoding_artifact", "token_contamination"],
+    }
+
+    def _get_system_prompt(self) -> str:
+        return """You classify a table column by semantic archetype.
+Return exactly one JSON object and no prose.
+Allowed archetypes: closed_enum, identifier, open_entity, geo_name,
+numeric_measure, unit_measure, free_text.
+Definitions:
+- closed_enum: a small controlled vocabulary, even when labels are long strings.
+- identifier: IDs, codes, phone/zip values, or structured time-like keys.
+- open_entity: names of people, organizations, products, or other long-tail entities.
+- geo_name: city, town, province, region, or other geographic names; it may be open-set.
+- numeric_measure: numeric quantities, rates, scores, and averages.
+- unit_measure: values containing both a number and a measurement unit.
+- free_text: unconstrained natural-language content.
+Scores must be numbers between 0 and 1. The supplied distribution statistics
+are objective facts. Do not reinterpret unique_ratio as semantic confidence."""
+
+    @staticmethod
+    def _clip_score(value: Any, default: float) -> float:
+        try:
+            return float(min(1.0, max(0.0, float(value))))
+        except (TypeError, ValueError):
+            return float(default)
+
+    @staticmethod
+    def _first_distribution_ratio(metadata: Dict[str, Any], key: str) -> float:
+        items = metadata.get(key) or []
+        if not items:
+            return 0.0
+        try:
+            return float(items[0].get("ratio", 0.0))
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
+
+    def _heuristic_fallback(
+        self,
+        column: str,
+        metadata: Dict[str, Any],
+        fallback_reason: str = "heuristic_fallback",
+    ) -> ColumnSemantics:
+        name = column.strip().lower()
+        snake_name = re.sub(r"(?<!^)(?=[A-Z])", "_", column.strip()).lower()
+        name_tokens = set(filter(None, re.split(r"[^a-z0-9]+", snake_name)))
+        col_type = str(metadata.get("type", "text")).lower()
+        unique_ratio = self._clip_score(metadata.get("unique_ratio"), 0.0)
+        top_coverage = self._clip_score(metadata.get("top_value_coverage"), 0.0)
+        shape_coverage = self._clip_score(
+            self._first_distribution_ratio(metadata, "shape_distribution"),
+            0.0,
+        )
+        percent_ratio = self._clip_score(metadata.get("percent_marker_ratio"), 0.0)
+
+        identifier_names = {
+            "id",
+            "provider_number",
+            "zip_code",
+            "zipcode",
+            "postal_code",
+            "phone_number",
+            "phonenumber",
+            "flight",
+        }
+        if (
+            name in identifier_names
+            or snake_name in identifier_names
+            or name.endswith("_id")
+            or name.endswith("identifier")
+            or "time" in name_tokens
+        ):
+            archetype = "identifier"
+        elif name_tokens.intersection({"city", "town", "province", "region"}):
+            archetype = "geo_name"
+        elif (
+            snake_name in {"state", "state_code", "country_code"}
+            or name_tokens.intersection({"status", "category", "style"})
+        ):
+            archetype = "closed_enum"
+        elif any(token in name for token in ("ounce", "ounces", "weight", "unit", "size")):
+            archetype = "unit_measure"
+        elif (
+            col_type == "numeric"
+            or name_tokens.intersection({"abv", "amount", "price", "rate", "score", "average", "avg"})
+            or name.endswith("avg")
+        ):
+            archetype = "numeric_measure"
+        elif "name" in name or unique_ratio >= 0.50:
+            archetype = "open_entity"
+        elif unique_ratio <= 0.10 and top_coverage >= 0.30:
+            archetype = "closed_enum"
+        else:
+            archetype = "free_text"
+
+        structure_strength = max(top_coverage, shape_coverage)
+        canonicalization_need = {
+            "unit_measure": 0.95,
+            "geo_name": 0.80,
+            "numeric_measure": max(0.45, percent_ratio),
+            "closed_enum": 0.40,
+            "identifier": 0.35,
+            "open_entity": 0.25,
+            "free_text": 0.20,
+        }[archetype]
+
+        return ColumnSemantics(
+            column=column,
+            archetype=archetype,
+            confidence=0.65,
+            open_set_score=unique_ratio,
+            structure_strength=structure_strength,
+            canonicalization_need=canonicalization_need,
+            possible_error_mechanisms=list(self.MECHANISMS_BY_ARCHETYPE[archetype]),
+            rationale=[fallback_reason],
+        )
+
+    @staticmethod
+    def _extract_json_object(response: str) -> Dict[str, Any]:
+        cleaned = (response or "").strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if not match:
+            raise ValueError("No JSON object in archetype response")
+        payload = json.loads(match.group(0))
+        if not isinstance(payload, dict):
+            raise ValueError("Archetype response must be a JSON object")
+        return payload
+
+    def _reconcile_archetype(
+        self,
+        column: str,
+        metadata: Dict[str, Any],
+        llm_archetype: str,
+        heuristic: ColumnSemantics,
+    ) -> Tuple[str, Optional[str]]:
+        """Override LLM output only when profiling supplies a strong constraint."""
+        snake_name = re.sub(r"(?<!^)(?=[A-Z])", "_", column.strip()).lower()
+        name_tokens = set(filter(None, re.split(r"[^a-z0-9]+", snake_name)))
+        unique_ratio = self._clip_score(metadata.get("unique_ratio"), 0.0)
+        top_coverage = self._clip_score(metadata.get("top_value_coverage"), 0.0)
+        coarse_type = str(metadata.get("type", "text")).lower()
+
+        strong_name_signal = bool(
+            snake_name == "id"
+            or snake_name.endswith("_id")
+            or snake_name in {
+                "provider_number",
+                "zip_code",
+                "zipcode",
+                "postal_code",
+                "phone_number",
+                "phonenumber",
+                "flight",
+                "state",
+                "state_code",
+                "country_code",
+            }
+            or name_tokens.intersection(
+                {"city", "town", "province", "region", "status", "category", "style", "time"}
+            )
+            or any(token in snake_name for token in ("ounce", "weight", "unit", "size"))
+        )
+        strong_numeric_signal = bool(
+            coarse_type == "numeric"
+            or name_tokens.intersection({"abv", "amount", "price", "rate", "score", "average", "avg"})
+            or snake_name.endswith("avg")
+        )
+        strong_closed_distribution = bool(
+            unique_ratio <= 0.10 and top_coverage >= 0.30
+        )
+        strong_open_distribution = bool(unique_ratio >= 0.50)
+
+        use_heuristic = (
+            strong_name_signal
+            or strong_numeric_signal
+            or strong_closed_distribution
+            or (
+                strong_open_distribution
+                and heuristic.archetype == "open_entity"
+                and llm_archetype == "closed_enum"
+            )
+        )
+        if use_heuristic and llm_archetype != heuristic.archetype:
+            return (
+                heuristic.archetype,
+                f"profile_override:{llm_archetype}->{heuristic.archetype}",
+            )
+        return llm_archetype, None
+
+    def _validated_mechanisms(
+        self,
+        archetype: str,
+        payload: Dict[str, Any],
+    ) -> List[str]:
+        allowed = set(self.MECHANISMS_BY_ARCHETYPE[archetype])
+        proposed = payload.get("possible_error_mechanisms") or []
+        if not isinstance(proposed, list):
+            proposed = []
+        validated = []
+        for mechanism in proposed:
+            normalized = str(mechanism).strip()
+            if normalized in allowed and normalized not in validated:
+                validated.append(normalized)
+        # Keep the complete stable vocabulary for coverage, while placing
+        # mechanisms explicitly proposed by the LLM first.
+        defaults = list(self.MECHANISMS_BY_ARCHETYPE[archetype])
+        return validated + [item for item in defaults if item not in validated]
+
+    def infer(self, column: str, metadata: Dict[str, Any]) -> ColumnSemantics:
+        compact_metadata = {
+            key: metadata.get(key)
+            for key in (
+                "type",
+                "non_null_count",
+                "null_count",
+                "unique_count",
+                "unique_ratio",
+                "singleton_ratio",
+                "top_value_coverage",
+                "percent_marker_ratio",
+                "sample_values",
+                "normalized_top_values",
+                "shape_distribution",
+                "regex_candidates",
+                "top_tokens",
+            )
+        }
+        prompt = f"""Column name: {column}
+Column profile:
+{json.dumps(compact_metadata, ensure_ascii=False, default=str)}
+
+Return this schema:
+{{
+  "archetype": "one allowed archetype",
+  "confidence": 0.0,
+  "open_set_score": 0.0,
+  "structure_strength": 0.0,
+  "canonicalization_need": 0.0,
+  "possible_error_mechanisms": [],
+  "rationale": []
+}}"""
+
+        response = self._call_llm(prompt, temperature=0.0)
+        try:
+            payload = self._extract_json_object(response)
+            llm_archetype = str(payload.get("archetype", "")).strip()
+            if llm_archetype not in self.ALLOWED_ARCHETYPES:
+                raise ValueError(f"Unsupported archetype: {llm_archetype!r}")
+
+            heuristic = self._heuristic_fallback(
+                column,
+                metadata,
+                fallback_reason="profile_reference",
+            )
+            archetype, override_reason = self._reconcile_archetype(
+                column,
+                metadata,
+                llm_archetype,
+                heuristic,
+            )
+            mechanisms = self._validated_mechanisms(archetype, payload)
+
+            rationale = payload.get("rationale") or []
+            if isinstance(rationale, str):
+                rationale = [rationale]
+            if not isinstance(rationale, list):
+                rationale = []
+            rationale = [str(item) for item in rationale if str(item).strip()]
+            rationale.append("scores_from_profile")
+            if override_reason:
+                rationale.append(override_reason)
+
+            llm_confidence = self._clip_score(payload.get("confidence"), 0.5)
+            confidence = (
+                min(llm_confidence, 0.80)
+                if override_reason else llm_confidence
+            )
+
+            # These values are measured or deterministic profile-derived
+            # quantities. LLM-proposed scores are intentionally not trusted.
+            profile_semantics = self._heuristic_fallback(
+                column,
+                metadata,
+                fallback_reason="profile_scores",
+            )
+            if profile_semantics.archetype != archetype:
+                profile_semantics = ColumnSemantics(
+                    column=column,
+                    archetype=archetype,
+                    confidence=profile_semantics.confidence,
+                    open_set_score=profile_semantics.open_set_score,
+                    structure_strength=profile_semantics.structure_strength,
+                    canonicalization_need={
+                        "unit_measure": 0.95,
+                        "geo_name": 0.80,
+                        "numeric_measure": max(
+                            0.45,
+                            self._clip_score(metadata.get("percent_marker_ratio"), 0.0),
+                        ),
+                        "closed_enum": 0.40,
+                        "identifier": 0.35,
+                        "open_entity": 0.25,
+                        "free_text": 0.20,
+                    }[archetype],
+                    possible_error_mechanisms=mechanisms,
+                    rationale=[],
+                )
+
+            return ColumnSemantics(
+                column=column,
+                archetype=archetype,
+                confidence=confidence,
+                open_set_score=profile_semantics.open_set_score,
+                structure_strength=profile_semantics.structure_strength,
+                canonicalization_need=profile_semantics.canonicalization_need,
+                possible_error_mechanisms=mechanisms,
+                rationale=rationale,
+            )
+        except Exception as exc:
+            return self._heuristic_fallback(
+                column,
+                metadata,
+                fallback_reason=f"heuristic_fallback:{type(exc).__name__}",
+            )
 
 
 class RuleReviewerAgent(BaseAgent):
@@ -1924,6 +2272,17 @@ class AgentFactory:
 
     def create_rule_reviewer(self) -> RuleReviewerAgent:
         return RuleReviewerAgent(self.base_url, self.model)
+
+    def infer_column_semantics(
+        self,
+        metadata: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, ColumnSemantics]:
+        """Infer and validate one semantic archetype for every column."""
+        agent = ColumnArchetypeAgent(self.base_url, self.model)
+        return {
+            column: agent.infer(column, col_metadata)
+            for column, col_metadata in metadata.items()
+        }
 
     def create_agents(self, column: str, column_type: str) -> List[BaseAgent]:
         """Create appropriate agents for a column based on its type."""

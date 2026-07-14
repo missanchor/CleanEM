@@ -9,7 +9,7 @@ import os
 import re
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime
 
@@ -2334,8 +2334,20 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
             f"unique={meta.get('unique_count', 0)}, families={meta.get('available_families', [])}"
         )
 
-    logger.info("[2/4] Generating clean rules and evidence sources")
+    logger.info("[2/4] Inferring column semantics and generating evidence sources")
     factory = AgentFactory(base_url=args.base_url, model=args.model, max_workers=args.max_workers)
+    column_semantics = factory.infer_column_semantics(metadata)
+    for column, semantics in column_semantics.items():
+        metadata[column]["semantics"] = asdict(semantics)
+        logger.info(
+            f"  - Column semantics '{column}': archetype={semantics.archetype}, "
+            f"confidence={semantics.confidence:.3f}, "
+            f"open_set={semantics.open_set_score:.3f}, "
+            f"structure={semantics.structure_strength:.3f}, "
+            f"canonicalization_need={semantics.canonicalization_need:.3f}, "
+            f"mechanisms={semantics.possible_error_mechanisms}"
+        )
+
     rule_pool = _build_clean_rule_pool(df, metadata, factory)
 
     total_rules = sum(len(rules) for rules in rule_pool.values())
