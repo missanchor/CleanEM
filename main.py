@@ -33,6 +33,43 @@ from cleanem_models import CellRecord, EvidenceObservation, HardEvidenceLabel, V
 cleanem_logger = logging.getLogger("CleanEM")
 
 FAMILIES = ["missing", "outlier", "pattern", "relationship", "prototype_lexical"]
+ARCHETYPE_EVIDENCE_GATES = {
+    "open_entity": {
+        "rarity_high": 0.10,
+        "prototype_far": 0.20,
+        "pattern_mismatch": 0.30,
+    },
+    "identifier": {
+        "rarity_high": 0.00,
+        "prototype_far": 0.00,
+        "pattern_mismatch": 1.00,
+    },
+    "closed_enum": {
+        "rarity_high": 1.00,
+        "prototype_far": 1.00,
+        "pattern_mismatch": 0.80,
+    },
+    "unit_measure": {
+        "rarity_high": 0.20,
+        "prototype_far": 0.20,
+        "pattern_mismatch": 0.60,
+    },
+    "numeric_measure": {
+        "rarity_high": 0.50,
+        "prototype_far": 0.20,
+        "pattern_mismatch": 0.80,
+    },
+    "geo_name": {
+        "rarity_high": 0.10,
+        "prototype_far": 0.20,
+        "pattern_mismatch": 0.30,
+    },
+    "free_text": {
+        "rarity_high": 0.05,
+        "prototype_far": 0.10,
+        "pattern_mismatch": 0.20,
+    },
+}
 FAMILY_SCORE_KEYS = {
     "missing": "S_missing",
     "outlier": "S_outlier",
@@ -201,6 +238,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="Max oracle cell labels used to calibrate clean_em evidence sources."
+    )
+    parser.add_argument(
+        "--disable_evidence_gating",
+        action="store_true",
+        help="Disable archetype-conditioned evidence scaling for ablation runs."
     )
     return parser.parse_args()
 
@@ -1387,6 +1429,104 @@ def _record_observation(
     target_list.append(observation)
 
 
+def _column_archetype(column_metadata: Dict[str, Any]) -> str:
+    semantics = column_metadata.get("semantics") or {}
+    if isinstance(semantics, dict):
+        return str(semantics.get("archetype") or "unknown")
+    return str(getattr(semantics, "archetype", "unknown"))
+
+
+def _gate_observation(
+    observation: EvidenceObservation,
+    column: str,
+    metadata: Dict[str, Dict[str, Any]],
+) -> Tuple[EvidenceObservation, str]:
+    """Apply a fixed semantic gate while retaining full audit provenance."""
+    observation.metadata = dict(observation.metadata or {})
+    if observation.metadata.get("gate_applied"):
+        return observation, "already_gated"
+
+    archetype = _column_archetype(metadata.get(column, {}))
+    raw_strength = float(observation.strength)
+
+    if observation.hard:
+        scale = 1.0
+        gate_reason = "hard_evidence_preserved"
+        outcome = "hard_preserved"
+    else:
+        policy = ARCHETYPE_EVIDENCE_GATES.get(archetype, {})
+        scale = float(policy.get(observation.source_id, 1.0))
+        gate_reason = (
+            "archetype_policy"
+            if observation.source_id in policy
+            else "source_default"
+        )
+        if scale <= 0.0:
+            outcome = "disabled"
+        elif scale < 1.0:
+            outcome = "attenuated"
+        else:
+            outcome = "unchanged"
+
+    observation.metadata.update({
+        "gate_applied": True,
+        "gate_archetype": archetype,
+        "raw_strength": raw_strength,
+        "gate_scale": scale,
+        "gate_reason": gate_reason,
+    })
+    observation.strength = float(np.clip(raw_strength * scale, 0.0, 1.0))
+    return observation, outcome
+
+
+def _apply_evidence_gates(
+    value_observations: Dict[str, List[EvidenceObservation]],
+    cell_observations: Dict[str, List[EvidenceObservation]],
+    metadata: Dict[str, Dict[str, Any]],
+    value_registry: Dict[str, ValueRecord],
+    cell_registry: Dict[str, CellRecord],
+) -> Dict[str, Any]:
+    summary = Counter()
+    policy_hits = Counter()
+
+    for value_key, observations in value_observations.items():
+        record = value_registry.get(value_key)
+        if record is None:
+            continue
+        archetype = _column_archetype(metadata.get(record.column, {}))
+        for observation in observations:
+            _, outcome = _gate_observation(observation, record.column, metadata)
+            summary[outcome] += 1
+            scale = float(observation.metadata.get("gate_scale", 1.0))
+            if scale < 1.0:
+                policy_hits[(archetype, observation.source_id, scale)] += 1
+
+    for cell_key, observations in cell_observations.items():
+        record = cell_registry.get(cell_key)
+        if record is None:
+            continue
+        archetype = _column_archetype(metadata.get(record.column, {}))
+        for observation in observations:
+            _, outcome = _gate_observation(observation, record.column, metadata)
+            summary[outcome] += 1
+            scale = float(observation.metadata.get("gate_scale", 1.0))
+            if scale < 1.0:
+                policy_hits[(archetype, observation.source_id, scale)] += 1
+
+    return {
+        "counts": dict(summary),
+        "policy_hits": [
+            {
+                "archetype": archetype,
+                "source_id": source_id,
+                "scale": scale,
+                "count": count,
+            }
+            for (archetype, source_id, scale), count in sorted(policy_hits.items())
+        ],
+    }
+
+
 def _matches_regex_candidates(value: Any, regex_candidates: List[Dict[str, Any]]) -> bool:
     return _matching_regex_rate(value, regex_candidates) > 0.0
 
@@ -1701,6 +1841,7 @@ def _extract_evidence(
     rule_pool: Dict[str, List[Dict[str, Any]]],
     value_registry: Dict[str, ValueRecord],
     cell_registry: Dict[str, CellRecord],
+    enable_evidence_gating: bool = True,
 ) -> Tuple[Dict[str, List[EvidenceObservation]], Dict[str, List[EvidenceObservation]]]:
     value_observations: Dict[str, List[EvidenceObservation]] = {}
     cell_observations: Dict[str, List[EvidenceObservation]] = {}
@@ -2138,6 +2279,24 @@ def _extract_evidence(
 
     _add_contextual_consensus_evidence(df, metadata, cell_observations)
 
+    if enable_evidence_gating:
+        gating_summary = _apply_evidence_gates(
+            value_observations,
+            cell_observations,
+            metadata,
+            value_registry,
+            cell_registry,
+        )
+        cleanem_logger.info(f"evidence_gating_counts: {gating_summary['counts']}")
+        for item in gating_summary["policy_hits"]:
+            cleanem_logger.info(
+                "  - Evidence gate: "
+                f"archetype={item['archetype']}, source={item['source_id']}, "
+                f"scale={item['scale']:.2f}, count={item['count']}"
+            )
+    else:
+        cleanem_logger.info("evidence_gating: disabled")
+
     return value_observations, cell_observations
 
 
@@ -2316,6 +2475,7 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
     logger.info(f"  - calib_max_dirty_pass (legacy/unused): {args.calib_max_dirty_pass}")
     logger.info(f"  - score_threshold (cell_posterior): {args.score_threshold}")
     logger.info(f"  - active_label_budget: {args.active_label_budget}")
+    logger.info(f"  - evidence_gating: {not args.disable_evidence_gating}")
     logger.info(f"  - top_k: {args.top_k}")
 
     profiler = PandasProfiler(args.dirty_csv)
@@ -2390,6 +2550,7 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         rule_pool,
         value_registry,
         cell_registry,
+        enable_evidence_gating=not args.disable_evidence_gating,
     )
     hard_labels = _build_hard_evidence(df, metadata, value_observations, cell_observations)
 
