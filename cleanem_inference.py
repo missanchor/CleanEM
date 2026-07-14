@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -174,6 +174,157 @@ def select_active_queries(
             ) / denom
 
     return [evidence_matrix.cell_keys[idx] for idx in selected]
+
+
+def select_adaptive_stratified_queries(
+    evidence_matrix: EvidenceMatrix,
+    cell_columns: Dict[str, str],
+    budget: int,
+    already_selected: Optional[List[str]] = None,
+    current_probabilities: Optional[Dict[str, float]] = None,
+    column_risk: Optional[Dict[str, float]] = None,
+    ridge: float = 1.0,
+) -> List[str]:
+    """Select one adaptive batch while preserving per-column coverage.
+
+    The first pass gives the least-covered columns one representative each.
+    Remaining slots use a global score combining D-optimal leverage, posterior
+    uncertainty, conflicting evidence, dirty-signal strength, and semantic risk.
+    Repeated evidence signatures within a column are collapsed so a batch does
+    not spend labels on interchangeable cells.
+    """
+
+    budget = max(0, int(budget))
+    if budget == 0 or evidence_matrix.values.size == 0:
+        return []
+
+    already_selected = list(already_selected or [])
+    selected_set: Set[str] = set(already_selected)
+    current_probabilities = current_probabilities or {}
+    column_risk = column_risk or {}
+    x_all = evidence_matrix.values
+
+    # Keep one deterministic representative for each evidence pattern per
+    # column. Identical patterns provide the same calibration information.
+    representatives: Dict[Tuple[str, Tuple[Tuple[int, float], ...]], int] = {}
+    for row_idx, cell_key in enumerate(evidence_matrix.cell_keys):
+        if cell_key in selected_set:
+            continue
+        x = x_all[row_idx]
+        nz = np.nonzero(np.abs(x) > 1e-9)[0]
+        if len(nz) == 0:
+            continue
+        column = cell_columns.get(cell_key)
+        if column is None:
+            continue
+        signature = tuple(
+            (int(feature_idx), round(float(x[feature_idx]), 3))
+            for feature_idx in nz
+        )
+        representatives.setdefault((column, signature), int(row_idx))
+
+    remaining: Set[int] = set(representatives.values())
+    if not remaining:
+        return []
+
+    dim = x_all.shape[1]
+    information = np.eye(dim, dtype=float) * max(float(ridge), 1e-6)
+    selected_indices = [
+        evidence_matrix.key_to_index[key]
+        for key in already_selected
+        if key in evidence_matrix.key_to_index
+    ]
+    if selected_indices:
+        selected_values = x_all[selected_indices]
+        information += selected_values.T @ selected_values
+    inverse_information = np.linalg.pinv(information)
+
+    selected_counts: Dict[str, int] = {}
+    for key in already_selected:
+        column = cell_columns.get(key)
+        if column is not None:
+            selected_counts[column] = selected_counts.get(column, 0) + 1
+
+    def candidate_score(candidate_idx: int) -> float:
+        cell_key = evidence_matrix.cell_keys[candidate_idx]
+        column = cell_columns[cell_key]
+        x = x_all[candidate_idx]
+        leverage = max(0.0, float(x @ inverse_information @ x.T))
+        leverage_score = leverage / (1.0 + leverage)
+        probability = float(current_probabilities.get(cell_key, 0.5))
+        uncertainty = 1.0 - min(1.0, 2.0 * abs(probability - 0.5))
+        positive = float(np.maximum(x, 0.0).sum())
+        negative = float(np.maximum(-x, 0.0).sum())
+        total = positive + negative
+        disagreement = 0.0 if total <= 1e-12 else 2.0 * min(positive, negative) / total
+        dirty_signal = 0.0 if total <= 1e-12 else positive / total
+        semantic_risk = float(np.clip(column_risk.get(column, 0.5), 0.0, 1.0))
+        return (
+            0.35 * leverage_score
+            + 0.25 * uncertainty
+            + 0.15 * disagreement
+            + 0.15 * dirty_signal
+            + 0.10 * semantic_risk
+        )
+
+    def choose_best(candidate_pool: Set[int]) -> Optional[int]:
+        if not candidate_pool:
+            return None
+        return max(
+            candidate_pool,
+            key=lambda idx: (
+                candidate_score(idx),
+                -idx,
+            ),
+        )
+
+    def accept(candidate_idx: int) -> None:
+        nonlocal inverse_information
+        batch_indices.append(candidate_idx)
+        remaining.remove(candidate_idx)
+        cell_key = evidence_matrix.cell_keys[candidate_idx]
+        column = cell_columns[cell_key]
+        selected_counts[column] = selected_counts.get(column, 0) + 1
+        x = x_all[candidate_idx]
+        x_col = x.reshape(-1, 1)
+        denom = 1.0 + float(x @ inverse_information @ x.T)
+        if denom > 1e-12:
+            inverse_information = inverse_information - (
+                inverse_information @ x_col @ x_col.T @ inverse_information
+            ) / denom
+
+    batch_indices: List[int] = []
+    available_columns = sorted(
+        {cell_columns[evidence_matrix.cell_keys[idx]] for idx in remaining},
+        key=lambda column: (
+            selected_counts.get(column, 0),
+            -float(column_risk.get(column, 0.5)),
+            column,
+        ),
+    )
+
+    # Hard coverage pass: at most one new label per column in this batch,
+    # prioritizing columns that have received fewer labels in earlier rounds.
+    for column in available_columns:
+        if len(batch_indices) >= budget:
+            break
+        column_candidates = {
+            idx
+            for idx in remaining
+            if cell_columns[evidence_matrix.cell_keys[idx]] == column
+        }
+        best_idx = choose_best(column_candidates)
+        if best_idx is not None:
+            accept(best_idx)
+
+    # Spend any remaining budget on globally informative, non-duplicate cells.
+    while remaining and len(batch_indices) < budget:
+        best_idx = choose_best(remaining)
+        if best_idx is None:
+            break
+        accept(best_idx)
+
+    return [evidence_matrix.cell_keys[idx] for idx in batch_indices]
 
 
 def _fit_prior_centered_logistic(

@@ -4,6 +4,8 @@ Command-line entry point for the agentic error detector.
 Supports a dual verification pipeline with clean rule-level refinement.
 """
 import argparse
+import hashlib
+import json
 import logging
 import os
 import re
@@ -24,6 +26,7 @@ from core.utils import safe_dict
 from cleanem_inference import (
     build_cell_evidence_matrix,
     estimate_calibrated_posteriors,
+    select_adaptive_stratified_queries,
     select_active_queries,
 )
 from cleanem_models import CellRecord, EvidenceObservation, HardEvidenceLabel, ValueRecord
@@ -45,9 +48,9 @@ ARCHETYPE_EVIDENCE_GATES = {
         "pattern_mismatch": 1.00,
     },
     "closed_enum": {
-        "rarity_high": 1.00,
-        "prototype_far": 1.00,
-        "pattern_mismatch": 0.80,
+        "rarity_high": 0.25,
+        "prototype_far": 0.30,
+        "pattern_mismatch": 0.60,
     },
     "unit_measure": {
         "rarity_high": 0.20,
@@ -240,9 +243,46 @@ def parse_args() -> argparse.Namespace:
         help="Max oracle cell labels used to calibrate clean_em evidence sources."
     )
     parser.add_argument(
+        "--active_query_strategy",
+        choices=["adaptive_stratified", "d_optimal"],
+        default="adaptive_stratified",
+        help=(
+            "Active-query selection strategy. adaptive_stratified performs "
+            "column-covered query/refit rounds; d_optimal preserves the legacy selector."
+        )
+    )
+    parser.add_argument(
+        "--active_query_rounds",
+        type=int,
+        default=3,
+        help="Maximum query/refit rounds for adaptive_stratified selection."
+    )
+    parser.add_argument(
+        "--active_query_batch_size",
+        type=int,
+        default=10,
+        help="Maximum new oracle labels requested per adaptive-query round."
+    )
+    parser.add_argument(
         "--disable_evidence_gating",
         action="store_true",
         help="Disable archetype-conditioned evidence scaling for ablation runs."
+    )
+    parser.add_argument(
+        "--rule_pool_cache",
+        default=None,
+        help=(
+            "Optional JSON cache for column semantics and generated rules. "
+            "Load it when present; otherwise generate and save it."
+        )
+    )
+    parser.add_argument(
+        "--active_query_cache",
+        default=None,
+        help=(
+            "Optional JSON cache for selected active-query cell keys. "
+            "Load it when present; otherwise select and save it."
+        )
     )
     return parser.parse_args()
 
@@ -294,6 +334,161 @@ def _build_clean_rule_pool(
         if col_pool:
             pool[column] = col_pool
     return pool
+
+
+def _dataframe_fingerprint(df: pd.DataFrame) -> str:
+    hashed = pd.util.hash_pandas_object(df, index=True).values.tobytes()
+    schema = "|".join(f"{column}:{df[column].dtype}" for column in df.columns)
+    digest = hashlib.sha256()
+    digest.update(schema.encode("utf-8"))
+    digest.update(hashed)
+    return digest.hexdigest()
+
+
+def _write_json_atomic(path: str, payload: Dict[str, Any]) -> None:
+    absolute_path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
+    temporary_path = f"{absolute_path}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+    os.replace(temporary_path, absolute_path)
+
+
+def _save_rule_pool_cache(
+    path: str,
+    df: pd.DataFrame,
+    metadata: Dict[str, Dict[str, Any]],
+    rule_pool: Dict[str, List[Dict[str, Any]]],
+) -> None:
+    payload = {
+        "version": 1,
+        "dataframe_fingerprint": _dataframe_fingerprint(df),
+        "columns": list(df.columns),
+        "semantics": {
+            column: dict(metadata.get(column, {}).get("semantics") or {})
+            for column in df.columns
+        },
+        "rules": {
+            column: [
+                {
+                    "agent": rule.get("agent"),
+                    "family": rule.get("family"),
+                    "rule_name": rule.get("rule_name"),
+                    "rule_str": rule.get("rule_str"),
+                }
+                for rule in rules
+            ]
+            for column, rules in rule_pool.items()
+        },
+    }
+    _write_json_atomic(path, payload)
+
+
+def _load_rule_pool_cache(
+    path: str,
+    df: pd.DataFrame,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Dict[str, Any]]]:
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    if payload.get("version") != 1:
+        raise ValueError(f"Unsupported rule-pool cache version: {payload.get('version')}")
+    if payload.get("columns") != list(df.columns):
+        raise ValueError("Rule-pool cache columns do not match the current dataset")
+    if payload.get("dataframe_fingerprint") != _dataframe_fingerprint(df):
+        raise ValueError("Rule-pool cache fingerprint does not match the current dataset")
+
+    cached_semantics = payload.get("semantics") or {}
+    if any(column not in cached_semantics for column in df.columns):
+        raise ValueError("Rule-pool cache is missing column semantics")
+
+    pool: Dict[str, List[Dict[str, Any]]] = {}
+    for column, rules in (payload.get("rules") or {}).items():
+        if column not in df.columns:
+            raise ValueError(f"Rule-pool cache contains unknown column: {column}")
+        compiled_rules = []
+        for item in rules:
+            rule_str = str(item.get("rule_str") or "").strip()
+            if not rule_str:
+                raise ValueError(f"Cached rule has no rule_str for column {column}")
+            try:
+                rule_func = eval(rule_str, safe_dict)
+            except Exception as exc:
+                raise ValueError(
+                    f"Could not compile cached rule for column {column}: {rule_str}"
+                ) from exc
+            compiled_rules.append({
+                "agent": item.get("agent"),
+                "family": item.get("family"),
+                "rule_name": item.get("rule_name"),
+                "rule_str": rule_str,
+                "rule_func": rule_func,
+            })
+        if compiled_rules:
+            pool[column] = compiled_rules
+    return pool, cached_semantics
+
+
+def _save_active_query_cache(
+    path: str,
+    df: pd.DataFrame,
+    budget: int,
+    cell_keys: List[str],
+    strategy: str,
+    rounds: int,
+    batch_size: int,
+    query_rounds: Optional[List[List[str]]] = None,
+) -> None:
+    _write_json_atomic(path, {
+        "version": 2,
+        "dataframe_fingerprint": _dataframe_fingerprint(df),
+        "budget": int(budget),
+        "strategy": str(strategy),
+        "rounds": int(rounds),
+        "batch_size": int(batch_size),
+        "cell_keys": list(cell_keys),
+        "query_rounds": [list(batch) for batch in (query_rounds or [])],
+    })
+
+
+def _load_active_query_cache(
+    path: str,
+    df: pd.DataFrame,
+    budget: int,
+    valid_cell_keys: set,
+    strategy: str,
+    rounds: int,
+    batch_size: int,
+) -> List[str]:
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("version") != 2:
+        raise ValueError(
+            "Unsupported active-query cache version: "
+            f"{payload.get('version')}; delete this cache and regenerate it"
+        )
+    if payload.get("dataframe_fingerprint") != _dataframe_fingerprint(df):
+        raise ValueError("Active-query cache fingerprint does not match the current dataset")
+    if int(payload.get("budget", -1)) != int(budget):
+        raise ValueError("Active-query cache budget does not match --active_label_budget")
+    if str(payload.get("strategy")) != str(strategy):
+        raise ValueError("Active-query cache strategy does not match --active_query_strategy")
+    if int(payload.get("rounds", -1)) != int(rounds):
+        raise ValueError("Active-query cache rounds do not match --active_query_rounds")
+    if int(payload.get("batch_size", -1)) != int(batch_size):
+        raise ValueError(
+            "Active-query cache batch size does not match --active_query_batch_size"
+        )
+
+    cell_keys = [str(key) for key in payload.get("cell_keys") or []]
+    if len(cell_keys) != len(set(cell_keys)):
+        raise ValueError("Active-query cache contains duplicate cell keys")
+    if len(cell_keys) > int(budget):
+        raise ValueError("Active-query cache contains more cells than the configured budget")
+    unknown = [key for key in cell_keys if key not in valid_cell_keys]
+    if unknown:
+        raise ValueError(f"Active-query cache contains unknown cell keys: {unknown[:3]}")
+    return cell_keys
 
 
 def _compute_rule_outputs_for_column(
@@ -2475,7 +2670,12 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
     logger.info(f"  - calib_max_dirty_pass (legacy/unused): {args.calib_max_dirty_pass}")
     logger.info(f"  - score_threshold (cell_posterior): {args.score_threshold}")
     logger.info(f"  - active_label_budget: {args.active_label_budget}")
+    logger.info(f"  - active_query_strategy: {args.active_query_strategy}")
+    logger.info(f"  - active_query_rounds: {args.active_query_rounds}")
+    logger.info(f"  - active_query_batch_size: {args.active_query_batch_size}")
     logger.info(f"  - evidence_gating: {not args.disable_evidence_gating}")
+    logger.info(f"  - rule_pool_cache: {args.rule_pool_cache or 'disabled'}")
+    logger.info(f"  - active_query_cache: {args.active_query_cache or 'disabled'}")
     logger.info(f"  - top_k: {args.top_k}")
 
     profiler = PandasProfiler(args.dirty_csv)
@@ -2496,22 +2696,48 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
 
     logger.info("[2/4] Inferring column semantics and generating evidence sources")
     factory = AgentFactory(base_url=args.base_url, model=args.model, max_workers=args.max_workers)
-    column_semantics = factory.infer_column_semantics(metadata)
-    for column, semantics in column_semantics.items():
-        metadata[column]["semantics"] = asdict(semantics)
+    rule_pool_cache_hit = bool(
+        args.rule_pool_cache and os.path.exists(args.rule_pool_cache)
+    )
+    if rule_pool_cache_hit:
+        rule_pool, cached_semantics = _load_rule_pool_cache(
+            args.rule_pool_cache,
+            df,
+        )
+        for column in df.columns:
+            metadata[column]["semantics"] = dict(cached_semantics[column])
+        logger.info(f"Loaded column semantics and rule pool from: {args.rule_pool_cache}")
+    else:
+        column_semantics = factory.infer_column_semantics(metadata)
+        for column, semantics in column_semantics.items():
+            metadata[column]["semantics"] = asdict(semantics)
+        rule_pool = _build_clean_rule_pool(df, metadata, factory)
+        if args.rule_pool_cache:
+            _save_rule_pool_cache(
+                args.rule_pool_cache,
+                df,
+                metadata,
+                rule_pool,
+            )
+            logger.info(f"Saved column semantics and rule pool to: {args.rule_pool_cache}")
+
+    for column in df.columns:
+        semantics = metadata[column]["semantics"]
         logger.info(
-            f"  - Column semantics '{column}': archetype={semantics.archetype}, "
-            f"confidence={semantics.confidence:.3f}, "
-            f"open_set={semantics.open_set_score:.3f}, "
-            f"structure={semantics.structure_strength:.3f}, "
-            f"canonicalization_need={semantics.canonicalization_need:.3f}, "
-            f"mechanisms={semantics.possible_error_mechanisms}"
+            f"  - Column semantics '{column}': archetype={semantics.get('archetype')}, "
+            f"confidence={float(semantics.get('confidence', 0.0)):.3f}, "
+            f"open_set={float(semantics.get('open_set_score', 0.0)):.3f}, "
+            f"structure={float(semantics.get('structure_strength', 0.0)):.3f}, "
+            f"canonicalization_need={float(semantics.get('canonicalization_need', 0.0)):.3f}, "
+            f"mechanisms={semantics.get('possible_error_mechanisms', [])}"
         )
 
-    rule_pool = _build_clean_rule_pool(df, metadata, factory)
-
     total_rules = sum(len(rules) for rules in rule_pool.values())
-    logger.info("Rule pool built successfully:")
+    logger.info(
+        "Rule pool loaded successfully:"
+        if rule_pool_cache_hit else
+        "Rule pool built successfully:"
+    )
     logger.info(f"  - Total columns with rules: {len(rule_pool)}")
     logger.info(f"  - Total rules: {total_rules}")
 
@@ -2571,14 +2797,149 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         logger.info("Active learning oracle unavailable: clean_csv not found")
 
     selected_cell_keys: List[str] = []
+    active_labels: Dict[str, int] = {}
+    queried_cells: List[Dict[str, object]] = []
+    query_rounds: List[List[str]] = []
+    labels_resolved_during_selection = False
     if clean_df_for_oracle is not None and args.active_label_budget > 0:
-        selected_cell_keys = select_active_queries(evidence_matrix, args.active_label_budget)
-    active_labels, queried_cells = _query_active_oracle_labels(
-        df,
-        clean_df_for_oracle,
-        cell_registry,
-        selected_cell_keys,
-    )
+        active_query_cache_hit = bool(
+            args.active_query_cache and os.path.exists(args.active_query_cache)
+        )
+        if active_query_cache_hit:
+            selected_cell_keys = _load_active_query_cache(
+                args.active_query_cache,
+                df,
+                args.active_label_budget,
+                set(evidence_matrix.cell_keys),
+                args.active_query_strategy,
+                args.active_query_rounds,
+                args.active_query_batch_size,
+            )
+            logger.info(f"Loaded active queries from: {args.active_query_cache}")
+        elif args.active_query_strategy == "d_optimal":
+            selected_cell_keys = select_active_queries(
+                evidence_matrix,
+                args.active_label_budget,
+            )
+            query_rounds = [list(selected_cell_keys)] if selected_cell_keys else []
+        else:
+            archetype_risk = {
+                "closed_enum": 1.00,
+                "unit_measure": 0.95,
+                "numeric_measure": 0.85,
+                "geo_name": 0.85,
+                "identifier": 0.75,
+                "open_entity": 0.70,
+                "free_text": 0.55,
+            }
+            column_risk: Dict[str, float] = {}
+            for column in df.columns:
+                semantics = metadata.get(column, {}).get("semantics") or {}
+                archetype = str(semantics.get("archetype") or "unknown")
+                canonicalization_need = float(
+                    semantics.get("canonicalization_need", 0.5)
+                )
+                column_risk[column] = float(np.clip(
+                    0.6 * archetype_risk.get(archetype, 0.60)
+                    + 0.4 * canonicalization_need,
+                    0.0,
+                    1.0,
+                ))
+
+            cell_columns = {
+                cell_key: record.column
+                for cell_key, record in cell_registry.items()
+            }
+            current_probabilities: Dict[str, float] = {}
+            remaining_budget = max(0, int(args.active_label_budget))
+            max_rounds = max(1, int(args.active_query_rounds))
+            batch_size = max(1, int(args.active_query_batch_size))
+
+            for round_index in range(max_rounds):
+                if remaining_budget <= 0:
+                    break
+                round_budget = min(batch_size, remaining_budget)
+                batch_keys = select_adaptive_stratified_queries(
+                    evidence_matrix,
+                    cell_columns,
+                    round_budget,
+                    already_selected=selected_cell_keys,
+                    current_probabilities=current_probabilities,
+                    column_risk=column_risk,
+                )
+                if not batch_keys:
+                    logger.info(
+                        f"Adaptive query round {round_index + 1}: no informative candidates"
+                    )
+                    break
+
+                batch_labels, batch_cells = _query_active_oracle_labels(
+                    df,
+                    clean_df_for_oracle,
+                    cell_registry,
+                    batch_keys,
+                )
+                selected_cell_keys.extend(batch_keys)
+                active_labels.update(batch_labels)
+                queried_cells.extend(batch_cells)
+                query_rounds.append(list(batch_keys))
+                remaining_budget -= len(batch_keys)
+                labels_resolved_during_selection = True
+
+                _, interim_posteriors, interim_trace = estimate_calibrated_posteriors(
+                    value_registry,
+                    cell_registry,
+                    evidence_matrix,
+                    selected_cell_keys,
+                    active_labels,
+                    args.em_prior_dirty,
+                    queried_cells=queried_cells,
+                )
+                current_probabilities = {
+                    key: bundle["posterior"]
+                    for key, bundle in interim_posteriors.items()
+                }
+                round_label_counts = Counter(batch_labels.values())
+                round_columns = Counter(
+                    cell_registry[key].column
+                    for key in batch_keys
+                    if key in cell_registry
+                )
+                logger.info(
+                    f"Adaptive query round {round_index + 1}/{max_rounds}: "
+                    f"selected={len(batch_keys)}, cumulative={len(selected_cell_keys)}, "
+                    f"dirty={round_label_counts.get(1, 0)}, "
+                    f"clean={round_label_counts.get(0, 0)}, "
+                    f"fit={interim_trace.reason}, columns={dict(round_columns)}"
+                )
+
+            if remaining_budget > 0:
+                logger.info(
+                    f"Adaptive query budget unused: {remaining_budget}; "
+                    "increase --active_query_rounds or --active_query_batch_size "
+                    "to consume the full budget"
+                )
+
+        if args.active_query_cache and not active_query_cache_hit:
+            _save_active_query_cache(
+                args.active_query_cache,
+                df,
+                args.active_label_budget,
+                selected_cell_keys,
+                args.active_query_strategy,
+                args.active_query_rounds,
+                args.active_query_batch_size,
+                query_rounds=query_rounds,
+            )
+            logger.info(f"Saved active queries to: {args.active_query_cache}")
+
+    if not labels_resolved_during_selection:
+        active_labels, queried_cells = _query_active_oracle_labels(
+            df,
+            clean_df_for_oracle,
+            cell_registry,
+            selected_cell_keys,
+        )
     value_priors, cell_posteriors, calibration_trace = estimate_calibrated_posteriors(
         value_registry,
         cell_registry,
