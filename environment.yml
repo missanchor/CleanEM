@@ -318,4 +318,3 @@ dependencies:
     - xlrd==2.0.1
     - xxhash==3.5.0
     - yarl==1.18.3
-prefix: /mnt/data/welkinni/table_det/.conda/envs/cleaningllm

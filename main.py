@@ -95,12 +95,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dirty_csv",
-        default="data/hospital_error-01.csv",
+        default="data/beers_error-01.csv",
         help="Path to the dirty/error-prone CSV that needs inspection."
     )
     parser.add_argument(
         "--clean_csv",
-        default="data/hospital_clean.csv",
+        default="data/beers_clean.csv",
         help="Optional clean CSV for evaluation against ground truth."
     )
     parser.add_argument(
