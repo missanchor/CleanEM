@@ -4,15 +4,17 @@ Command-line entry point for the agentic error detector.
 Supports a dual verification pipeline with clean rule-level refinement.
 """
 import argparse
+import ast
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, List, Any, Tuple, Optional, Set
 from datetime import datetime
 
 import numpy as np
@@ -25,11 +27,24 @@ from validator import DisjointnessValidator
 from core.utils import safe_dict
 from cleanem_inference import (
     build_cell_evidence_matrix,
+    compute_leave_one_evidence_out_contributions,
     estimate_calibrated_posteriors,
-    select_adaptive_stratified_queries,
     select_active_queries,
 )
-from cleanem_models import CellRecord, EvidenceObservation, HardEvidenceLabel, ValueRecord
+from cleanem_models import (
+    CellRecord,
+    EvidenceContribution,
+    EvidenceObservation,
+    ExplanationTrace,
+    HardEvidenceLabel,
+    RepairCandidate,
+    ValueRecord,
+)
+from canonicalization import (
+    PlanDrivenCanonicalizationAgent,
+    build_canonicalization_profiles,
+    flatten_repair_candidates,
+)
 
 
 # CleanEM Logger
@@ -61,6 +76,13 @@ ARCHETYPE_EVIDENCE_GATES = {
         "rarity_high": 0.50,
         "prototype_far": 0.20,
         "pattern_mismatch": 0.80,
+    },
+    # Temporal values rely on their format/range/order evidence. Preserve the
+    # generic sources until dedicated temporal evidence sources are available.
+    "temporal_measure": {
+        "rarity_high": 1.00,
+        "prototype_far": 1.00,
+        "pattern_mismatch": 1.00,
     },
     "geo_name": {
         "rarity_high": 0.10,
@@ -244,29 +266,61 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--active_query_strategy",
-        choices=["adaptive_stratified", "d_optimal"],
-        default="adaptive_stratified",
-        help=(
-            "Active-query selection strategy. adaptive_stratified performs "
-            "column-covered query/refit rounds; d_optimal preserves the legacy selector."
-        )
+        choices=["d_optimal"],
+        default="d_optimal",
+        help="Active-query selection strategy (D-optimal evidence diversity)."
     )
     parser.add_argument(
         "--active_query_rounds",
         type=int,
         default=3,
-        help="Maximum query/refit rounds for adaptive_stratified selection."
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--active_query_batch_size",
         type=int,
         default=10,
-        help="Maximum new oracle labels requested per adaptive-query round."
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--disable_evidence_gating",
         action="store_true",
         help="Disable archetype-conditioned evidence scaling for ablation runs."
+    )
+    parser.add_argument(
+        "--evidence_gating_mode",
+        choices=["hard", "soft", "weak_prior"],
+        default="hard",
+        help=(
+            "Evidence gate policy: hard threshold, legacy label-supported soft "
+            "gate, or an always-on weak archetype prior updated by labels."
+        )
+    )
+    parser.add_argument(
+        "--hard_gate_min_clean_support",
+        type=int,
+        default=1,
+        help="Distinct clean counterexamples required to activate a hard gate."
+    )
+    parser.add_argument(
+        "--gate_prior_strength",
+        type=float,
+        default=0.25,
+        help="Weak-prior trust multiplier in [0, 1] (default: 0.25)."
+    )
+    parser.add_argument(
+        "--gate_prior_pseudocount",
+        type=float,
+        default=2.0,
+        help="Pseudo-count assigned to the archetype gate prior (default: 2)."
+    )
+    parser.add_argument(
+        "--disable_canonicalization_evidence",
+        action="store_true",
+        help=(
+            "Generate repair candidates for audit output but exclude their "
+            "canonicalization evidence from calibrated inference."
+        )
     )
     parser.add_argument(
         "--rule_pool_cache",
@@ -284,6 +338,14 @@ def parse_args() -> argparse.Namespace:
             "Load it when present; otherwise select and save it."
         )
     )
+    parser.add_argument(
+        "--canonicalization_plan_cache",
+        default=None,
+        help=(
+            "Optional JSON cache for LLM-generated column canonicalization plans. "
+            "Load it when present; otherwise generate, validate, and save it."
+        )
+    )
     return parser.parse_args()
 
 
@@ -297,6 +359,129 @@ def _invoke_rule(rule_func, value, row) -> bool:
             return False
     except Exception:
         return False
+
+
+def _representative_rule_validation_indices(
+    df: pd.DataFrame,
+    column: str,
+    max_rows: int = 2048,
+) -> List[Any]:
+    """Select deterministic common and distinct values for rule smoke tests."""
+    non_null = df[column].dropna()
+    if non_null.empty:
+        return []
+
+    def evenly_spaced(indices: List[Any], limit: int) -> List[Any]:
+        if len(indices) <= limit:
+            return indices
+        positions = np.linspace(0, len(indices) - 1, num=limit, dtype=int)
+        return [indices[int(position)] for position in positions]
+
+    half = max(1, int(max_rows) // 2)
+    row_indices = evenly_spaced(list(non_null.index), half)
+    distinct_indices = evenly_spaced(
+        list(non_null.astype(str).drop_duplicates().index),
+        half,
+    )
+    return list(dict.fromkeys(row_indices + distinct_indices))
+
+
+def _validate_rule_candidate(
+    df: pd.DataFrame,
+    column: str,
+    family: str,
+    rule_str: str,
+) -> Tuple[Optional[Any], Dict[str, Any]]:
+    """Compile and smoke-test an LLM rule before it enters the rule pool."""
+    report: Dict[str, Any] = {
+        "accepted": False,
+        "reason": "unknown",
+        "tested": 0,
+        "pass_rate": None,
+    }
+    try:
+        tree = ast.parse(rule_str, mode="eval")
+    except SyntaxError as exc:
+        report["reason"] = f"syntax_error:{exc.msg}"
+        return None, report
+
+    if any(
+        isinstance(node, ast.Constant) and node.value is Ellipsis
+        for node in ast.walk(tree)
+    ):
+        report["reason"] = "placeholder_ellipsis"
+        return None, report
+
+    try:
+        rule_func = eval(compile(tree, "<generated_clean_rule>", "eval"), safe_dict)
+    except Exception as exc:
+        report["reason"] = f"compile_error:{type(exc).__name__}"
+        return None, report
+    if not callable(rule_func):
+        report["reason"] = "not_callable"
+        return None, report
+
+    indices = _representative_rule_validation_indices(df, column)
+    if not indices:
+        if family == "missing":
+            report.update({"accepted": True, "reason": "empty_column_missing_rule"})
+            return rule_func, report
+        report["reason"] = "no_non_null_samples"
+        return None, report
+
+    outcomes: List[bool] = []
+    for row_index in indices:
+        row = df.loc[row_index]
+        value = row[column]
+        try:
+            outcome = bool(rule_func(value, row))
+        except TypeError:
+            try:
+                outcome = bool(rule_func(value))
+            except Exception as exc:
+                report.update({
+                    "reason": f"runtime_error:{type(exc).__name__}",
+                    "tested": len(outcomes),
+                })
+                return None, report
+        except Exception as exc:
+            report.update({
+                "reason": f"runtime_error:{type(exc).__name__}",
+                "tested": len(outcomes),
+            })
+            return None, report
+        outcomes.append(outcome)
+
+    pass_rate = float(np.mean(outcomes))
+    report.update({"tested": len(outcomes), "pass_rate": pass_rate})
+    if family != "missing":
+        if all(outcomes) or not any(outcomes):
+            report["reason"] = "degenerate_constant_result"
+            return None, report
+        if 1.0 - pass_rate >= 0.95:
+            report["reason"] = "excessive_violation_rate"
+            return None, report
+
+    report.update({"accepted": True, "reason": "validated"})
+    return rule_func, report
+
+
+def _log_rule_rejection(
+    column: str,
+    rule_name: str,
+    rule_str: str,
+    report: Dict[str, Any],
+) -> None:
+    cleanem_logger.warning(
+        "Rejected clean rule: column=%s, rule=%s, reason=%s, tested=%s, "
+        "pass_rate=%s, expression=%s",
+        column,
+        rule_name,
+        report.get("reason"),
+        report.get("tested"),
+        report.get("pass_rate"),
+        rule_str,
+    )
 
 
 def _build_clean_rule_pool(
@@ -318,15 +503,21 @@ def _build_clean_rule_pool(
             family = family_map.get(agent_name)
             if not family:
                 continue
-            try:
-                rule_func = eval(rule_str, safe_dict)
-            except Exception:
+            rule_name = f"{agent_name}_{idx}"
+            rule_func, validation = _validate_rule_candidate(
+                df,
+                column,
+                family,
+                rule_str,
+            )
+            if rule_func is None:
+                _log_rule_rejection(column, rule_name, rule_str, validation)
                 continue
             col_pool.append(
                 {
                     "agent": agent_name,
                     "family": family,
-                    "rule_name": f"{agent_name}_{idx}",
+                    "rule_name": rule_name,
                     "rule_str": rule_str,
                     "rule_func": rule_func,
                 }
@@ -411,22 +602,62 @@ def _load_rule_pool_cache(
             rule_str = str(item.get("rule_str") or "").strip()
             if not rule_str:
                 raise ValueError(f"Cached rule has no rule_str for column {column}")
-            try:
-                rule_func = eval(rule_str, safe_dict)
-            except Exception as exc:
-                raise ValueError(
-                    f"Could not compile cached rule for column {column}: {rule_str}"
-                ) from exc
+            family = str(item.get("family") or "")
+            rule_name = str(item.get("rule_name") or "cached_rule")
+            rule_func, validation = _validate_rule_candidate(
+                df,
+                column,
+                family,
+                rule_str,
+            )
+            if rule_func is None:
+                _log_rule_rejection(column, rule_name, rule_str, validation)
+                continue
             compiled_rules.append({
                 "agent": item.get("agent"),
-                "family": item.get("family"),
-                "rule_name": item.get("rule_name"),
+                "family": family,
+                "rule_name": rule_name,
                 "rule_str": rule_str,
                 "rule_func": rule_func,
             })
         if compiled_rules:
             pool[column] = compiled_rules
     return pool, cached_semantics
+
+
+def _save_canonicalization_plan_cache(
+    path: str,
+    df: pd.DataFrame,
+    plans: Dict[str, Dict[str, Any]],
+) -> None:
+    _write_json_atomic(path, {
+        "version": 1,
+        "dataframe_fingerprint": _dataframe_fingerprint(df),
+        "columns": list(df.columns),
+        "plans": plans,
+    })
+
+
+def _load_canonicalization_plan_cache(
+    path: str,
+    df: pd.DataFrame,
+) -> Dict[str, Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("version") != 1:
+        raise ValueError(
+            f"Unsupported canonicalization-plan cache version: {payload.get('version')}"
+        )
+    if payload.get("columns") != list(df.columns):
+        raise ValueError("Canonicalization-plan cache columns do not match the dataset")
+    if payload.get("dataframe_fingerprint") != _dataframe_fingerprint(df):
+        raise ValueError("Canonicalization-plan cache fingerprint does not match the dataset")
+    plans = payload.get("plans") or {}
+    if any(column not in plans for column in df.columns):
+        raise ValueError("Canonicalization-plan cache is missing one or more columns")
+    if any(not isinstance(plans[column], dict) for column in df.columns):
+        raise ValueError("Canonicalization-plan cache contains an invalid plan")
+    return {column: dict(plans[column]) for column in df.columns}
 
 
 def _save_active_query_cache(
@@ -440,7 +671,7 @@ def _save_active_query_cache(
     query_rounds: Optional[List[List[str]]] = None,
 ) -> None:
     _write_json_atomic(path, {
-        "version": 2,
+        "version": 4,
         "dataframe_fingerprint": _dataframe_fingerprint(df),
         "budget": int(budget),
         "strategy": str(strategy),
@@ -462,7 +693,7 @@ def _load_active_query_cache(
 ) -> List[str]:
     with open(path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
-    if payload.get("version") != 2:
+    if payload.get("version") != 4:
         raise ValueError(
             "Unsupported active-query cache version: "
             f"{payload.get('version')}; delete this cache and regenerate it"
@@ -1635,6 +1866,11 @@ def _gate_observation(
     observation: EvidenceObservation,
     column: str,
     metadata: Dict[str, Dict[str, Any]],
+    supported_policies: Optional[Set[Tuple[str, str]]] = None,
+    policy_support: Optional[Dict[Tuple[str, str], Dict[str, int]]] = None,
+    gating_mode: str = "hard",
+    gate_prior_strength: float = 0.25,
+    gate_prior_pseudocount: float = 2.0,
 ) -> Tuple[EvidenceObservation, str]:
     """Apply a fixed semantic gate while retaining full audit provenance."""
     observation.metadata = dict(observation.metadata or {})
@@ -1650,18 +1886,80 @@ def _gate_observation(
         outcome = "hard_preserved"
     else:
         policy = ARCHETYPE_EVIDENCE_GATES.get(archetype, {})
-        scale = float(policy.get(observation.source_id, 1.0))
-        gate_reason = (
-            "archetype_policy"
-            if observation.source_id in policy
-            else "source_default"
-        )
-        if scale <= 0.0:
-            outcome = "disabled"
-        elif scale < 1.0:
-            outcome = "attenuated"
+        policy_key = (archetype, observation.source_id)
+        policy_requested = observation.source_id in policy
+        if policy_requested and gating_mode == "weak_prior":
+            support = (policy_support or {}).get(policy_key, {})
+            clean_count = max(0, int(support.get("clean", 0)))
+            dirty_count = max(0, int(support.get("dirty", 0)))
+            semantics = metadata.get(column, {}).get("semantics") or {}
+            semantics_confidence = float(np.clip(
+                semantics.get("confidence", 0.0) if isinstance(semantics, dict)
+                else getattr(semantics, "confidence", 0.0),
+                0.0,
+                1.0,
+            ))
+            prior_strength = float(np.clip(gate_prior_strength, 0.0, 1.0))
+            prior_count = max(0.0, float(gate_prior_pseudocount))
+            prior_trust = prior_strength * semantics_confidence
+            denominator = prior_count + clean_count + dirty_count
+            if denominator > 0.0:
+                posterior_trust = (
+                    prior_count * prior_trust + clean_count
+                ) / denominator
+            else:
+                posterior_trust = prior_trust
+            target_scale = float(policy[observation.source_id])
+            scale = 1.0 - posterior_trust * (1.0 - target_scale)
+            gate_reason = "weak_archetype_prior_with_label_update"
+            outcome = "attenuated" if scale < 1.0 else "unchanged"
+            observation.metadata.update({
+                "gate_clean_support": clean_count,
+                "gate_dirty_support": dirty_count,
+                "gate_prior_trust": prior_trust,
+                "gate_posterior_trust": posterior_trust,
+                "gate_target_scale": target_scale,
+            })
+        elif policy_requested and gating_mode == "soft":
+            support = (policy_support or {}).get(policy_key, {})
+            clean_count = max(0, int(support.get("clean", 0)))
+            dirty_count = max(0, int(support.get("dirty", 0)))
+            semantics = metadata.get(column, {}).get("semantics") or {}
+            semantics_confidence = float(np.clip(
+                semantics.get("confidence", 0.0) if isinstance(semantics, dict)
+                else getattr(semantics, "confidence", 0.0),
+                0.0,
+                1.0,
+            ))
+            if clean_count <= 0:
+                scale = 1.0
+                gate_reason = "no_clean_label_support"
+                outcome = "support_fallback"
+            else:
+                trust = semantics_confidence * clean_count / (
+                    clean_count + dirty_count + 1.0
+                )
+                target_scale = float(policy[observation.source_id])
+                scale = 1.0 - trust * (1.0 - target_scale)
+                gate_reason = "label_supported_soft_policy"
+                outcome = "attenuated" if scale < 1.0 else "unchanged"
         else:
-            outcome = "unchanged"
+            policy_supported = (
+                supported_policies is None or policy_key in supported_policies
+            )
+            if policy_requested and not policy_supported:
+                scale = 1.0
+                gate_reason = "insufficient_clean_label_support"
+                outcome = "support_fallback"
+            else:
+                scale = float(policy.get(observation.source_id, 1.0))
+                gate_reason = "archetype_policy" if policy_requested else "source_default"
+                if scale <= 0.0:
+                    outcome = "disabled"
+                elif scale < 1.0:
+                    outcome = "attenuated"
+                else:
+                    outcome = "unchanged"
 
     observation.metadata.update({
         "gate_applied": True,
@@ -1680,6 +1978,11 @@ def _apply_evidence_gates(
     metadata: Dict[str, Dict[str, Any]],
     value_registry: Dict[str, ValueRecord],
     cell_registry: Dict[str, CellRecord],
+    supported_policies: Optional[Set[Tuple[str, str]]] = None,
+    policy_support: Optional[Dict[Tuple[str, str], Dict[str, int]]] = None,
+    gating_mode: str = "hard",
+    gate_prior_strength: float = 0.25,
+    gate_prior_pseudocount: float = 2.0,
 ) -> Dict[str, Any]:
     summary = Counter()
     policy_hits = Counter()
@@ -1690,7 +1993,16 @@ def _apply_evidence_gates(
             continue
         archetype = _column_archetype(metadata.get(record.column, {}))
         for observation in observations:
-            _, outcome = _gate_observation(observation, record.column, metadata)
+            _, outcome = _gate_observation(
+                observation,
+                record.column,
+                metadata,
+                supported_policies=supported_policies,
+                policy_support=policy_support,
+                gating_mode=gating_mode,
+                gate_prior_strength=gate_prior_strength,
+                gate_prior_pseudocount=gate_prior_pseudocount,
+            )
             summary[outcome] += 1
             scale = float(observation.metadata.get("gate_scale", 1.0))
             if scale < 1.0:
@@ -1702,7 +2014,16 @@ def _apply_evidence_gates(
             continue
         archetype = _column_archetype(metadata.get(record.column, {}))
         for observation in observations:
-            _, outcome = _gate_observation(observation, record.column, metadata)
+            _, outcome = _gate_observation(
+                observation,
+                record.column,
+                metadata,
+                supported_policies=supported_policies,
+                policy_support=policy_support,
+                gating_mode=gating_mode,
+                gate_prior_strength=gate_prior_strength,
+                gate_prior_pseudocount=gate_prior_pseudocount,
+            )
             summary[outcome] += 1
             scale = float(observation.metadata.get("gate_scale", 1.0))
             if scale < 1.0:
@@ -1720,6 +2041,61 @@ def _apply_evidence_gates(
             for (archetype, source_id, scale), count in sorted(policy_hits.items())
         ],
     }
+
+
+def _label_supported_gating_policies(
+    selected_cell_keys: List[str],
+    active_labels: Dict[str, int],
+    metadata: Dict[str, Dict[str, Any]],
+    value_observations: Dict[str, List[EvidenceObservation]],
+    cell_observations: Dict[str, List[EvidenceObservation]],
+    cell_registry: Dict[str, CellRecord],
+    min_distinct_clean_values: int = 2,
+) -> Tuple[Set[Tuple[str, str]], Dict[Tuple[str, str], Dict[str, int]]]:
+    """Enable attenuation only after observing clean counterexamples.
+
+    A fixed gate is intended to suppress a dirty-polarity source that fires on
+    legitimate values. Requiring distinct clean queried values prevents a pair
+    of repeated missing cells from authorizing broad changes to an archetype.
+    """
+    clean_support: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    dirty_support: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    for cell_key in selected_cell_keys:
+        if cell_key not in active_labels:
+            continue
+        label = int(active_labels[cell_key])
+        record = cell_registry.get(cell_key)
+        if record is None:
+            continue
+        archetype = _column_archetype(metadata.get(record.column, {}))
+        policy = ARCHETYPE_EVIDENCE_GATES.get(archetype, {})
+        if not policy:
+            continue
+        observations = list(cell_observations.get(cell_key, []))
+        observations.extend(value_observations.get(record.value_key, []))
+        for observation in observations:
+            if (
+                observation.polarity == "dirty"
+                and observation.source_id in policy
+                and float(policy[observation.source_id]) < 1.0
+            ):
+                target = clean_support if label == 0 else dirty_support
+                target[(archetype, observation.source_id)].add(record.value_key)
+
+    keys = set(clean_support) | set(dirty_support)
+    support_counts = {
+        key: {
+            "clean": len(clean_support.get(key, set())),
+            "dirty": len(dirty_support.get(key, set())),
+        }
+        for key in keys
+    }
+    supported = {
+        key
+        for key, counts in support_counts.items()
+        if counts["clean"] >= max(1, int(min_distinct_clean_values))
+    }
+    return supported, support_counts
 
 
 def _matches_regex_candidates(value: Any, regex_candidates: List[Dict[str, Any]]) -> bool:
@@ -2030,13 +2406,48 @@ def _build_cell_registry(
     return registry
 
 
+def _add_canonicalization_evidence(
+    repair_candidates: Dict[str, List[RepairCandidate]],
+    cell_observations: Dict[str, List[EvidenceObservation]],
+) -> None:
+    """Translate auditable repair candidates into calibratable dirty evidence."""
+    for cell_key, candidates in repair_candidates.items():
+        for candidate in candidates:
+            detection_strength = float(np.clip(
+                candidate.detection_confidence * (1.0 - 0.10 * candidate.ambiguity),
+                0.0,
+                1.0,
+            ))
+            candidate_metadata = {
+                "candidate_value": candidate.candidate_value,
+                "repairability": candidate.repairability,
+                "ambiguity": candidate.ambiguity,
+                "changed_fields": candidate.changed_fields,
+                "supporting_evidence": candidate.supporting_evidence,
+            }
+            _record_observation(cell_observations, EvidenceObservation(
+                target_scope="cell",
+                target_key=cell_key,
+                source_id=candidate.mechanism,
+                family="canonicalization",
+                polarity="dirty",
+                strength=detection_strength,
+                hard=False,
+                reason_code=f"canonicalization_{candidate.mechanism}",
+                metadata=candidate_metadata,
+            ))
+
+
 def _extract_evidence(
     df: pd.DataFrame,
     metadata: Dict[str, Dict[str, Any]],
     rule_pool: Dict[str, List[Dict[str, Any]]],
     value_registry: Dict[str, ValueRecord],
     cell_registry: Dict[str, CellRecord],
+    repair_candidates: Optional[Dict[str, List[RepairCandidate]]] = None,
+    enable_canonicalization_evidence: bool = True,
     enable_evidence_gating: bool = True,
+    defer_evidence_gating: bool = False,
 ) -> Tuple[Dict[str, List[EvidenceObservation]], Dict[str, List[EvidenceObservation]]]:
     value_observations: Dict[str, List[EvidenceObservation]] = {}
     cell_observations: Dict[str, List[EvidenceObservation]] = {}
@@ -2472,6 +2883,17 @@ def _extract_evidence(
                 reason_code="parser_contract_satisfied",
             ))
 
+    if enable_canonicalization_evidence:
+        if repair_candidates:
+            _add_canonicalization_evidence(repair_candidates, cell_observations)
+        cleanem_logger.info(
+            "canonicalization_evidence: enabled, "
+            f"candidate_cells={len(repair_candidates or {})}, "
+            f"candidates={sum(len(items) for items in (repair_candidates or {}).values())}"
+        )
+    else:
+        cleanem_logger.info("canonicalization_evidence: disabled")
+
     _add_contextual_consensus_evidence(df, metadata, cell_observations)
 
     if enable_evidence_gating:
@@ -2489,6 +2911,8 @@ def _extract_evidence(
                 f"archetype={item['archetype']}, source={item['source_id']}, "
                 f"scale={item['scale']:.2f}, count={item['count']}"
             )
+    elif defer_evidence_gating:
+        cleanem_logger.info("evidence_gating: deferred_until_active_labels")
     else:
         cleanem_logger.info("evidence_gating: disabled")
 
@@ -2611,6 +3035,234 @@ def _evidence_source_coverage(
     return {source_id: len(targets) for source_id, targets in sorted(coverage.items())}
 
 
+EVIDENCE_REASON_TEMPLATES = {
+    "missing": "The value is missing or is a missing-value placeholder",
+    "missing_token": "The value matches a missing-value placeholder",
+    "rarity_high": "The value is rare in this column",
+    "prototype_far": "The value differs substantially from typical values in this column",
+    "prototype_close": "The value is close to typical values in this column",
+    "pattern_mismatch": "The value does not match the dominant format of this column",
+    "pattern_match": "The value matches the dominant format of this column",
+    "regex_pass": "The value satisfies the column's regular-expression constraint",
+    "outlier": "The value deviates from the numeric distribution of this column",
+    "parser_success": "The value can be parsed as the expected column type",
+    "parse_failure": "The value cannot be parsed as the expected column type",
+    "type_conflict": "The value conflicts with the expected column type",
+    "cell_parser_success": "The cell can be parsed as the expected column type",
+    "cell_parse_failure": "The cell cannot be parsed as the expected column type",
+    "cell_type_conflict": "The cell conflicts with the expected column type",
+    "relationship": "The value violates a relation involving this row or related records",
+    "relationship_satisfied": "The value satisfies a discovered cross-column relation",
+    "strong_relationship_violation": "The value violates a high-confidence cross-column relation",
+    "local_consistency_pass": "The value passes the local relational-consistency check",
+    "local_consistency_fail": "The value fails the local relational-consistency check",
+    "contextual_agreement": "The value agrees with the dominant value in a similar context",
+    "contextual_disagreement": "The value disagrees with the dominant value in a similar context",
+    "unit_variant": "The value uses a non-dominant unit or unit expression",
+    "suffix_pollution": "The value contains a suspected contaminating suffix",
+    "percent_decimal_mismatch": "The value is inconsistent with the column's percent/decimal convention",
+    "geo_suffix_pollution": "The geographic name contains a suspected extraneous region suffix",
+    "encoding_artifact": "The value contains a suspected encoding artifact",
+    "token_contamination": "The value contains additional content inconsistent with the column semantics",
+    "case_variant": "The value's letter case differs from the dominant convention",
+    "whitespace_variant": "The value's whitespace differs from the dominant convention",
+    "other_canonicalization": "A high-confidence canonicalization candidate is available for this value",
+}
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert nested trace data to strict RFC-compatible JSON values."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _public_explanation_payload(trace: ExplanationTrace) -> Dict[str, Any]:
+    """Return a user-facing trace without oracle-derived audit fields."""
+    payload = asdict(trace)
+    payload.pop("active_oracle_label", None)
+    # ``confidence`` is retained internally for backward compatibility, but it
+    # is entropy-based decision sharpness rather than epistemic confidence.
+    payload.pop("confidence", None)
+    return _json_safe(payload)
+
+
+def _explanation_reason_text(evidence: EvidenceContribution) -> str:
+    if evidence.source_id in {"contextual_agreement", "contextual_disagreement"}:
+        context_column = str(evidence.metadata.get("context_column") or "").strip()
+        if context_column:
+            relation = (
+                "agrees"
+                if evidence.source_id == "contextual_agreement"
+                else "disagrees"
+            )
+            return (
+                f"The value {relation} with the dominant value in similar "
+                f"contexts defined by column '{context_column}'"
+            )
+    if evidence.source_id in EVIDENCE_REASON_TEMPLATES:
+        return EVIDENCE_REASON_TEMPLATES[evidence.source_id]
+    if evidence.family in EVIDENCE_REASON_TEMPLATES:
+        return EVIDENCE_REASON_TEMPLATES[evidence.family]
+    readable = evidence.reason_code.replace("_", " ").strip()
+    return f"Evidence source '{evidence.source_id}' triggered {readable or evidence.family}"
+
+
+def _format_contribution_reason(evidence: EvidenceContribution) -> str:
+    direction = "increases" if evidence.posterior_contribution >= 0 else "decreases"
+    return (
+        f"{_explanation_reason_text(evidence)}"
+        f" (posterior without this evidence: {evidence.posterior_without:.4f}; "
+        f"contribution to the error posterior: {evidence.posterior_contribution:+.4f}, "
+        f"which {direction} the error likelihood)"
+    )
+
+
+def _generate_template_explanation(trace: ExplanationTrace) -> str:
+    location = (
+        f"Row {trace.row_index + 1} (internal index {trace.row_index}), "
+        f"column '{trace.column}'"
+    )
+    if trace.decision == "suspicious":
+        opening = (
+            f"{location} has an error posterior of {trace.posterior:.4f}, "
+            f"which meets the threshold of {trace.threshold:.4f}; therefore, "
+            f"the cell is classified as suspicious."
+        )
+    else:
+        opening = (
+            f"{location} has an error posterior of {trace.posterior:.4f}, "
+            f"which is below the threshold of {trace.threshold:.4f}; therefore, "
+            f"the cell is not classified as erroneous."
+        )
+
+    parts = [opening]
+    if trace.primary_reason:
+        parts.append(f" Primary evidence: {trace.primary_reason}.")
+    elif not trace.calibration_fitted:
+        parts.append(" No calibrated evidence contribution is available; the result is primarily determined by the base prior.")
+    else:
+        parts.append(" No evidence source has a measurable independent contribution to the posterior.")
+    if trace.supporting_reasons:
+        parts.append(" Additional supporting evidence: " + "; ".join(trace.supporting_reasons) + ".")
+    if trace.counter_evidence:
+        parts.append(" Counter-evidence: " + "; ".join(trace.counter_evidence) + ".")
+    if (
+        trace.repair_recommended
+        and trace.repair_candidate is not None
+        and str(trace.repair_candidate) != ""
+    ):
+        parts.append(
+            f" Recommended repair: '{trace.repair_candidate}' "
+            f"(mechanism: {trace.repair_mechanism or 'canonicalization'}; "
+            f"repairability: {trace.repairability:.3f})."
+        )
+    return "".join(parts)
+
+
+def _build_explanation_traces(
+    metadata: Dict[str, Dict[str, Any]],
+    cell_registry: Dict[str, CellRecord],
+    cell_posteriors: Dict[str, Dict[str, float]],
+    hard_labels: Dict[str, Dict[str, HardEvidenceLabel]],
+    active_labels: Dict[str, int],
+    repair_candidates: Dict[str, List[RepairCandidate]],
+    loeo_contributions: Dict[str, List[EvidenceContribution]],
+    calibration_trace: Any,
+    threshold: float,
+) -> Dict[str, ExplanationTrace]:
+    traces: Dict[str, ExplanationTrace] = {}
+    epsilon = 1e-12
+
+    for cell_key, record in cell_registry.items():
+        posterior_bundle = cell_posteriors.get(
+            cell_key, {"posterior": 0.5, "confidence": 0.0}
+        )
+        posterior = float(posterior_bundle["posterior"])
+        evidence = loeo_contributions.get(cell_key, [])
+        positive = [item for item in evidence if item.posterior_contribution > epsilon]
+        negative = [item for item in evidence if item.posterior_contribution < -epsilon]
+        positive.sort(key=lambda item: item.posterior_contribution, reverse=True)
+        negative.sort(key=lambda item: item.posterior_contribution)
+
+        is_suspicious = posterior >= threshold
+        if is_suspicious:
+            primary = positive[0] if positive else None
+            supporting = positive[1:4] if primary else []
+            counter = negative[:3]
+        else:
+            # For a clean decision, evidence that lowers the dirty posterior is
+            # decision support; dirty-directed evidence is counter-evidence.
+            primary = negative[0] if negative else None
+            supporting = negative[1:4] if primary else []
+            counter = positive[:3]
+        cell_hard_label = hard_labels["cell"].get(cell_key)
+        value_hard_label = hard_labels["value"].get(record.value_key)
+        effective_hard_label = cell_hard_label or value_hard_label
+        repairs = repair_candidates.get(cell_key) or []
+        primary_repair = repairs[0] if repairs else None
+        canonicalization_support = [
+            item
+            for item in positive
+            if item.family == "canonicalization"
+            and (
+                primary_repair is None
+                or item.source_id == primary_repair.mechanism
+            )
+        ]
+        repair_used_in_inference = bool(canonicalization_support)
+        repair_recommended = bool(
+            is_suspicious and primary_repair and repair_used_in_inference
+        )
+        semantics = metadata.get(record.column, {}).get("semantics") or {}
+        archetype = (
+            str(semantics.get("archetype") or "unknown")
+            if isinstance(semantics, dict)
+            else str(getattr(semantics, "archetype", "unknown"))
+        )
+
+        trace = ExplanationTrace(
+            cell_key=cell_key,
+            row_index=int(record.row_index),
+            column=record.column,
+            raw_value=record.raw_value,
+            archetype=archetype,
+            posterior=posterior,
+            confidence=float(posterior_bundle["confidence"]),
+            decision_certainty=float(posterior_bundle["confidence"]),
+            full_logit=float(posterior_bundle.get("logit", 0.0)),
+            threshold=float(threshold),
+            decision="suspicious" if is_suspicious else "not_suspicious",
+            hard_label=effective_hard_label.label if effective_hard_label else "",
+            active_oracle_label=(
+                "dirty" if active_labels.get(cell_key) == 1
+                else "clean" if active_labels.get(cell_key) == 0
+                else ""
+            ),
+            calibration_fitted=bool(calibration_trace.fitted),
+            calibration_reason=str(calibration_trace.reason),
+            primary_reason=_format_contribution_reason(primary) if primary else "",
+            supporting_reasons=[_format_contribution_reason(item) for item in supporting],
+            counter_evidence=[_format_contribution_reason(item) for item in counter],
+            evidence=list(evidence),
+            repair_candidate=primary_repair.candidate_value if primary_repair else None,
+            repair_mechanism=primary_repair.mechanism if primary_repair else "",
+            repairability=primary_repair.repairability if primary_repair else 0.0,
+            repair_used_in_inference=repair_used_in_inference,
+            repair_recommended=repair_recommended,
+        )
+        trace.natural_language_explanation = _generate_template_explanation(trace)
+        traces[cell_key] = trace
+
+    return traces
+
+
 def _export_cleanem_results(
     df: pd.DataFrame,
     value_registry: Dict[str, ValueRecord],
@@ -2620,16 +3272,30 @@ def _export_cleanem_results(
     hard_labels: Dict[str, Dict[str, HardEvidenceLabel]],
     value_observations: Dict[str, List[EvidenceObservation]],
     cell_observations: Dict[str, List[EvidenceObservation]],
+    repair_candidates: Optional[Dict[str, List[RepairCandidate]]] = None,
     active_labels: Optional[Dict[str, int]] = None,
+    explanation_traces: Optional[Dict[str, ExplanationTrace]] = None,
 ) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     active_labels = active_labels or {}
+    repair_candidates = repair_candidates or {}
+    explanation_traces = explanation_traces or {}
     for cell_key, cell_record in cell_registry.items():
         value_record = value_registry[cell_record.value_key]
         prior_bundle = value_priors.get(cell_record.value_key, {"prior": 0.5, "confidence": 0.0})
         posterior_bundle = cell_posteriors.get(cell_key, {"posterior": 0.5, "confidence": 0.0})
         cell_label = hard_labels["cell"].get(cell_key)
         active_label = active_labels.get(cell_key)
+        primary_repair = (
+            repair_candidates.get(cell_key, [None])[0]
+            if repair_candidates.get(cell_key)
+            else None
+        )
+        explanation_trace = explanation_traces.get(cell_key)
+        explanation_payload = (
+            _public_explanation_payload(explanation_trace)
+            if explanation_trace else {}
+        )
 
         results.append({
             "row_index": cell_record.row_index,
@@ -2640,12 +3306,56 @@ def _export_cleanem_results(
             "value_prior_confidence": prior_bundle["confidence"],
             "cell_posterior": posterior_bundle["posterior"],
             "cell_confidence": posterior_bundle["confidence"],
+            "decision_certainty": posterior_bundle["confidence"],
             "hard_label": cell_label.label if cell_label else "",
             "hard_reason_summary": _summarize_hard_label(cell_label),
             "queried_for_calibration": cell_key in active_labels,
             "active_oracle_label": "dirty" if active_label == 1 else "clean" if active_label == 0 else "",
             "value_evidence_summary": _summarize_observations(value_observations.get(cell_record.value_key, [])),
             "cell_evidence_summary": _summarize_observations(cell_observations.get(cell_key, [])),
+            "repair_mechanism": primary_repair.mechanism if primary_repair else "",
+            "repair_candidate": primary_repair.candidate_value if primary_repair else "",
+            "repair_detection_confidence": (
+                primary_repair.detection_confidence if primary_repair else 0.0
+            ),
+            "repairability_score": primary_repair.repairability if primary_repair else 0.0,
+            "repair_ambiguity": primary_repair.ambiguity if primary_repair else 0.0,
+            "repair_used_in_inference": (
+                explanation_trace.repair_used_in_inference
+                if explanation_trace else False
+            ),
+            "repair_recommended": (
+                explanation_trace.repair_recommended
+                if explanation_trace else False
+            ),
+            "repair_changed_fields": (
+                json.dumps(
+                    primary_repair.changed_fields,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+                if primary_repair else ""
+            ),
+            "primary_reason": explanation_trace.primary_reason if explanation_trace else "",
+            "supporting_reasons": (
+                "; ".join(explanation_trace.supporting_reasons)
+                if explanation_trace else ""
+            ),
+            "counter_evidence": (
+                "; ".join(explanation_trace.counter_evidence)
+                if explanation_trace else ""
+            ),
+            "natural_language_explanation": (
+                explanation_trace.natural_language_explanation
+                if explanation_trace else ""
+            ),
+            "explanation_trace": json.dumps(
+                explanation_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
         })
 
     results.sort(key=lambda item: (item["cell_posterior"], item["value_prior"]), reverse=True)
@@ -2671,11 +3381,22 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
     logger.info(f"  - score_threshold (cell_posterior): {args.score_threshold}")
     logger.info(f"  - active_label_budget: {args.active_label_budget}")
     logger.info(f"  - active_query_strategy: {args.active_query_strategy}")
-    logger.info(f"  - active_query_rounds: {args.active_query_rounds}")
-    logger.info(f"  - active_query_batch_size: {args.active_query_batch_size}")
     logger.info(f"  - evidence_gating: {not args.disable_evidence_gating}")
+    logger.info(f"  - evidence_gating_mode: {args.evidence_gating_mode}")
+    logger.info(
+        f"  - hard_gate_min_clean_support: {args.hard_gate_min_clean_support}"
+    )
+    logger.info(f"  - gate_prior_strength: {args.gate_prior_strength}")
+    logger.info(f"  - gate_prior_pseudocount: {args.gate_prior_pseudocount}")
+    logger.info(
+        f"  - canonicalization_evidence: {not args.disable_canonicalization_evidence}"
+    )
     logger.info(f"  - rule_pool_cache: {args.rule_pool_cache or 'disabled'}")
     logger.info(f"  - active_query_cache: {args.active_query_cache or 'disabled'}")
+    logger.info(
+        f"  - canonicalization_plan_cache: "
+        f"{args.canonicalization_plan_cache or 'disabled'}"
+    )
     logger.info(f"  - top_k: {args.top_k}")
 
     profiler = PandasProfiler(args.dirty_csv)
@@ -2770,13 +3491,78 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
     logger.info(f"Value registry size: {len(value_registry)}")
     logger.info(f"Cell registry size: {len(cell_registry)}")
 
+    canonicalization_profiles = build_canonicalization_profiles(df, metadata)
+    plan_cache_hit = bool(
+        args.canonicalization_plan_cache
+        and os.path.exists(args.canonicalization_plan_cache)
+    )
+    if plan_cache_hit:
+        canonicalization_plans = _load_canonicalization_plan_cache(
+            args.canonicalization_plan_cache,
+            df,
+        )
+        logger.info(
+            "Loaded canonicalization plans from: "
+            f"{args.canonicalization_plan_cache}"
+        )
+    else:
+        canonicalization_plans = factory.infer_canonicalization_plans(
+            canonicalization_profiles
+        )
+        if args.canonicalization_plan_cache:
+            _save_canonicalization_plan_cache(
+                args.canonicalization_plan_cache,
+                df,
+                canonicalization_plans,
+            )
+            logger.info(
+                "Saved canonicalization plans to: "
+                f"{args.canonicalization_plan_cache}"
+            )
+
+    repair_agent = PlanDrivenCanonicalizationAgent(
+        df,
+        metadata,
+        cell_registry,
+        canonicalization_plans,
+    )
+    plan_diagnostics = repair_agent.validate_plans()
+    for column in df.columns:
+        plan = canonicalization_plans.get(column) or {}
+        diagnostics = plan_diagnostics.get(column) or []
+        accepted = [item for item in diagnostics if item.get("accepted")]
+        rejected = [item for item in diagnostics if not item.get("accepted")]
+        logger.info(
+            f"  - Canonicalization plan '{column}': "
+            f"applicable={bool(plan.get('applicable'))}, "
+            f"confidence={float(plan.get('confidence') or 0.0):.3f}, "
+            f"proposed={len(plan.get('operations') or [])}, "
+            f"accepted={len(accepted)}, rejected={len(rejected)}, "
+            f"rejection_reasons={[item.get('reason') for item in rejected]}"
+        )
+    repair_candidates = repair_agent.generate()
+    repair_mechanism_counts = Counter(
+        candidate.mechanism
+        for candidates in repair_candidates.values()
+        for candidate in candidates
+    )
+    logger.info(
+        "Canonicalization/Repair Agent: "
+        f"candidate_cells={len(repair_candidates)}, "
+        f"candidates={sum(len(items) for items in repair_candidates.values())}, "
+        f"mechanisms={dict(sorted(repair_mechanism_counts.items()))}"
+    )
+
     value_observations, cell_observations = _extract_evidence(
         df,
         metadata,
         rule_pool,
         value_registry,
         cell_registry,
-        enable_evidence_gating=not args.disable_evidence_gating,
+        repair_candidates=repair_candidates,
+        enable_canonicalization_evidence=not args.disable_canonicalization_evidence,
+        enable_evidence_gating=False,
+        defer_evidence_gating=not args.disable_evidence_gating,
     )
     hard_labels = _build_hard_evidence(df, metadata, value_observations, cell_observations)
 
@@ -2816,109 +3602,12 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
                 args.active_query_batch_size,
             )
             logger.info(f"Loaded active queries from: {args.active_query_cache}")
-        elif args.active_query_strategy == "d_optimal":
+        else:
             selected_cell_keys = select_active_queries(
                 evidence_matrix,
                 args.active_label_budget,
             )
             query_rounds = [list(selected_cell_keys)] if selected_cell_keys else []
-        else:
-            archetype_risk = {
-                "closed_enum": 1.00,
-                "unit_measure": 0.95,
-                "numeric_measure": 0.85,
-                "geo_name": 0.85,
-                "identifier": 0.75,
-                "open_entity": 0.70,
-                "free_text": 0.55,
-            }
-            column_risk: Dict[str, float] = {}
-            for column in df.columns:
-                semantics = metadata.get(column, {}).get("semantics") or {}
-                archetype = str(semantics.get("archetype") or "unknown")
-                canonicalization_need = float(
-                    semantics.get("canonicalization_need", 0.5)
-                )
-                column_risk[column] = float(np.clip(
-                    0.6 * archetype_risk.get(archetype, 0.60)
-                    + 0.4 * canonicalization_need,
-                    0.0,
-                    1.0,
-                ))
-
-            cell_columns = {
-                cell_key: record.column
-                for cell_key, record in cell_registry.items()
-            }
-            current_probabilities: Dict[str, float] = {}
-            remaining_budget = max(0, int(args.active_label_budget))
-            max_rounds = max(1, int(args.active_query_rounds))
-            batch_size = max(1, int(args.active_query_batch_size))
-
-            for round_index in range(max_rounds):
-                if remaining_budget <= 0:
-                    break
-                round_budget = min(batch_size, remaining_budget)
-                batch_keys = select_adaptive_stratified_queries(
-                    evidence_matrix,
-                    cell_columns,
-                    round_budget,
-                    already_selected=selected_cell_keys,
-                    current_probabilities=current_probabilities,
-                    column_risk=column_risk,
-                )
-                if not batch_keys:
-                    logger.info(
-                        f"Adaptive query round {round_index + 1}: no informative candidates"
-                    )
-                    break
-
-                batch_labels, batch_cells = _query_active_oracle_labels(
-                    df,
-                    clean_df_for_oracle,
-                    cell_registry,
-                    batch_keys,
-                )
-                selected_cell_keys.extend(batch_keys)
-                active_labels.update(batch_labels)
-                queried_cells.extend(batch_cells)
-                query_rounds.append(list(batch_keys))
-                remaining_budget -= len(batch_keys)
-                labels_resolved_during_selection = True
-
-                _, interim_posteriors, interim_trace = estimate_calibrated_posteriors(
-                    value_registry,
-                    cell_registry,
-                    evidence_matrix,
-                    selected_cell_keys,
-                    active_labels,
-                    args.em_prior_dirty,
-                    queried_cells=queried_cells,
-                )
-                current_probabilities = {
-                    key: bundle["posterior"]
-                    for key, bundle in interim_posteriors.items()
-                }
-                round_label_counts = Counter(batch_labels.values())
-                round_columns = Counter(
-                    cell_registry[key].column
-                    for key in batch_keys
-                    if key in cell_registry
-                )
-                logger.info(
-                    f"Adaptive query round {round_index + 1}/{max_rounds}: "
-                    f"selected={len(batch_keys)}, cumulative={len(selected_cell_keys)}, "
-                    f"dirty={round_label_counts.get(1, 0)}, "
-                    f"clean={round_label_counts.get(0, 0)}, "
-                    f"fit={interim_trace.reason}, columns={dict(round_columns)}"
-                )
-
-            if remaining_budget > 0:
-                logger.info(
-                    f"Adaptive query budget unused: {remaining_budget}; "
-                    "increase --active_query_rounds or --active_query_batch_size "
-                    "to consume the full budget"
-                )
 
         if args.active_query_cache and not active_query_cache_hit:
             _save_active_query_cache(
@@ -2940,6 +3629,68 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
             cell_registry,
             selected_cell_keys,
         )
+
+    fixed_calibration = None
+    if not args.disable_evidence_gating:
+        # Learn globally comparable evidence weights from the raw observations.
+        # Gating is a post-calibration attenuation step: refitting after scaling
+        # one archetype would otherwise change weights for every other column.
+        _, _, fixed_calibration = estimate_calibrated_posteriors(
+            value_registry,
+            cell_registry,
+            evidence_matrix,
+            selected_cell_keys,
+            active_labels,
+            args.em_prior_dirty,
+            queried_cells=queried_cells,
+        )
+        supported_policies, policy_support = _label_supported_gating_policies(
+            selected_cell_keys,
+            active_labels,
+            metadata,
+            value_observations,
+            cell_observations,
+            cell_registry,
+            min_distinct_clean_values=max(1, args.hard_gate_min_clean_support),
+        )
+        logger.info(
+            "label_supported_gating: "
+            f"mode={args.evidence_gating_mode}, "
+            f"prior_strength={args.gate_prior_strength}, "
+            f"prior_pseudocount={args.gate_prior_pseudocount}, "
+            f"supported={sorted(supported_policies)}, "
+            f"support_counts={dict(sorted(policy_support.items()))}"
+        )
+        gating_summary = _apply_evidence_gates(
+            value_observations,
+            cell_observations,
+            metadata,
+            value_registry,
+            cell_registry,
+            supported_policies=supported_policies,
+            policy_support=policy_support,
+            gating_mode=args.evidence_gating_mode,
+            gate_prior_strength=args.gate_prior_strength,
+            gate_prior_pseudocount=args.gate_prior_pseudocount,
+        )
+        logger.info(f"evidence_gating_counts: {gating_summary['counts']}")
+        for item in gating_summary["policy_hits"]:
+            logger.info(
+                "  - Evidence gate: "
+                f"archetype={item['archetype']}, source={item['source_id']}, "
+                f"scale={item['scale']:.2f}, count={item['count']}"
+            )
+        evidence_matrix = build_cell_evidence_matrix(
+            cell_registry,
+            value_observations,
+            cell_observations,
+        )
+        logger.info(
+            "Evidence matrix rebuilt after label-supported gating: "
+            f"cells={len(evidence_matrix.cell_keys)}, "
+            f"features={len(evidence_matrix.feature_names)}"
+        )
+
     value_priors, cell_posteriors, calibration_trace = estimate_calibrated_posteriors(
         value_registry,
         cell_registry,
@@ -2948,6 +3699,31 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         active_labels,
         args.em_prior_dirty,
         queried_cells=queried_cells,
+        fixed_calibration=fixed_calibration,
+    )
+    loeo_contributions = compute_leave_one_evidence_out_contributions(
+        cell_registry,
+        value_observations,
+        cell_observations,
+        cell_posteriors,
+        calibration_trace,
+    )
+    explanation_traces = _build_explanation_traces(
+        metadata,
+        cell_registry,
+        cell_posteriors,
+        hard_labels,
+        active_labels,
+        repair_candidates,
+        loeo_contributions,
+        calibration_trace,
+        args.score_threshold,
+    )
+    logger.info(
+        "Explanation traces built: "
+        f"cells={len(explanation_traces)}, "
+        f"evidence_observations={sum(len(items) for items in loeo_contributions.values())}, "
+        f"nonzero_loeo={sum(1 for items in loeo_contributions.values() for item in items if abs(item.posterior_contribution) > 1e-12)}"
     )
     results = _export_cleanem_results(
         df,
@@ -2958,7 +3734,9 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         hard_labels,
         value_observations,
         cell_observations,
+        repair_candidates=repair_candidates,
         active_labels=active_labels,
+        explanation_traces=explanation_traces,
     )
 
     for value_key, record in value_registry.items():
@@ -3046,6 +3824,60 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
     output_path = os.path.join(args.output_dir, f"{timestamp}_{dataset_name}_clean_em_scores.csv")
     pd.DataFrame(results).to_csv(output_path, index=False, encoding="utf-8")
     logger.info(f"\nSaved all cell scores to: {output_path}")
+
+    explanation_output_path = os.path.join(
+        args.output_dir,
+        f"{timestamp}_{dataset_name}_explanation_traces.jsonl",
+    )
+    with open(explanation_output_path, "w", encoding="utf-8") as explanation_file:
+        for cell_key in cell_registry:
+            trace = explanation_traces[cell_key]
+            explanation_file.write(json.dumps(
+                _public_explanation_payload(trace),
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            ))
+            explanation_file.write("\n")
+    logger.info(
+        f"Saved {len(explanation_traces)} unified explanation traces to: "
+        f"{explanation_output_path}"
+    )
+
+    explanation_audit_path = os.path.join(
+        args.output_dir,
+        f"{timestamp}_{dataset_name}_explanation_audit.jsonl",
+    )
+    with open(explanation_audit_path, "w", encoding="utf-8") as audit_file:
+        for cell_key in cell_registry:
+            trace = explanation_traces[cell_key]
+            if not trace.active_oracle_label:
+                continue
+            audit_file.write(json.dumps(
+                _json_safe(asdict(trace)),
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            ))
+            audit_file.write("\n")
+    logger.info(
+        "Saved active-label explanation audit traces to: "
+        f"{explanation_audit_path}"
+    )
+
+    repair_output_path = os.path.join(
+        args.output_dir,
+        f"{timestamp}_{dataset_name}_repair_candidates.csv",
+    )
+    repair_rows = flatten_repair_candidates(repair_candidates)
+    pd.DataFrame(repair_rows).to_csv(
+        repair_output_path,
+        index=False,
+        encoding="utf-8",
+    )
+    logger.info(
+        f"Saved {len(repair_rows)} repair candidates to: {repair_output_path}"
+    )
 
     if args.clean_csv and os.path.exists(args.clean_csv):
         logger.info("\nEvaluating clean_em scores against ground truth:")

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -70,3 +70,54 @@ class RepairCandidate:
     ambiguity: float = 0.0
     changed_fields: Dict[str, Any] = field(default_factory=dict)
     supporting_evidence: List[str] = field(default_factory=list)
+
+
+@dataclass
+class EvidenceContribution:
+    """One auditable evidence observation and its LOEO posterior effect."""
+
+    target_scope: str
+    source_id: str
+    family: str
+    polarity: str
+    reason_code: str
+    strength: float
+    hard: bool
+    feature_name: str
+    feature_weight: float
+    signed_feature_value: float
+    weighted_logit: float
+    posterior_without: float
+    posterior_contribution: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ExplanationTrace:
+    """Unified, serializable explanation record for one table cell."""
+
+    cell_key: str
+    row_index: int
+    column: str
+    raw_value: Any
+    archetype: str
+    posterior: float
+    confidence: float
+    decision_certainty: float
+    full_logit: float
+    threshold: float
+    decision: str
+    hard_label: str
+    active_oracle_label: str
+    calibration_fitted: bool
+    calibration_reason: str
+    primary_reason: str
+    supporting_reasons: List[str]
+    counter_evidence: List[str]
+    evidence: List[EvidenceContribution]
+    repair_candidate: Optional[Any] = None
+    repair_mechanism: str = ""
+    repairability: float = 0.0
+    repair_used_in_inference: bool = False
+    repair_recommended: bool = False
+    natural_language_explanation: str = ""

@@ -124,6 +124,7 @@ class ColumnArchetypeAgent(BaseAgent):
         "geo_name",
         "numeric_measure",
         "unit_measure",
+        "temporal_measure",
         "free_text",
     }
 
@@ -134,6 +135,12 @@ class ColumnArchetypeAgent(BaseAgent):
         "geo_name": ["missing", "geo_suffix_shift", "value_contamination"],
         "numeric_measure": ["missing", "numeric_outlier", "percent_marker_contamination"],
         "unit_measure": ["missing", "unit_variant", "suffix_pollution"],
+        "temporal_measure": [
+            "missing",
+            "temporal_format_violation",
+            "temporal_range_violation",
+            "temporal_order_violation",
+        ],
         "free_text": ["missing", "encoding_artifact", "token_contamination"],
     }
 
@@ -141,14 +148,16 @@ class ColumnArchetypeAgent(BaseAgent):
         return """You classify a table column by semantic archetype.
 Return exactly one JSON object and no prose.
 Allowed archetypes: closed_enum, identifier, open_entity, geo_name,
-numeric_measure, unit_measure, free_text.
+numeric_measure, unit_measure, temporal_measure, free_text.
 Definitions:
 - closed_enum: a small controlled vocabulary, even when labels are long strings.
-- identifier: IDs, codes, phone/zip values, or structured time-like keys.
+- identifier: IDs, codes, phone numbers, zip values, or other entity keys.
 - open_entity: names of people, organizations, products, or other long-tail entities.
 - geo_name: city, town, province, region, or other geographic names; it may be open-set.
 - numeric_measure: numeric quantities, rates, scores, and averages.
 - unit_measure: values containing both a number and a measurement unit.
+- temporal_measure: dates, years, clock times, timestamps, or durations whose
+  values have temporal format, range, or ordering semantics.
 - free_text: unconstrained natural-language content.
 Scores must be numbers between 0 and 1. The supplied distribution statistics
 are objective facts. Do not reinterpret unique_ratio as semantic confidence."""
@@ -198,12 +207,24 @@ are objective facts. Do not reinterpret unique_ratio as semantic confidence."""
             "phonenumber",
             "flight",
         }
+        temporal_tokens = {
+            "time",
+            "date",
+            "datetime",
+            "timestamp",
+            "year",
+            "duration",
+        }
         if (
+            bool(name_tokens.intersection(temporal_tokens))
+            or snake_name.endswith("_at")
+        ):
+            archetype = "temporal_measure"
+        elif (
             name in identifier_names
             or snake_name in identifier_names
             or name.endswith("_id")
             or name.endswith("identifier")
-            or "time" in name_tokens
         ):
             archetype = "identifier"
         elif name_tokens.intersection({"city", "town", "province", "region"}):
@@ -233,6 +254,7 @@ are objective facts. Do not reinterpret unique_ratio as semantic confidence."""
             "unit_measure": 0.95,
             "geo_name": 0.80,
             "numeric_measure": max(0.45, percent_ratio),
+            "temporal_measure": 0.30,
             "closed_enum": 0.40,
             "identifier": 0.35,
             "open_entity": 0.25,
@@ -297,6 +319,12 @@ are objective facts. Do not reinterpret unique_ratio as semantic confidence."""
             )
             or any(token in snake_name for token in ("ounce", "weight", "unit", "size"))
         )
+        strong_temporal_signal = bool(
+            name_tokens.intersection(
+                {"time", "date", "datetime", "timestamp", "year", "duration"}
+            )
+            or snake_name.endswith("_at")
+        )
         strong_numeric_signal = bool(
             coarse_type == "numeric"
             or name_tokens.intersection({"abv", "amount", "price", "rate", "score", "average", "avg"})
@@ -309,6 +337,7 @@ are objective facts. Do not reinterpret unique_ratio as semantic confidence."""
 
         use_heuristic = (
             strong_name_signal
+            or strong_temporal_signal
             or strong_numeric_signal
             or strong_closed_distribution
             or (
@@ -434,6 +463,7 @@ Return this schema:
                             0.45,
                             self._clip_score(metadata.get("percent_marker_ratio"), 0.0),
                         ),
+                        "temporal_measure": 0.30,
                         "closed_enum": 0.40,
                         "identifier": 0.35,
                         "open_entity": 0.25,
@@ -459,6 +489,183 @@ Return this schema:
                 metadata,
                 fallback_reason=f"heuristic_fallback:{type(exc).__name__}",
             )
+
+
+class CanonicalizationPlanningAgent(BaseAgent):
+    """Plan column-specific canonicalization with a constrained repair DSL."""
+
+    ALLOWED_OPERATIONS = {
+        "regex_replace",
+        "strip_suffix",
+        "split_trailing_token",
+        "truncate_at_marker",
+        "normalize_surface",
+    }
+    ALLOWED_MECHANISMS = {
+        "unit_variant",
+        "suffix_pollution",
+        "percent_decimal_mismatch",
+        "geo_suffix_pollution",
+        "encoding_artifact",
+        "token_contamination",
+        "case_variant",
+        "whitespace_variant",
+        "other_canonicalization",
+    }
+
+    def _get_system_prompt(self) -> str:
+        return """You are a conservative canonicalization planning agent.
+Infer column-specific conventions from the supplied profile; do not assume that
+units, percent signs, suffixes, casing, or punctuation are errors merely because
+they exist. A dominant surface form is presumptively valid. If the profile does
+not establish a safer target convention, abstain.
+
+Return exactly one JSON object and no prose. You may use only these operations:
+- regex_replace: params {pattern, replacement, target_pattern}; pattern is
+  searched within the value and replaced globally
+- strip_suffix: params {suffix, numeric_scale, target_pattern}
+- split_trailing_token: params {reference_column}
+- truncate_at_marker: params {markers, suffix_reference_column}
+- normalize_surface: params {mapping}; mapping keys and values are literal strings
+
+target_pattern may be a full regular expression or one measured surface label:
+numeric_percent_suffix, plain_numeric, numeric_with_suffix, lexical,
+mixed_alphanumeric, other.
+
+Parameter rules:
+- For regex_replace, derive both pattern and replacement from measured minority
+  and dominant tokens in the supplied profile.
+- For strip_suffix, the suffix must be observed and the target_pattern must
+  describe the transformed value, not the original value.
+- For split_trailing_token and truncate_at_marker, name an actually supplied
+  reference column; otherwise do not propose the operation.
+- For normalize_surface, mapping entries must be supported by repeated observed
+  variants and a clearly dominant target token.
+
+Regexes and mappings must describe generic surfaces, never lists of row-specific
+values. Do not emit executable code. Each operation must describe one source
+surface and one target convention. Prefer multiple narrow operations over one
+broad transformation. Scores are in [0,1]."""
+
+    @staticmethod
+    def _clip(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(min(1.0, max(0.0, float(value))))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _abstain(self, column: str, reason: str) -> Dict[str, Any]:
+        return {
+            "column": column,
+            "applicable": False,
+            "canonical_surface": "",
+            "confidence": 0.0,
+            "operations": [],
+            "rationale": [reason],
+            "risky_assumptions": [],
+        }
+
+    def _validate_operation(self, item: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(item, dict):
+            return None
+        operation = str(item.get("operation") or "").strip()
+        mechanism = str(item.get("mechanism") or "").strip()
+        if operation not in self.ALLOWED_OPERATIONS:
+            return None
+        if mechanism not in self.ALLOWED_MECHANISMS:
+            # Mechanism names are descriptive evidence labels, not executable
+            # behavior. Preserve a structurally valid operation under a neutral
+            # label instead of silently discarding it when an upstream agent
+            # uses a synonymous or newly coined mechanism name.
+            mechanism = "other_canonicalization"
+        params = item.get("params") or {}
+        if not isinstance(params, dict):
+            return None
+        # Keep the DSL JSON-only and bounded. The executor performs deeper
+        # operation-specific validation before applying any transformation.
+        try:
+            encoded_params = json.dumps(params, ensure_ascii=False, default=str)
+        except Exception:
+            return None
+        if len(encoded_params) > 4000:
+            return None
+        rationale = item.get("rationale") or []
+        if isinstance(rationale, str):
+            rationale = [rationale]
+        if not isinstance(rationale, list):
+            rationale = []
+        return {
+            "mechanism": mechanism,
+            "operation": operation,
+            "params": params,
+            "confidence": self._clip(item.get("confidence"), 0.0),
+            "repairability": self._clip(item.get("repairability"), 0.0),
+            "rationale": [str(value) for value in rationale if str(value).strip()],
+        }
+
+    def infer(self, column: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+        prompt = f"""Column: {column}
+Archetype: {profile.get('archetype', 'unknown')}
+Observed canonicalization profile (computed only from the dirty table):
+{json.dumps(profile, ensure_ascii=False, default=str)}
+
+Return this schema:
+{{
+  "column": {json.dumps(column)},
+  "applicable": false,
+  "canonical_surface": "description of observed target convention",
+  "confidence": 0.0,
+  "operations": [
+    {{
+      "mechanism": "one allowed mechanism",
+      "operation": "one allowed operation",
+      "params": {{}},
+      "confidence": 0.0,
+      "repairability": 0.0,
+      "rationale": []
+    }}
+  ],
+  "rationale": [],
+  "risky_assumptions": []
+}}
+
+Critical rules:
+1. Never propose changing the dominant observed surface into a minority surface.
+2. Percent signs may be canonical (for example a score) or contaminating (for
+   example a decimal-rate column); decide from the observed surface ratios.
+3. A column classified as unit_measure may still contain no stable unit grammar;
+   abstain unless the profile supports a target convention.
+4. Do not use clean/reference data; it is not supplied.
+5. If uncertain, return applicable=false and operations=[]."""
+        response = self._call_llm(prompt, max_tokens=3072, temperature=0.0)
+        try:
+            payload = ColumnArchetypeAgent._extract_json_object(response)
+        except Exception as exc:
+            return self._abstain(column, f"invalid_planner_response:{type(exc).__name__}")
+
+        operations = []
+        for item in payload.get("operations") or []:
+            validated = self._validate_operation(item)
+            if validated is not None:
+                operations.append(validated)
+        applicable = bool(payload.get("applicable")) and bool(operations)
+        if not applicable:
+            operations = []
+        rationale = payload.get("rationale") or []
+        if isinstance(rationale, str):
+            rationale = [rationale]
+        risky = payload.get("risky_assumptions") or []
+        if isinstance(risky, str):
+            risky = [risky]
+        return {
+            "column": column,
+            "applicable": applicable,
+            "canonical_surface": str(payload.get("canonical_surface") or ""),
+            "confidence": self._clip(payload.get("confidence"), 0.0),
+            "operations": operations,
+            "rationale": [str(value) for value in rationale if str(value).strip()],
+            "risky_assumptions": [str(value) for value in risky if str(value).strip()],
+        }
 
 
 class RuleReviewerAgent(BaseAgent):
@@ -2283,6 +2490,26 @@ class AgentFactory:
             column: agent.infer(column, col_metadata)
             for column, col_metadata in metadata.items()
         }
+
+    def infer_canonicalization_plans(
+        self,
+        profiles: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Generate one conservative, column-specific repair plan per profile."""
+        items = list(profiles.items())
+
+        def infer_one(item: Tuple[str, Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
+            column, profile = item
+            agent = CanonicalizationPlanningAgent(self.base_url, self.model)
+            return column, agent.infer(column, profile)
+
+        if self.max_workers <= 1 or len(items) <= 1:
+            return dict(infer_one(item) for item in items)
+        plans: Dict[str, Dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            for column, plan in executor.map(infer_one, items):
+                plans[column] = plan
+        return plans
 
     def create_agents(self, column: str, column_type: str) -> List[BaseAgent]:
         """Create appropriate agents for a column based on its type."""
