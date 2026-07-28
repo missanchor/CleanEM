@@ -2140,6 +2140,49 @@ def _row_family_pass_ratio(
     return float(np.mean(outputs[row_idx, indices]))
 
 
+def _agent_rule_provenance(
+    rules: List[Dict[str, Any]],
+    outputs: np.ndarray,
+    family: str,
+    row_idx: int,
+) -> Dict[str, Any]:
+    """Return auditable per-rule outcomes without changing evidence features."""
+    if outputs.size == 0 or row_idx < 0 or row_idx >= outputs.shape[0]:
+        return {}
+
+    evaluated_rules: List[Dict[str, Any]] = []
+    failed_rules: List[Dict[str, Any]] = []
+    passed_rule_names: List[str] = []
+    for rule_idx, rule in enumerate(rules):
+        if str(rule.get("family") or "") != family:
+            continue
+        outcome = bool(outputs[row_idx, rule_idx])
+        rule_record = {
+            "rule_name": str(rule.get("rule_name") or f"{family}_{rule_idx}"),
+            "agent": str(rule.get("agent") or ""),
+            "family": family,
+            "rule_str": str(rule.get("rule_str") or ""),
+            "outcome": "pass" if outcome else "fail",
+        }
+        evaluated_rules.append(rule_record)
+        if outcome:
+            passed_rule_names.append(rule_record["rule_name"])
+        else:
+            failed_rules.append(rule_record)
+
+    if not evaluated_rules:
+        return {}
+    return {
+        "rule_pool_source": "agentic_clean_rule_pool",
+        "rule_family": family,
+        "evaluated_rule_count": len(evaluated_rules),
+        "passed_rule_count": len(evaluated_rules) - len(failed_rules),
+        "failed_rule_count": len(failed_rules),
+        "failed_rules": failed_rules,
+        "passed_rule_names": passed_rule_names,
+    }
+
+
 def _prototype_distance_evidence(text: str, metadata: Dict[str, Any]) -> Tuple[float, float]:
     prototype_candidates = (metadata.get("prototype_candidates") or {}).get("candidates") or []
     if not text or not prototype_candidates:
@@ -2272,10 +2315,23 @@ def _add_contextual_consensus_evidence(
         column: [_normalize_signature(value) for value in df[column].tolist()]
         for column in df.columns
     }
+    representatives_by_column: Dict[str, Dict[str, Any]] = {}
+    for column in df.columns:
+        representatives: Dict[str, Any] = {}
+        for signature, value in zip(signatures_by_column[column], df[column].tolist()):
+            representatives.setdefault(signature, value)
+        representatives_by_column[column] = representatives
 
     for target_column in df.columns:
         target_signatures = signatures_by_column[target_column]
-        context_profiles: List[Tuple[str, float, Dict[str, Counter]]] = []
+        context_profiles: List[
+            Tuple[
+                str,
+                float,
+                Dict[str, Counter],
+                Dict[str, Dict[str, List[int]]],
+            ]
+        ] = []
 
         for context_column in df.columns:
             if context_column == target_column:
@@ -2286,12 +2342,25 @@ def _add_contextual_consensus_evidence(
                 continue
 
             grouped_counts: Dict[str, Counter] = defaultdict(Counter)
-            for target_sig, context_sig in zip(target_signatures, context_signatures):
+            grouped_rows: Dict[str, Dict[str, List[int]]] = defaultdict(
+                lambda: defaultdict(list)
+            )
+            for candidate_idx, (target_sig, context_sig) in enumerate(
+                zip(target_signatures, context_signatures)
+            ):
                 if context_sig in {"<na>", "<empty>"}:
                     continue
                 grouped_counts[context_sig][target_sig] += 1
+                grouped_rows[context_sig][target_sig].append(candidate_idx)
 
-            context_profiles.append((context_column, predictiveness, grouped_counts))
+            context_profiles.append(
+                (
+                    context_column,
+                    predictiveness,
+                    grouped_counts,
+                    grouped_rows,
+                )
+            )
 
         if not context_profiles:
             continue
@@ -2306,8 +2375,15 @@ def _add_contextual_consensus_evidence(
             best_agreement = 0.0
             best_disagreement_context = ""
             best_agreement_context = ""
+            best_disagreement_metadata: Dict[str, Any] = {}
+            best_agreement_metadata: Dict[str, Any] = {}
 
-            for context_column, predictiveness, grouped_counts in context_profiles:
+            for (
+                context_column,
+                predictiveness,
+                grouped_counts,
+                grouped_rows,
+            ) in context_profiles:
                 context_sig = signatures_by_column[context_column][row_idx]
                 counts = grouped_counts.get(context_sig)
                 if not counts:
@@ -2322,13 +2398,52 @@ def _add_contextual_consensus_evidence(
                 strength_base = float(np.clip(predictiveness * group_information, 0.0, 1.0))
                 disagreement = strength_base * (1.0 - conditional_probability)
                 agreement = strength_base * conditional_probability
+                expected_sig, expected_count = counts.most_common(1)[0]
+                expected_value = representatives_by_column[target_column].get(
+                    expected_sig,
+                    expected_sig,
+                )
+                context_value = df.iloc[row_idx][context_column]
+                reference_rows = [
+                    int(reference_idx)
+                    for reference_idx in (
+                        grouped_rows.get(context_sig, {}).get(expected_sig, [])
+                    )
+                    if reference_idx != row_idx
+                ][:5]
+                relation_metadata = {
+                    "relation_type": "conditional_consensus",
+                    "determinant_column": context_column,
+                    "dependent_column": target_column,
+                    "left_column": context_column,
+                    "right_column": target_column,
+                    "related_columns": [context_column, target_column],
+                    "context_column": context_column,
+                    "determinant_value": context_value,
+                    "observed_value": value,
+                    "expected_value": expected_value,
+                    "group_size": int(group_total),
+                    "observed_support": int(support),
+                    "expected_support": int(expected_count),
+                    "conditional_probability": float(conditional_probability),
+                    "expected_probability": float(expected_count / group_total),
+                    "predictiveness": float(predictiveness),
+                    "reference_rows": reference_rows,
+                    "rule_violated": bool(target_sig != expected_sig),
+                    "rule_text": (
+                        f"Rows with the same '{context_column}' value should "
+                        f"normally share the dominant '{target_column}' value"
+                    ),
+                }
 
                 if disagreement > best_disagreement:
                     best_disagreement = disagreement
                     best_disagreement_context = context_column
+                    best_disagreement_metadata = dict(relation_metadata)
                 if agreement > best_agreement:
                     best_agreement = agreement
                     best_agreement_context = context_column
+                    best_agreement_metadata = dict(relation_metadata)
 
             cell_key = f"{row_idx}::{target_column}"
             if best_disagreement > 0.0:
@@ -2341,7 +2456,15 @@ def _add_contextual_consensus_evidence(
                     strength=best_disagreement,
                     hard=False,
                     reason_code="conditional_value_disagreement",
-                    metadata={"context_column": best_disagreement_context},
+                    metadata=best_disagreement_metadata or {
+                        "context_column": best_disagreement_context,
+                        "determinant_column": best_disagreement_context,
+                        "dependent_column": target_column,
+                        "related_columns": [
+                            best_disagreement_context,
+                            target_column,
+                        ],
+                    },
                 ))
             if best_agreement > 0.0:
                 _record_observation(cell_observations, EvidenceObservation(
@@ -2353,7 +2476,15 @@ def _add_contextual_consensus_evidence(
                     strength=best_agreement,
                     hard=False,
                     reason_code="conditional_value_agreement",
-                    metadata={"context_column": best_agreement_context},
+                    metadata=best_agreement_metadata or {
+                        "context_column": best_agreement_context,
+                        "determinant_column": best_agreement_context,
+                        "dependent_column": target_column,
+                        "related_columns": [
+                            best_agreement_context,
+                            target_column,
+                        ],
+                    },
                 ))
 
 
@@ -2652,6 +2783,12 @@ def _extract_evidence(
             "pattern",
             record.row_index,
         )
+        pattern_rule_provenance = _agent_rule_provenance(
+            rule_pool.get(record.column, []),
+            outputs_by_column.get(record.column, np.zeros((0, 0), dtype=int)),
+            "pattern",
+            record.row_index,
+        )
 
         emitted_hard_dirty = False
         parse_success = False
@@ -2662,6 +2799,8 @@ def _extract_evidence(
         strong_relationship_violation = 0
         weak_relationship_violation = 0
         relationship_satisfied = 0
+        violated_relationships: List[Dict[str, Any]] = []
+        satisfied_relationships: List[Dict[str, Any]] = []
 
         if missing_like:
             _record_observation(cell_observations, EvidenceObservation(
@@ -2730,6 +2869,7 @@ def _extract_evidence(
                         strength=min(1.0, max(0.6, regex_match_rate)),
                         hard=False,
                         reason_code="regex_match",
+                        metadata=pattern_rule_provenance,
                     ))
                 elif _best_regex_contract_rate(col_meta) >= 0.60:
                     _record_observation(cell_observations, EvidenceObservation(
@@ -2741,6 +2881,7 @@ def _extract_evidence(
                         strength=0.6,
                         hard=False,
                         reason_code="format_contract_mismatch",
+                        metadata=pattern_rule_provenance,
                     ))
         else:
             text = str(value).strip()
@@ -2773,6 +2914,7 @@ def _extract_evidence(
                     strength=pattern_ratio,
                     hard=False,
                     reason_code="pattern_rule_match",
+                    metadata=pattern_rule_provenance,
                 ))
 
             if not regex_match and mismatch_strength >= 0.55:
@@ -2785,6 +2927,7 @@ def _extract_evidence(
                     strength=mismatch_strength,
                     hard=False,
                     reason_code="pattern_mismatch",
+                    metadata=pattern_rule_provenance,
                 ))
 
         for profile in col_meta.get("relationship_profiles") or []:
@@ -2798,13 +2941,77 @@ def _extract_evidence(
                 continue
             relationship_applicable += 1
             is_valid = _relationship_predicate(value, other_value, profile.get("type", ""))
+            relation_detail = {
+                "relation_type": str(profile.get("type") or "relationship"),
+                "determinant_column": other_column,
+                "dependent_column": record.column,
+                "left_column": other_column,
+                "right_column": record.column,
+                "related_columns": [other_column, record.column],
+                "determinant_value": other_value,
+                "observed_value": value,
+                "description": str(
+                    profile.get("description")
+                    or (
+                        f"'{record.column}' must satisfy "
+                        f"{profile.get('type', 'the relation')} with "
+                        f"'{other_column}'"
+                    )
+                ),
+                "rule_text": str(
+                    profile.get("description")
+                    or (
+                        f"'{record.column}' must satisfy "
+                        f"{profile.get('type', 'the relation')} with "
+                        f"'{other_column}'"
+                    )
+                ),
+                "applicable_count": int(profile.get("applicable_count", 0)),
+                "violation_rate": float(profile.get("violation_rate", 1.0)),
+                "rule_confidence": float(
+                    np.clip(
+                        1.0 - float(profile.get("violation_rate", 1.0)),
+                        0.0,
+                        1.0,
+                    )
+                ),
+            }
             if is_valid:
                 relationship_satisfied += 1
+                satisfied_relationships.append(relation_detail)
             else:
+                violated_relationships.append(relation_detail)
                 if float(profile.get("violation_rate", 1.0)) <= 0.10:
                     strong_relationship_violation += 1
                 else:
                     weak_relationship_violation += 1
+
+        violated_relationships.sort(
+            key=lambda item: (
+                float(item.get("violation_rate", 1.0)),
+                str(item.get("determinant_column", "")),
+            )
+        )
+        satisfied_relationships.sort(
+            key=lambda item: (
+                float(item.get("violation_rate", 1.0)),
+                str(item.get("determinant_column", "")),
+            )
+        )
+        primary_violated_relationship = (
+            dict(violated_relationships[0]) if violated_relationships else {}
+        )
+        primary_satisfied_relationship = (
+            dict(satisfied_relationships[0]) if satisfied_relationships else {}
+        )
+        if primary_violated_relationship:
+            primary_violated_relationship["violated_relationships"] = (
+                violated_relationships
+            )
+        if primary_satisfied_relationship:
+            primary_satisfied_relationship["satisfied_relationships"] = (
+                satisfied_relationships
+            )
 
         if strong_relationship_violation > 0:
             emitted_hard_dirty = True
@@ -2817,6 +3024,7 @@ def _extract_evidence(
                 strength=1.0,
                 hard=True,
                 reason_code="strong_relationship_violation",
+                metadata=primary_violated_relationship,
             ))
         elif weak_relationship_violation > 0:
             _record_observation(cell_observations, EvidenceObservation(
@@ -2828,6 +3036,7 @@ def _extract_evidence(
                 strength=min(1.0, 0.35 + weak_relationship_violation / max(relationship_applicable, 1)),
                 hard=False,
                 reason_code="weak_relationship_violation",
+                metadata=primary_violated_relationship,
             ))
         elif relationship_applicable > 0:
             _record_observation(cell_observations, EvidenceObservation(
@@ -2839,6 +3048,7 @@ def _extract_evidence(
                 strength=min(1.0, 0.4 + relationship_satisfied / max(relationship_applicable, 1)),
                 hard=False,
                 reason_code="relationship_satisfied",
+                metadata=primary_satisfied_relationship,
             ))
 
         if relationship_applicable >= 2:
@@ -2852,6 +3062,11 @@ def _extract_evidence(
                     strength=0.75,
                     hard=False,
                     reason_code="local_consistency_pass",
+                    metadata={
+                        **primary_satisfied_relationship,
+                        "relationship_applicable": relationship_applicable,
+                        "relationship_satisfied": relationship_satisfied,
+                    },
                 ))
             elif (strong_relationship_violation + weak_relationship_violation) / max(relationship_applicable, 1) >= 0.5:
                 _record_observation(cell_observations, EvidenceObservation(
@@ -2863,6 +3078,13 @@ def _extract_evidence(
                     strength=0.75,
                     hard=False,
                     reason_code="local_consistency_fail",
+                    metadata={
+                        **primary_violated_relationship,
+                        "relationship_applicable": relationship_applicable,
+                        "relationship_satisfied": relationship_satisfied,
+                        "strong_violation_count": strong_relationship_violation,
+                        "weak_violation_count": weak_relationship_violation,
+                    },
                 ))
 
         if (
@@ -3093,18 +3315,131 @@ def _public_explanation_payload(trace: ExplanationTrace) -> Dict[str, Any]:
     return _json_safe(payload)
 
 
-def _explanation_reason_text(evidence: EvidenceContribution) -> str:
+def _display_rule_value(value: Any) -> str:
+    if value is None:
+        return "<missing>"
+    text = str(value)
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
+def _relationship_reason_text(evidence: EvidenceContribution) -> str:
+    metadata = evidence.metadata or {}
+    determinant_column = str(
+        metadata.get("determinant_column")
+        or metadata.get("context_column")
+        or metadata.get("left_column")
+        or ""
+    ).strip()
+    dependent_column = str(
+        metadata.get("dependent_column")
+        or metadata.get("right_column")
+        or ""
+    ).strip()
+    rule_text = str(
+        metadata.get("rule_text")
+        or metadata.get("description")
+        or ""
+    ).strip()
+    determinant_value = _display_rule_value(
+        metadata.get("determinant_value")
+    )
+    observed_value = _display_rule_value(metadata.get("observed_value"))
+    expected_value = _display_rule_value(metadata.get("expected_value"))
+    reference_rows = [
+        int(row_index) + 1
+        for row_index in (metadata.get("reference_rows") or [])
+        if isinstance(row_index, (int, np.integer))
+    ]
+
     if evidence.source_id in {"contextual_agreement", "contextual_disagreement"}:
-        context_column = str(evidence.metadata.get("context_column") or "").strip()
-        if context_column:
-            relation = (
-                "agrees"
-                if evidence.source_id == "contextual_agreement"
-                else "disagrees"
+        if not determinant_column:
+            return ""
+        relation = (
+            rule_text
+            or (
+                f"rows with the same '{determinant_column}' value should "
+                f"normally share the dominant '{dependent_column}' value"
+            )
+        )
+        if evidence.source_id == "contextual_disagreement":
+            if metadata.get("rule_violated") and dependent_column:
+                detail = (
+                    f"The value violates the learned conditional rule "
+                    f"\"{relation}\": for '{determinant_column}'="
+                    f"'{determinant_value}', the expected "
+                    f"'{dependent_column}' value is '{expected_value}' "
+                    f"({int(metadata.get('expected_support', 0))}/"
+                    f"{int(metadata.get('group_size', 0))} supporting rows), "
+                    f"but the observed value is '{observed_value}'"
+                )
+            else:
+                detail = (
+                    f"The observed '{dependent_column}' value has limited "
+                    f"support under the learned conditional rule "
+                    f"\"{relation}\" for '{determinant_column}'="
+                    f"'{determinant_value}'"
+                )
+        else:
+            detail = (
+                f"The value supports the learned conditional rule "
+                f"\"{relation}\" for '{determinant_column}'="
+                f"'{determinant_value}'"
+            )
+        if reference_rows:
+            detail += (
+                "; representative supporting rows: "
+                + ", ".join(str(row) for row in reference_rows)
+            )
+        return detail
+
+    if evidence.family != "relationship":
+        return ""
+    if not rule_text:
+        return ""
+    columns = (
+        f" between '{determinant_column}' and '{dependent_column}'"
+        if determinant_column and dependent_column
+        else ""
+    )
+    values = (
+        f"; observed '{determinant_column}'='{determinant_value}' and "
+        f"'{dependent_column}'='{observed_value}'"
+        if determinant_column and dependent_column
+        else ""
+    )
+    if evidence.polarity == "dirty":
+        return (
+            f"The value violates the relation \"{rule_text}\"{columns}"
+            f"{values}"
+        )
+    return (
+        f"The value satisfies the relation \"{rule_text}\"{columns}"
+        f"{values}"
+    )
+
+
+def _explanation_reason_text(evidence: EvidenceContribution) -> str:
+    relationship_text = _relationship_reason_text(evidence)
+    if relationship_text:
+        return relationship_text
+    if evidence.source_id == "pattern_mismatch":
+        failed_rules = (evidence.metadata or {}).get("failed_rules") or []
+        if failed_rules:
+            failed_rule_names = [
+                str(rule.get("rule_name") or "unnamed_rule")
+                for rule in failed_rules
+            ]
+            evaluated_count = int(
+                (evidence.metadata or {}).get(
+                    "evaluated_rule_count",
+                    len(failed_rules),
+                )
             )
             return (
-                f"The value {relation} with the dominant value in similar "
-                f"contexts defined by column '{context_column}'"
+                "The value does not match the dominant format of this column; "
+                f"it failed {len(failed_rules)} of {evaluated_count} "
+                "Agent-generated pattern rules: "
+                + ", ".join(failed_rule_names)
             )
     if evidence.source_id in EVIDENCE_REASON_TEMPLATES:
         return EVIDENCE_REASON_TEMPLATES[evidence.source_id]

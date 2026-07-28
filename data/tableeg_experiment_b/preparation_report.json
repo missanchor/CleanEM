@@ -1,0 +1,30 @@
+{
+  "beers": {
+    "rows": 2410,
+    "columns_for_cleanem": 10,
+    "annotations": 3357,
+    "table_difference_annotations": 3357,
+    "orientation_fixed": false
+  },
+  "hospital": {
+    "rows": 1000,
+    "columns_for_cleanem": 19,
+    "annotations": 509,
+    "table_difference_annotations": 509,
+    "orientation_fixed": true
+  },
+  "flight": {
+    "rows": 2376,
+    "columns_for_cleanem": 6,
+    "annotations": 4016,
+    "table_difference_annotations": 4016,
+    "orientation_fixed": false
+  },
+  "Restaurant": {
+    "rows": 12007,
+    "columns_for_cleanem": 11,
+    "annotations": 635,
+    "table_difference_annotations": 622,
+    "orientation_fixed": false
+  }
+}
