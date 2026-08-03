@@ -195,7 +195,70 @@ class RelationshipExplanationTests(unittest.TestCase):
         )
         self.assertNotIn("2::city", observations)
 
+    def test_identifier_agreement_allows_informative_non_dominant_group(self):
+        df = pd.DataFrame(
+            {
+                "schedule": ["A", "A", "A", "B", "B", "B", "B", "B"],
+                "flight": ["X", "X", "Y", "Z", "Z", "Z", "Z", "Z"],
+            }
+        )
+        observations = {}
+        main._add_contextual_consensus_evidence(
+            df,
+            {
+                "schedule": {"semantics": {"archetype": "closed_enum"}},
+                "flight": {"semantics": {"archetype": "identifier"}},
+            },
+            observations,
+        )
+        agreement = next(
+            item
+            for item in observations["0::flight"]
+            if item.source_id == "contextual_agreement"
+        )
+        self.assertEqual(
+            agreement.metadata["agreement_reliability"],
+            "identifier_semantic",
+        )
+        self.assertEqual(
+            agreement.metadata["validation_status"],
+            "identifier_semantic_agreement",
+        )
+
+    def test_temporal_identifier_low_support_disagreement(self):
+        df = pd.DataFrame(
+            {
+                "flight": ["A", "A", "A", "A", "B", "B", "B", "B"],
+                "act_arr_time": [
+                    "9:00 a.m.", "9:00 a.m.", "9:10 a.m.", "9:20 a.m.",
+                    "10:00 a.m.", "10:00 a.m.", "10:00 a.m.", "10:00 a.m.",
+                ],
+            }
+        )
+        observations = {}
+        main._add_contextual_consensus_evidence(
+            df,
+            {
+                "flight": {"semantics": {"archetype": "identifier"}},
+                "act_arr_time": {
+                    "semantics": {"archetype": "temporal_measure"},
+                },
+            },
+            observations,
+        )
+        evidence = next(
+            item
+            for item in observations["2::act_arr_time"]
+            if item.source_id == "contextual_disagreement"
+        )
+        self.assertEqual(
+            evidence.metadata["validation_status"],
+            "temporal_identifier_low_support",
+        )
+        self.assertTrue(evidence.hard)
+
     def test_profile_relationship_keeps_columns_and_rule(self):
+
         df = pd.DataFrame(
             {
                 "State": ["CA", "TX", "NY"],

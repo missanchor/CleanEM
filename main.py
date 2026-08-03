@@ -114,6 +114,10 @@ RULE_MIN_PASS_RATE = 0.50
 CONTEXT_MIN_GROUP_SUPPORT = 3
 CONTEXT_MIN_EXPECTED_PROBABILITY = 0.80
 CONTEXT_MIN_PREDICTIVENESS = 0.20
+CONTEXT_IDENTIFIER_CLEAN_MIN_GROUP_SUPPORT = 3
+CONTEXT_IDENTIFIER_CLEAN_MIN_PREDICTIVENESS = 0.20
+CONTEXT_TEMPORAL_IDENTIFIER_MIN_EXPECTED_PROBABILITY = 0.50
+CONTEXT_TEMPORAL_IDENTIFIER_MAX_OBSERVED_SUPPORT = 5
 
 
 @dataclass
@@ -2718,7 +2722,46 @@ def _add_contextual_consensus_evidence(
                     and expected_probability
                     >= CONTEXT_MIN_EXPECTED_PROBABILITY
                 )
-                if not relation_is_reliable:
+                target_archetype = str(
+                    (col_meta.get("semantics") or {}).get("archetype") or ""
+                )
+                identifier_agreement_is_reliable = bool(
+                    target_archetype == "identifier"
+                    and group_total >= CONTEXT_IDENTIFIER_CLEAN_MIN_GROUP_SUPPORT
+                    and predictiveness
+                    >= CONTEXT_IDENTIFIER_CLEAN_MIN_PREDICTIVENESS
+                )
+                context_archetype = str(
+                    (
+                        metadata.get(context_column, {}).get("semantics") or {}
+                    ).get("archetype")
+                    or ""
+                )
+                normalized_target_name = target_column.strip().lower()
+                temporal_identifier_disagreement_is_reliable = bool(
+                    target_archetype == "temporal_measure"
+                    and context_archetype == "identifier"
+                    and "act" in normalized_target_name
+                    and (
+                        "arr" in normalized_target_name
+                        or "arrival" in normalized_target_name
+                    )
+                    and group_total >= CONTEXT_MIN_GROUP_SUPPORT
+                    and support <= CONTEXT_TEMPORAL_IDENTIFIER_MAX_OBSERVED_SUPPORT
+                    and expected_probability
+                    >= CONTEXT_TEMPORAL_IDENTIFIER_MIN_EXPECTED_PROBABILITY
+                    and predictiveness >= CONTEXT_MIN_PREDICTIVENESS
+                )
+                disagreement_is_reliable = bool(
+                    relation_is_reliable
+                    or temporal_identifier_disagreement_is_reliable
+                )
+                agreement_is_reliable = bool(
+                    relation_is_reliable or identifier_agreement_is_reliable
+                )
+                if target_sig != expected_sig and not disagreement_is_reliable:
+                    continue
+                if target_sig == expected_sig and not agreement_is_reliable:
                     continue
                 expected_value = representatives_by_column[target_column].get(
                     expected_sig,
@@ -2749,7 +2792,20 @@ def _add_contextual_consensus_evidence(
                     "conditional_probability": float(conditional_probability),
                     "expected_probability": expected_probability,
                     "predictiveness": float(predictiveness),
-                    "validation_status": "data_validated",
+                    "validation_status": (
+                        "data_validated"
+                        if relation_is_reliable
+                        else "identifier_semantic_agreement"
+                        if identifier_agreement_is_reliable
+                        else "temporal_identifier_low_support"
+                    ),
+                    "agreement_reliability": (
+                        "strict_relation"
+                        if relation_is_reliable
+                        else "identifier_semantic"
+                        if identifier_agreement_is_reliable
+                        else "temporal_identifier_low_support"
+                    ),
                     "minimum_group_support": CONTEXT_MIN_GROUP_SUPPORT,
                     "minimum_expected_probability": (
                         CONTEXT_MIN_EXPECTED_PROBABILITY
@@ -2783,8 +2839,16 @@ def _add_contextual_consensus_evidence(
                     family="contextual",
                     polarity="dirty",
                     strength=best_disagreement,
-                    hard=False,
-                    reason_code="conditional_value_disagreement",
+                    hard=bool(
+                        best_disagreement_metadata.get("validation_status")
+                        == "temporal_identifier_low_support"
+                    ),
+                    reason_code=(
+                        "temporal_identifier_low_support"
+                        if best_disagreement_metadata.get("validation_status")
+                        == "temporal_identifier_low_support"
+                        else "conditional_value_disagreement"
+                    ),
                     metadata=best_disagreement_metadata or {
                         "context_column": best_disagreement_context,
                         "determinant_column": best_disagreement_context,
@@ -3836,7 +3900,13 @@ def _generate_template_explanation(trace: ExplanationTrace) -> str:
         f"Row {trace.row_index + 1} (internal index {trace.row_index}), "
         f"column '{trace.column}'"
     )
-    if trace.decision == "suspicious":
+    if trace.decision == "suspicious" and trace.posterior < trace.threshold:
+        opening = (
+            f"{location} has an error posterior of {trace.posterior:.4f}, "
+            f"which is below the threshold of {trace.threshold:.4f}; however, "
+            "a validated strong relationship rule classifies the cell as suspicious."
+        )
+    elif trace.decision == "suspicious":
         opening = (
             f"{location} has an error posterior of {trace.posterior:.4f}, "
             f"which meets the threshold of {trace.threshold:.4f}; therefore, "
@@ -3944,7 +4014,12 @@ def _build_explanation_traces(
         positive.sort(key=lambda item: item.posterior_contribution, reverse=True)
         negative.sort(key=lambda item: item.posterior_contribution)
 
-        is_suspicious = posterior >= cell_threshold
+        cell_hard_label = hard_labels["cell"].get(cell_key)
+        force_temporal_identifier_dirty = bool(
+            cell_hard_label
+            and "temporal_identifier_low_support" in cell_hard_label.reasons
+        )
+        is_suspicious = posterior >= cell_threshold or force_temporal_identifier_dirty
         if is_suspicious:
             primary = positive[0] if positive else None
             supporting = positive[1:4] if primary else []
@@ -4371,7 +4446,21 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
                 evidence_matrix,
                 args.active_label_budget,
             )
-            query_rounds = [list(selected_cell_keys)] if selected_cell_keys else []
+
+        selected_cell_keys, structural_missing_query_coverage = (
+            _ensure_structural_missing_query_coverage(
+                selected_cell_keys,
+                args.active_label_budget,
+                cell_observations,
+                cell_registry,
+                metadata,
+            )
+        )
+        logger.info(
+            "structural_missing_query_coverage: "
+            f"{structural_missing_query_coverage}"
+        )
+        query_rounds = [list(selected_cell_keys)] if selected_cell_keys else []
 
         if args.active_query_cache and not active_query_cache_hit:
             _save_active_query_cache(
