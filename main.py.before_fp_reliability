@@ -107,14 +107,6 @@ ANCHOR_HARD_DIRTY = "hard_dirty"
 ANCHOR_UNLABELED = "unlabeled"
 ANCHOR_ABSTAIN = "abstain"
 
-# Dataset-agnostic reliability requirements.
-STRUCTURAL_MISSING_MIN_SUPPORT = 5
-STRUCTURAL_MISSING_MIN_RATE = 0.02
-RULE_MIN_PASS_RATE = 0.50
-CONTEXT_MIN_GROUP_SUPPORT = 3
-CONTEXT_MIN_EXPECTED_PROBABILITY = 0.80
-CONTEXT_MIN_PREDICTIVENESS = 0.20
-
 
 @dataclass
 class GroupRecord:
@@ -267,26 +259,6 @@ def parse_args() -> argparse.Namespace:
         help="Threshold on cell_posterior to treat a cell as error in clean_em mode."
     )
     parser.add_argument(
-        "--rule_min_pass_rate",
-        type=float,
-        default=RULE_MIN_PASS_RATE,
-        help=(
-            "Minimum empirical pass rate required for a non-missing Agent rule "
-            f"during rule-pool validation (default: {RULE_MIN_PASS_RATE})."
-        ),
-    )
-    parser.add_argument(
-        "--disable_column_thresholds",
-        action="store_true",
-        help="Disable conservative per-column thresholds learned from active labels."
-    )
-    parser.add_argument(
-        "--column_threshold_min_labels",
-        type=int,
-        default=2,
-        help="Minimum active labels in a column before learning its decision threshold."
-    )
-    parser.add_argument(
         "--active_label_budget",
         type=int,
         default=10,
@@ -428,7 +400,6 @@ def _validate_rule_candidate(
     column: str,
     family: str,
     rule_str: str,
-    min_pass_rate: float = RULE_MIN_PASS_RATE,
 ) -> Tuple[Optional[Any], Dict[str, Any]]:
     """Compile and smoke-test an LLM rule before it enters the rule pool."""
     report: Dict[str, Any] = {
@@ -491,26 +462,16 @@ def _validate_rule_candidate(
         outcomes.append(outcome)
 
     pass_rate = float(np.mean(outcomes))
-    violation_rate = 1.0 - pass_rate
-    report.update({
-        "tested": len(outcomes),
-        "pass_rate": pass_rate,
-        "violation_rate": violation_rate,
-        "validation_status": "rejected",
-    })
+    report.update({"tested": len(outcomes), "pass_rate": pass_rate})
     if family != "missing":
         if all(outcomes) or not any(outcomes):
             report["reason"] = "degenerate_constant_result"
             return None, report
-        if pass_rate < float(min_pass_rate):
-            report["reason"] = "excessive_empirical_conflict"
+        if 1.0 - pass_rate >= 0.95:
+            report["reason"] = "excessive_violation_rate"
             return None, report
 
-    report.update({
-        "accepted": True,
-        "reason": "data_validated",
-        "validation_status": "accepted",
-    })
+    report.update({"accepted": True, "reason": "validated"})
     return rule_func, report
 
 
@@ -536,7 +497,6 @@ def _build_clean_rule_pool(
     df: pd.DataFrame,
     metadata: Dict[str, Dict[str, Any]],
     factory: AgentFactory,
-    rule_min_pass_rate: float = RULE_MIN_PASS_RATE,
 ) -> Dict[str, List[Dict[str, Any]]]:
     clean_rules, _ = factory.generate_clean_rules_per_column(metadata)
     family_map = {
@@ -558,7 +518,6 @@ def _build_clean_rule_pool(
                 column,
                 family,
                 rule_str,
-                min_pass_rate=rule_min_pass_rate,
             )
             if rule_func is None:
                 _log_rule_rejection(column, rule_name, rule_str, validation)
@@ -570,8 +529,6 @@ def _build_clean_rule_pool(
                     "rule_name": rule_name,
                     "rule_str": rule_str,
                     "rule_func": rule_func,
-                    "proposal_source": "llm",
-                    "validation": dict(validation),
                 }
             )
         if col_pool:
@@ -618,8 +575,6 @@ def _save_rule_pool_cache(
                     "family": rule.get("family"),
                     "rule_name": rule.get("rule_name"),
                     "rule_str": rule.get("rule_str"),
-                    "proposal_source": rule.get("proposal_source", "llm"),
-                    "validation": rule.get("validation") or {},
                 }
                 for rule in rules
             ]
@@ -632,7 +587,6 @@ def _save_rule_pool_cache(
 def _load_rule_pool_cache(
     path: str,
     df: pd.DataFrame,
-    rule_min_pass_rate: float = RULE_MIN_PASS_RATE,
 ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Dict[str, Any]]]:
     with open(path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -664,7 +618,6 @@ def _load_rule_pool_cache(
                 column,
                 family,
                 rule_str,
-                min_pass_rate=rule_min_pass_rate,
             )
             if rule_func is None:
                 _log_rule_rejection(column, rule_name, rule_str, validation)
@@ -675,8 +628,6 @@ def _load_rule_pool_cache(
                 "rule_name": rule_name,
                 "rule_str": rule_str,
                 "rule_func": rule_func,
-                "proposal_source": item.get("proposal_source", "llm"),
-                "validation": dict(validation),
             })
         if compiled_rules:
             pool[column] = compiled_rules
@@ -844,14 +795,6 @@ def _is_missing_like(value: Any, metadata: Dict[str, Any]) -> bool:
     return normalized in DEFAULT_MISSING_TOKEN_SET or normalized in dominant_tokens
 
 
-def _is_structural_missing_group(support: int, total_rows: int) -> bool:
-    """Frequent placeholders represent allowed absence, not an error alone."""
-    return (
-        int(support) >= STRUCTURAL_MISSING_MIN_SUPPORT
-        and float(support) / max(int(total_rows), 1) >= STRUCTURAL_MISSING_MIN_RATE
-    )
-
-
 def _coerce_numeric(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -982,12 +925,8 @@ def _build_anchor_groups(
     if family == "missing":
         for record in groups:
             if _is_missing_like(record.representative_value, metadata):
-                if _is_structural_missing_group(record.weight, len(df)):
-                    record.anchor_state = ANCHOR_ABSTAIN
-                    record.anchor_source = "structural_missing_token"
-                else:
-                    record.anchor_state = ANCHOR_HARD_DIRTY
-                    record.anchor_source = "real_missing_token"
+                record.anchor_state = ANCHOR_HARD_DIRTY
+                record.anchor_source = "real_missing_token"
             else:
                 record.anchor_state = ANCHOR_HARD_CLEAN
                 record.anchor_source = "real_non_missing"
@@ -1431,16 +1370,7 @@ def _build_soft_anchor_groups(
     if family == "missing":
         for record in groups:
             if _is_missing_like(record.representative_value, metadata):
-                if _is_structural_missing_group(record.weight, len(df)):
-                    _set_group_anchor(
-                        record, ANCHOR_ABSTAIN, "structural_missing_token",
-                        prior_dirty, 0.0,
-                    )
-                else:
-                    _set_group_anchor(
-                        record, ANCHOR_HARD_DIRTY, "real_missing_token",
-                        0.99, 1.0,
-                    )
+                _set_group_anchor(record, ANCHOR_HARD_DIRTY, "real_missing_token", 0.99, 1.0)
             else:
                 _set_group_anchor(record, ANCHOR_HARD_CLEAN, "real_non_missing", 0.01, 1.0)
         return groups, status
@@ -2275,8 +2205,6 @@ def _agent_rule_provenance(
             "family": family,
             "rule_str": str(rule.get("rule_str") or ""),
             "outcome": "pass" if outcome else "fail",
-            "proposal_source": str(rule.get("proposal_source") or "llm"),
-            "validation": dict(rule.get("validation") or {}),
         }
         evaluated_rules.append(rule_record)
         if outcome:
@@ -2364,204 +2292,6 @@ def _low_frequency_strength(value_record: ValueRecord, metadata: Dict[str, Any])
     if value_record.support_count == 3:
         return 0.50
     return 0.0
-
-
-def _allow_discrete_rarity_evidence(metadata: Dict[str, Any]) -> bool:
-    """Whether singleton/category rarity is meaningful for this column."""
-    semantics = metadata.get("semantics") or {}
-    if isinstance(semantics, dict):
-        archetype = str(semantics.get("archetype") or "")
-        open_set_score = float(semantics.get("open_set_score") or 0.0)
-    else:
-        archetype = str(getattr(semantics, "archetype", "") or "")
-        open_set_score = float(
-            getattr(semantics, "open_set_score", 0.0) or 0.0
-        )
-    # Open measurement domains commonly contain unique legitimate values.
-    # Format, range, unit, and canonicalization evidence remain active.
-    if (
-        archetype in {"numeric_measure", "unit_measure", "temporal_measure"}
-        and open_set_score >= 0.20
-    ):
-        return False
-    return True
-
-
-def _update_structural_missing_from_labels(
-    value_observations: Dict[str, List[EvidenceObservation]],
-    cell_observations: Dict[str, List[EvidenceObservation]],
-    metadata: Dict[str, Dict[str, Any]],
-    value_registry: Dict[str, ValueRecord],
-    cell_registry: Dict[str, CellRecord],
-    active_labels: Dict[str, int],
-) -> Dict[str, Any]:
-    """Update the structural-missing prior using labels at archetype scope."""
-    support: Dict[str, Counter] = defaultdict(Counter)
-    for cell_key, label in active_labels.items():
-        record = cell_registry.get(cell_key)
-        if record is None:
-            continue
-        observations = cell_observations.get(cell_key, [])
-        if not any(
-            item.reason_code == "structural_missing_token"
-            for item in observations
-        ):
-            continue
-        semantics = metadata.get(record.column, {}).get("semantics") or {}
-        archetype = (
-            str(semantics.get("archetype") or "unknown")
-            if isinstance(semantics, dict)
-            else str(getattr(semantics, "archetype", "unknown"))
-        )
-        support[archetype]["dirty" if int(label) == 1 else "clean"] += 1
-
-    promoted_archetypes = {
-        archetype
-        for archetype, counts in support.items()
-        if counts["dirty"] > counts["clean"]
-    }
-    if not promoted_archetypes:
-        return {"support": dict(support), "promoted_archetypes": [], "updated": 0}
-
-    updated = 0
-    for observations, registry in (
-        (value_observations, value_registry),
-        (cell_observations, cell_registry),
-    ):
-        for target_key, items in observations.items():
-            record = registry.get(target_key)
-            if record is None:
-                continue
-            column = record.column
-            semantics = metadata.get(column, {}).get("semantics") or {}
-            archetype = (
-                str(semantics.get("archetype") or "unknown")
-                if isinstance(semantics, dict)
-                else str(getattr(semantics, "archetype", "unknown"))
-            )
-            if archetype not in promoted_archetypes:
-                continue
-            for item in items:
-                if item.reason_code != "structural_missing_token":
-                    continue
-                item.strength = 1.0
-                item.hard = True
-                item.metadata["label_updated"] = True
-                item.metadata["label_update_scope"] = archetype
-                updated += 1
-    return {
-        "support": {
-            archetype: dict(counts) for archetype, counts in support.items()
-        },
-        "promoted_archetypes": sorted(promoted_archetypes),
-        "updated": updated,
-    }
-
-
-def _ensure_structural_missing_query_coverage(
-    selected_cell_keys: List[str],
-    budget: int,
-    cell_observations: Dict[str, List[EvidenceObservation]],
-    cell_registry: Dict[str, CellRecord],
-    metadata: Dict[str, Dict[str, Any]],
-) -> Tuple[List[str], Dict[str, Any]]:
-    """Reserve at most one query per structural-missing archetype."""
-    selected = list(dict.fromkeys(selected_cell_keys))[:max(int(budget), 0)]
-
-    def archetype_for(cell_key: str) -> str:
-        record = cell_registry.get(cell_key)
-        if record is None:
-            return "unknown"
-        semantics = metadata.get(record.column, {}).get("semantics") or {}
-        return (
-            str(semantics.get("archetype") or "unknown")
-            if isinstance(semantics, dict)
-            else str(getattr(semantics, "archetype", "unknown"))
-        )
-
-    structural_candidates: Dict[str, str] = {}
-    structural_keys: Set[str] = set()
-    for cell_key in sorted(cell_observations):
-        if not any(
-            item.reason_code == "structural_missing_token"
-            for item in cell_observations[cell_key]
-        ):
-            continue
-        structural_keys.add(cell_key)
-        structural_candidates.setdefault(archetype_for(cell_key), cell_key)
-
-    covered = {
-        archetype_for(cell_key)
-        for cell_key in selected
-        if cell_key in structural_keys
-    }
-    inserted: List[str] = []
-    replaced: List[str] = []
-    for archetype, candidate in sorted(structural_candidates.items()):
-        if archetype in covered or candidate in selected or budget <= 0:
-            continue
-        if len(selected) < budget:
-            selected.append(candidate)
-        else:
-            counts = Counter(archetype_for(key) for key in selected)
-            column_counts = Counter(
-                cell_registry[key].column
-                for key in selected
-                if key in cell_registry
-            )
-            # Preserve semantic coverage: first replace a repeated query from
-            # the same archetype, ideally from a duplicated column.
-            replace_index = next(
-                (
-                    index
-                    for index in range(len(selected) - 1, -1, -1)
-                    if selected[index] not in structural_keys
-                    and archetype_for(selected[index]) == archetype
-                    and selected[index] in cell_registry
-                    and column_counts[cell_registry[selected[index]].column] > 1
-                ),
-                None,
-            )
-            if replace_index is None:
-                replace_index = next(
-                    (
-                        index
-                        for index in range(len(selected) - 1, -1, -1)
-                        if selected[index] not in structural_keys
-                        and archetype_for(selected[index]) == archetype
-                    ),
-                    None,
-                )
-            if replace_index is None:
-                replace_index = next(
-                (
-                    index
-                    for index in range(len(selected) - 1, -1, -1)
-                    if selected[index] not in structural_keys
-                    and counts[archetype_for(selected[index])] > 1
-                ),
-                None,
-            )
-            if replace_index is None:
-                replace_index = next(
-                    (
-                        index
-                        for index in range(len(selected) - 1, -1, -1)
-                        if selected[index] not in structural_keys
-                    ),
-                    None,
-                )
-            if replace_index is None:
-                continue
-            replaced.append(selected[replace_index])
-            selected[replace_index] = candidate
-        inserted.append(candidate)
-        covered.add(archetype)
-    return selected, {
-        "structural_archetypes": sorted(structural_candidates),
-        "inserted": inserted,
-        "replaced": replaced,
-    }
 
 
 def _entropy_from_counts(counts: Counter) -> float:
@@ -2701,7 +2431,7 @@ def _add_contextual_consensus_evidence(
                 if not counts:
                     continue
                 group_total = float(sum(counts.values()))
-                if group_total < CONTEXT_MIN_GROUP_SUPPORT:
+                if group_total <= 1:
                     continue
 
                 support = float(counts.get(target_sig, 0))
@@ -2711,15 +2441,6 @@ def _add_contextual_consensus_evidence(
                 disagreement = strength_base * (1.0 - conditional_probability)
                 agreement = strength_base * conditional_probability
                 expected_sig, expected_count = counts.most_common(1)[0]
-                expected_probability = float(expected_count / group_total)
-                relation_is_reliable = bool(
-                    predictiveness >= CONTEXT_MIN_PREDICTIVENESS
-                    and expected_count >= CONTEXT_MIN_GROUP_SUPPORT
-                    and expected_probability
-                    >= CONTEXT_MIN_EXPECTED_PROBABILITY
-                )
-                if not relation_is_reliable:
-                    continue
                 expected_value = representatives_by_column[target_column].get(
                     expected_sig,
                     expected_sig,
@@ -2747,13 +2468,8 @@ def _add_contextual_consensus_evidence(
                     "observed_support": int(support),
                     "expected_support": int(expected_count),
                     "conditional_probability": float(conditional_probability),
-                    "expected_probability": expected_probability,
+                    "expected_probability": float(expected_count / group_total),
                     "predictiveness": float(predictiveness),
-                    "validation_status": "data_validated",
-                    "minimum_group_support": CONTEXT_MIN_GROUP_SUPPORT,
-                    "minimum_expected_probability": (
-                        CONTEXT_MIN_EXPECTED_PROBABILITY
-                    ),
                     "reference_rows": reference_rows,
                     "rule_violated": bool(target_sig != expected_sig),
                     "rule_text": (
@@ -2762,14 +2478,11 @@ def _add_contextual_consensus_evidence(
                     ),
                 }
 
-                # A low probability is not itself a violation when the observed
-                # value is still the group's dominant value. This guard prevents
-                # diverse groups from creating self-contradictory dirty evidence.
-                if target_sig != expected_sig and disagreement > best_disagreement:
+                if disagreement > best_disagreement:
                     best_disagreement = disagreement
                     best_disagreement_context = context_column
                     best_disagreement_metadata = dict(relation_metadata)
-                if target_sig == expected_sig and agreement > best_agreement:
+                if agreement > best_agreement:
                     best_agreement = agreement
                     best_agreement_context = context_column
                     best_agreement_metadata = dict(relation_metadata)
@@ -2940,26 +2653,15 @@ def _extract_evidence(
         )
 
         if missing_like:
-            structural_missing = _is_structural_missing_group(
-                record.support_count, len(df)
-            )
             _record_observation(value_observations, EvidenceObservation(
                 target_scope="value",
                 target_key=value_key,
                 source_id="missing_token",
                 family="missing",
                 polarity="dirty",
-                strength=0.15 if structural_missing else 1.0,
-                hard=not structural_missing,
-                reason_code=(
-                    "structural_missing_token"
-                    if structural_missing else "missing_token"
-                ),
-                metadata={
-                    "structural_missing": structural_missing,
-                    "support": int(record.support_count),
-                    "column_rate": float(record.support_count / max(len(df), 1)),
-                },
+                strength=1.0,
+                hard=True,
+                reason_code="missing_token",
             ))
             continue
 
@@ -3070,11 +2772,7 @@ def _extract_evidence(
                 reason_code="pattern_rule_support",
             ))
 
-        low_frequency_strength = (
-            _low_frequency_strength(record, col_meta)
-            if _allow_discrete_rarity_evidence(col_meta)
-            else 0.0
-        )
+        low_frequency_strength = _low_frequency_strength(record, col_meta)
         if low_frequency_strength > 0:
             _record_observation(value_observations, EvidenceObservation(
                 target_scope="value",
@@ -3147,30 +2845,15 @@ def _extract_evidence(
         satisfied_relationships: List[Dict[str, Any]] = []
 
         if missing_like:
-            value_record = value_registry.get(record.value_key)
-            missing_support = (
-                int(value_record.support_count) if value_record is not None else 1
-            )
-            structural_missing = _is_structural_missing_group(
-                missing_support, len(df)
-            )
             _record_observation(cell_observations, EvidenceObservation(
                 target_scope="cell",
                 target_key=cell_key,
                 source_id="missing_token",
                 family="missing",
                 polarity="dirty",
-                strength=0.15 if structural_missing else 1.0,
-                hard=not structural_missing,
-                reason_code=(
-                    "structural_missing_token"
-                    if structural_missing else "missing_token"
-                ),
-                metadata={
-                    "structural_missing": structural_missing,
-                    "support": missing_support,
-                    "column_rate": float(missing_support / max(len(df), 1)),
-                },
+                strength=1.0,
+                hard=True,
+                reason_code="missing_token",
             ))
             continue
 
@@ -3556,16 +3239,6 @@ def _oracle_label_from_clean(
         return None
     dirty_val = dirty_df.iloc[cell_record.row_index][cell_record.column]
     clean_val = clean_df.iloc[cell_record.row_index][cell_record.column]
-    dirty_missing = (
-        pd.isna(dirty_val)
-        or _normalize_token(dirty_val) in DEFAULT_MISSING_TOKEN_SET
-    )
-    clean_missing = (
-        pd.isna(clean_val)
-        or _normalize_token(clean_val) in DEFAULT_MISSING_TOKEN_SET
-    )
-    if dirty_missing and clean_missing:
-        return 0
     return int(str(dirty_val).strip() != str(clean_val).strip())
 
 
@@ -3629,9 +3302,6 @@ def _evidence_source_coverage(
 EVIDENCE_REASON_TEMPLATES = {
     "missing": "The value is missing or is a missing-value placeholder",
     "missing_token": "The value matches a missing-value placeholder",
-    "structural_missing_token": (
-        "The value is a repeated structural missing-value placeholder"
-    ),
     "rarity_high": "The value is rare in this column",
     "prototype_far": "The value differs substantially from typical values in this column",
     "prototype_close": "The value is close to typical values in this column",
@@ -3873,48 +3543,6 @@ def _generate_template_explanation(trace: ExplanationTrace) -> str:
     return "".join(parts)
 
 
-def _learn_column_thresholds(
-    cell_registry: Dict[str, CellRecord],
-    cell_posteriors: Dict[str, Dict[str, float]],
-    active_labels: Dict[str, int],
-    base_threshold: float,
-    min_labels: int = 2,
-) -> Dict[str, float]:
-    """Learn conservative column thresholds with global-threshold shrinkage."""
-    labeled_by_column: Dict[str, List[Tuple[float, int]]] = defaultdict(list)
-    for cell_key, label in active_labels.items():
-        record = cell_registry.get(cell_key)
-        bundle = cell_posteriors.get(cell_key)
-        if record is None or bundle is None:
-            continue
-        labeled_by_column[record.column].append(
-            (float(bundle.get("posterior", 0.5)), int(label))
-        )
-
-    thresholds: Dict[str, float] = {}
-    for column, examples in labeled_by_column.items():
-        if len(examples) < max(2, int(min_labels)):
-            continue
-        clean_scores = [score for score, label in examples if label == 0]
-        dirty_scores = [score for score, label in examples if label == 1]
-        if clean_scores and dirty_scores and max(clean_scores) < min(dirty_scores):
-            empirical = 0.5 * (max(clean_scores) + min(dirty_scores))
-        elif clean_scores:
-            empirical = max(float(base_threshold), max(clean_scores) + 0.05)
-        elif dirty_scores:
-            empirical = min(float(base_threshold), min(dirty_scores) - 0.05)
-        else:
-            continue
-        # Small label sets should only make a small adjustment.
-        shrinkage = len(examples) / (len(examples) + 5.0)
-        learned = (
-            (1.0 - shrinkage) * float(base_threshold)
-            + shrinkage * empirical
-        )
-        thresholds[column] = float(np.clip(learned, 0.05, 0.95))
-    return thresholds
-
-
 def _build_explanation_traces(
     metadata: Dict[str, Dict[str, Any]],
     cell_registry: Dict[str, CellRecord],
@@ -3925,15 +3553,11 @@ def _build_explanation_traces(
     loeo_contributions: Dict[str, List[EvidenceContribution]],
     calibration_trace: Any,
     threshold: float,
-    column_thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, ExplanationTrace]:
     traces: Dict[str, ExplanationTrace] = {}
     epsilon = 1e-12
 
     for cell_key, record in cell_registry.items():
-        cell_threshold = float(
-            (column_thresholds or {}).get(record.column, threshold)
-        )
         posterior_bundle = cell_posteriors.get(
             cell_key, {"posterior": 0.5, "confidence": 0.0}
         )
@@ -3944,7 +3568,7 @@ def _build_explanation_traces(
         positive.sort(key=lambda item: item.posterior_contribution, reverse=True)
         negative.sort(key=lambda item: item.posterior_contribution)
 
-        is_suspicious = posterior >= cell_threshold
+        is_suspicious = posterior >= threshold
         if is_suspicious:
             primary = positive[0] if positive else None
             supporting = positive[1:4] if primary else []
@@ -3990,7 +3614,7 @@ def _build_explanation_traces(
             confidence=float(posterior_bundle["confidence"]),
             decision_certainty=float(posterior_bundle["confidence"]),
             full_logit=float(posterior_bundle.get("logit", 0.0)),
-            threshold=cell_threshold,
+            threshold=float(threshold),
             decision="suspicious" if is_suspicious else "not_suspicious",
             hard_label=effective_hard_label.label if effective_hard_label else "",
             active_oracle_label=(
@@ -4051,7 +3675,6 @@ def _export_cleanem_results(
         )
 
         results.append({
-            "cell_key": cell_key,
             "row_index": cell_record.row_index,
             "column": cell_record.column,
             "value": cell_record.raw_value,
@@ -4117,8 +3740,6 @@ def _export_cleanem_results(
 
 
 def run_clean_em_mode(args: argparse.Namespace) -> None:
-    if not 0.0 <= float(args.rule_min_pass_rate) <= 1.0:
-        raise ValueError("--rule_min_pass_rate must be between 0 and 1")
     os.makedirs(args.output_dir, exist_ok=True)
     dataset_name = os.path.splitext(os.path.basename(args.dirty_csv))[0]
 
@@ -4135,7 +3756,6 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
     logger.info(f"  - calib_min_clean_pass (legacy/unused): {args.calib_min_clean_pass}")
     logger.info(f"  - calib_max_dirty_pass (legacy/unused): {args.calib_max_dirty_pass}")
     logger.info(f"  - score_threshold (cell_posterior): {args.score_threshold}")
-    logger.info(f"  - rule_min_pass_rate: {args.rule_min_pass_rate}")
     logger.info(f"  - active_label_budget: {args.active_label_budget}")
     logger.info(f"  - active_query_strategy: {args.active_query_strategy}")
     logger.info(f"  - evidence_gating: {not args.disable_evidence_gating}")
@@ -4182,7 +3802,6 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         rule_pool, cached_semantics = _load_rule_pool_cache(
             args.rule_pool_cache,
             df,
-            rule_min_pass_rate=args.rule_min_pass_rate,
         )
         for column in df.columns:
             metadata[column]["semantics"] = dict(cached_semantics[column])
@@ -4191,12 +3810,7 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         column_semantics = factory.infer_column_semantics(metadata)
         for column, semantics in column_semantics.items():
             metadata[column]["semantics"] = asdict(semantics)
-        rule_pool = _build_clean_rule_pool(
-            df,
-            metadata,
-            factory,
-            rule_min_pass_rate=args.rule_min_pass_rate,
-        )
+        rule_pool = _build_clean_rule_pool(df, metadata, factory)
         if args.rule_pool_cache:
             _save_rule_pool_cache(
                 args.rule_pool_cache,
@@ -4394,24 +4008,6 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
             selected_cell_keys,
         )
 
-    structural_missing_update = _update_structural_missing_from_labels(
-        value_observations,
-        cell_observations,
-        metadata,
-        value_registry,
-        cell_registry,
-        active_labels,
-    )
-    logger.info(
-        f"structural_missing_label_update: {structural_missing_update}"
-    )
-    if structural_missing_update["updated"]:
-        evidence_matrix = build_cell_evidence_matrix(
-            cell_registry,
-            value_observations,
-            cell_observations,
-        )
-
     fixed_calibration = None
     if not args.disable_evidence_gating:
         # Learn globally comparable evidence weights from the raw observations.
@@ -4511,21 +4107,6 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         cell_posteriors,
         calibration_trace,
     )
-    column_thresholds = (
-        {}
-        if args.disable_column_thresholds
-        else _learn_column_thresholds(
-            cell_registry,
-            cell_posteriors,
-            active_labels,
-            args.score_threshold,
-            min_labels=args.column_threshold_min_labels,
-        )
-    )
-    logger.info(
-        "column_decision_thresholds: "
-        f"base={args.score_threshold}, learned={dict(sorted(column_thresholds.items()))}"
-    )
     explanation_traces = _build_explanation_traces(
         metadata,
         cell_registry,
@@ -4536,7 +4117,6 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         loeo_contributions,
         calibration_trace,
         args.score_threshold,
-        column_thresholds=column_thresholds,
     )
     logger.info(
         "Explanation traces built: "
@@ -4705,14 +4285,9 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         detected_errors = [
             {"row_index": item["row_index"], "column": item["column"]}
             for item in results
-            if (
-                item.get("cell_key") in explanation_traces
-                and explanation_traces[item["cell_key"]].decision == "suspicious"
-            )
+            if pd.notna(item["cell_posterior"]) and item["cell_posterior"] >= args.score_threshold
         ]
-        logger.info(
-            f"Detected {len(detected_errors)} cells using global/column thresholds"
-        )
+        logger.info(f"Detected {len(detected_errors)} cells with cell_posterior >= {args.score_threshold}")
         metrics = judge.evaluate_with_ground_truth(df, clean_df, detected_errors)
         judge.print_evaluation_summary(metrics)
         if hasattr(metrics, "get"):

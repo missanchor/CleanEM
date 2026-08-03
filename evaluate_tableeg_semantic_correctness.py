@@ -76,15 +76,55 @@ def safe_div(numerator, denominator):
     return numerator / denominator if denominator else 0.0
 
 
-def rule_explanation_alignment(annotation, trace):
+def parse_tuple_pair_rows(value):
+    return [int(item) for item in re.findall(r"\d+", str(value or ""))]
+
+
+def gold_determinant_columns(constraint):
+    columns = []
+    pattern = re.compile(
+        r"The\s+([A-Za-z0-9_]+)\s+of\s+Row\s+\d+\s+is\s+equal\s+to\s+"
+        r"the\s+([A-Za-z0-9_]+)\s+of\s+Row\s+\d+",
+        re.IGNORECASE,
+    )
+    for left, right in pattern.findall(str(constraint or "")):
+        if left.lower() == right.lower():
+            columns.append(left)
+    return columns
+
+
+def rule_explanation_alignment(
+    annotation,
+    trace,
+    row_id_to_index,
+):
     constraint = str(annotation.get("constraint") or "").strip().lower()
     if not constraint:
-        return None, None, None, None, None
+        return None
+    gold_target_row_id = str(annotation.get("row_id"))
+    gold_reference_rows = {
+        row_id_to_index[str(row_id)]
+        for row_id in parse_tuple_pair_rows(annotation.get("tuple_pairs"))
+        if str(row_id) != gold_target_row_id
+        and str(row_id) in row_id_to_index
+    }
+    gold_determinants = {
+        value.lower()
+        for value in gold_determinant_columns(annotation.get("constraint"))
+    }
+    gold_dependent = str(annotation.get("column") or "").strip().lower()
+
     type_aligned = False
     column_aligned = False
     detail_available = False
     reference_available = False
     expected_value_matches = None
+    determinant_matches = False
+    dependent_matches = False
+    column_pair_matches = False
+    reference_hit_at_1 = False
+    reference_hit_at_5 = False
+    grounded_matches = False
     for evidence in support_evidence(trace, 4):
         if evidence_error_type(evidence) != "rule_violation":
             continue
@@ -116,9 +156,40 @@ def rule_explanation_alignment(annotation, trace):
         detail_available = detail_available or bool(
             determinant and dependent and rule_text
         )
-        reference_available = reference_available or bool(
-            metadata.get("reference_rows")
+        determinant_match = (
+            determinant.lower() in gold_determinants
+            if determinant and gold_determinants
+            else False
         )
+        dependent_match = bool(
+            dependent and dependent.lower() == gold_dependent
+        )
+        determinant_matches = determinant_matches or determinant_match
+        dependent_matches = dependent_matches or dependent_match
+        column_pair_match = determinant_match and dependent_match
+        column_pair_matches = column_pair_matches or column_pair_match
+
+        references = metadata.get("reference_rows") or []
+        if not isinstance(references, list):
+            references = [references]
+        normalized_references = []
+        for value in references:
+            try:
+                normalized_references.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        reference_available = reference_available or bool(normalized_references)
+        hit_at_1 = bool(
+            normalized_references
+            and normalized_references[0] in gold_reference_rows
+        )
+        hit_at_5 = bool(
+            set(normalized_references[:5]) & gold_reference_rows
+        )
+        reference_hit_at_1 = reference_hit_at_1 or hit_at_1
+        reference_hit_at_5 = reference_hit_at_5 or hit_at_5
+
+        candidate_match = None
         if metadata.get("expected_value") is not None:
             candidate_match = (
                 normalize(metadata.get("expected_value"))
@@ -129,13 +200,25 @@ def rule_explanation_alignment(annotation, trace):
                 if expected_value_matches is None
                 else expected_value_matches or candidate_match
             )
-    return (
-        type_aligned,
-        column_aligned,
-        detail_available,
-        reference_available,
-        expected_value_matches,
-    )
+        grounded_matches = grounded_matches or bool(
+            column_pair_match and hit_at_5 and candidate_match
+        )
+    return {
+        "type_aligned": type_aligned,
+        "column_aligned": column_aligned,
+        "detail_available": detail_available,
+        "reference_available": reference_available,
+        "expected_value_matches": expected_value_matches,
+        "determinant_matches": determinant_matches,
+        "dependent_matches": dependent_matches,
+        "column_pair_matches": column_pair_matches,
+        "reference_hit_at_1": reference_hit_at_1,
+        "reference_hit_at_5": reference_hit_at_5,
+        "grounded_matches": grounded_matches,
+        "gold_reference_rows": sorted(gold_reference_rows),
+        "gold_determinants": sorted(gold_determinants),
+        "gold_dependent": gold_dependent,
+    }
 
 
 def evaluate_dataset(name, trace_path, dataset_dir, excluded_columns=None):
@@ -186,6 +269,14 @@ def evaluate_dataset(name, trace_path, dataset_dir, excluded_columns=None):
     rule_detail_scores = []
     rule_reference_scores = []
     rule_expected_value_scores = []
+    rule_determinant_scores = []
+    rule_dependent_scores = []
+    rule_column_pair_scores = []
+    rule_reference_hit_at_1_scores = []
+    rule_reference_hit_at_5_scores = []
+    grounded_rule_scores = []
+    gold_rule_violations = 0
+    detected_rule_violations = 0
     for annotation in annotations:
         if str(annotation.get("valid_key", "")).lower() != "true":
             continue
@@ -212,22 +303,42 @@ def evaluate_dataset(name, trace_path, dataset_dir, excluded_columns=None):
                 "normalized": normalize(repair_candidate) == normalize(right_value),
             })
 
+        alignment = None
+        if gold_type == "rule_violation":
+            gold_rule_violations += 1
         if gold_type == "rule_violation" and detected:
-            (
-                type_aligned,
-                column_aligned,
-                detail_available,
-                reference_available,
-                expected_value_matches,
-            ) = rule_explanation_alignment(annotation, trace)
-            if type_aligned is not None:
-                constraint_type_scores.append(float(type_aligned))
-                constraint_column_scores.append(float(column_aligned))
-                rule_detail_scores.append(float(detail_available))
-                rule_reference_scores.append(float(reference_available))
-                if expected_value_matches is not None:
+            detected_rule_violations += 1
+            alignment = rule_explanation_alignment(
+                annotation,
+                trace,
+                row_id_to_index,
+            )
+            if alignment is not None:
+                constraint_type_scores.append(float(alignment["type_aligned"]))
+                constraint_column_scores.append(float(alignment["column_aligned"]))
+                rule_detail_scores.append(float(alignment["detail_available"]))
+                rule_reference_scores.append(float(alignment["reference_available"]))
+                rule_determinant_scores.append(
+                    float(alignment["determinant_matches"])
+                )
+                rule_dependent_scores.append(
+                    float(alignment["dependent_matches"])
+                )
+                rule_column_pair_scores.append(
+                    float(alignment["column_pair_matches"])
+                )
+                rule_reference_hit_at_1_scores.append(
+                    float(alignment["reference_hit_at_1"])
+                )
+                rule_reference_hit_at_5_scores.append(
+                    float(alignment["reference_hit_at_5"])
+                )
+                grounded_rule_scores.append(
+                    float(alignment["grounded_matches"])
+                )
+                if alignment["expected_value_matches"] is not None:
                     rule_expected_value_scores.append(
-                        float(expected_value_matches)
+                        float(alignment["expected_value_matches"])
                     )
 
         annotation_records.append({
@@ -236,6 +347,7 @@ def evaluate_dataset(name, trace_path, dataset_dir, excluded_columns=None):
             "predicted_type": predicted_type,
             "correct_type": correct_type,
             "repair_recommended": repair_recommended,
+            "rule_alignment": alignment,
         })
 
     valid_annotations = len(annotation_records)
@@ -311,6 +423,31 @@ def evaluate_dataset(name, trace_path, dataset_dir, excluded_columns=None):
         "rule_expected_value_accuracy": safe_div(
             sum(rule_expected_value_scores), len(rule_expected_value_scores)
         ),
+        "rule_determinant_column_accuracy": safe_div(
+            sum(rule_determinant_scores), len(rule_determinant_scores)
+        ),
+        "rule_dependent_column_accuracy": safe_div(
+            sum(rule_dependent_scores), len(rule_dependent_scores)
+        ),
+        "rule_column_pair_accuracy": safe_div(
+            sum(rule_column_pair_scores), len(rule_column_pair_scores)
+        ),
+        "rule_reference_row_hit_at_1": safe_div(
+            sum(rule_reference_hit_at_1_scores),
+            len(rule_reference_hit_at_1_scores),
+        ),
+        "rule_reference_row_hit_at_5": safe_div(
+            sum(rule_reference_hit_at_5_scores),
+            len(rule_reference_hit_at_5_scores),
+        ),
+        "conditional_grounded_rule_accuracy": safe_div(
+            sum(grounded_rule_scores), len(grounded_rule_scores)
+        ),
+        "end_to_end_grounded_rule_accuracy": safe_div(
+            sum(grounded_rule_scores), gold_rule_violations
+        ),
+        "gold_rule_violations": gold_rule_violations,
+        "detected_rule_violations": detected_rule_violations,
         "constraint_evaluated": len(constraint_type_scores),
         "rule_expected_value_evaluated": len(rule_expected_value_scores),
         "repair_evaluated": len(repairs),

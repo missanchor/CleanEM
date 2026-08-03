@@ -4,10 +4,45 @@ import pandas as pd
 
 import evaluate_tableeg_semantic_correctness as tableeg_eval
 import main
-from cleanem_models import EvidenceContribution
+from cleanem_models import EvidenceContribution, EvidenceObservation
 
 
 class RelationshipExplanationTests(unittest.TestCase):
+    def test_agent_pattern_rule_scale_only_changes_agent_pattern_evidence(self):
+        agent_pattern = EvidenceObservation(
+            target_scope="cell",
+            target_key="0::code",
+            source_id="pattern_mismatch",
+            family="pattern",
+            polarity="dirty",
+            strength=0.8,
+            hard=False,
+            reason_code="pattern_mismatch",
+            metadata={"rule_pool_source": "agentic_clean_rule_pool"},
+        )
+        deterministic_pattern = EvidenceObservation(
+            target_scope="cell",
+            target_key="0::code",
+            source_id="regex_fail",
+            family="pattern",
+            polarity="dirty",
+            strength=0.6,
+            hard=False,
+            reason_code="regex_fail",
+        )
+        counts = main._scale_agent_pattern_rule_evidence(
+            {},
+            {"0::code": [agent_pattern, deterministic_pattern]},
+            0.5,
+        )
+        self.assertAlmostEqual(agent_pattern.strength, 0.4)
+        self.assertAlmostEqual(deterministic_pattern.strength, 0.6)
+        self.assertEqual(counts, {"cell": 1, "dirty": 1})
+        self.assertEqual(
+            agent_pattern.metadata["agent_pattern_rule_scale"],
+            0.5,
+        )
+
     def test_pattern_mismatch_keeps_each_failed_agent_rule(self):
         df = pd.DataFrame({"code": ["12345", "12x45", "99999"]})
         metadata = {
@@ -90,8 +125,10 @@ class RelationshipExplanationTests(unittest.TestCase):
     def test_contextual_evidence_keeps_rule_details(self):
         df = pd.DataFrame(
             {
-                "brewery_id": ["1", "1", "1", "2", "2", "2"],
+                "brewery_id": ["1", "1", "1", "1", "1", "2", "2", "2"],
                 "city": [
+                    "San Diego",
+                    "San Diego",
                     "San Diego",
                     "San Diego",
                     "San Diego CA",
@@ -109,15 +146,16 @@ class RelationshipExplanationTests(unittest.TestCase):
         )
         evidence = next(
             item
-            for item in observations["2::city"]
+            for item in observations["4::city"]
             if item.source_id == "contextual_disagreement"
         )
         self.assertEqual(evidence.metadata["determinant_column"], "brewery_id")
         self.assertEqual(evidence.metadata["dependent_column"], "city")
         self.assertEqual(evidence.metadata["expected_value"], "San Diego")
         self.assertEqual(evidence.metadata["observed_value"], "San Diego CA")
-        self.assertEqual(evidence.metadata["reference_rows"], [0, 1])
+        self.assertEqual(evidence.metadata["reference_rows"], [0, 1, 2, 3])
         self.assertTrue(evidence.metadata["rule_violated"])
+        self.assertEqual(evidence.metadata["validation_status"], "data_validated")
 
         contribution = EvidenceContribution(
             target_scope="cell",
@@ -140,7 +178,22 @@ class RelationshipExplanationTests(unittest.TestCase):
         self.assertIn("city", text)
         self.assertIn("San Diego CA", text)
         self.assertIn("San Diego", text)
-        self.assertIn("supporting rows: 1, 2", text)
+        self.assertIn("supporting rows: 1, 2, 3, 4", text)
+
+    def test_contextual_evidence_abstains_on_weak_majority(self):
+        df = pd.DataFrame(
+            {
+                "brewery_id": ["1", "1", "1"],
+                "city": ["San Diego", "San Diego", "San Diego CA"],
+            }
+        )
+        observations = {}
+        main._add_contextual_consensus_evidence(
+            df,
+            {"brewery_id": {}, "city": {}},
+            observations,
+        )
+        self.assertNotIn("2::city", observations)
 
     def test_profile_relationship_keeps_columns_and_rule(self):
         df = pd.DataFrame(
@@ -196,10 +249,13 @@ class RelationshipExplanationTests(unittest.TestCase):
 
     def test_tableeg_alignment_reads_shared_relation_fields(self):
         annotation = {
+            "row_id": "2",
+            "column": "city",
             "constraint": (
                 "Constraint Violation: The brewery_id of Row 1 is equal to "
                 "the brewery_id of Row 2, and the city values differ."
             ),
+            "tuple_pairs": "(1, 2)",
             "right_value": "San Diego",
         }
         trace = {
@@ -223,18 +279,19 @@ class RelationshipExplanationTests(unittest.TestCase):
                 }
             ],
         }
-        (
-            type_aligned,
-            column_aligned,
-            detail_available,
-            reference_available,
-            expected_value_matches,
-        ) = tableeg_eval.rule_explanation_alignment(annotation, trace)
-        self.assertTrue(type_aligned)
-        self.assertTrue(column_aligned)
-        self.assertTrue(detail_available)
-        self.assertTrue(reference_available)
-        self.assertTrue(expected_value_matches)
+        alignment = tableeg_eval.rule_explanation_alignment(
+            annotation,
+            trace,
+            {"1": 1, "2": 2},
+        )
+        self.assertTrue(alignment["type_aligned"])
+        self.assertTrue(alignment["column_aligned"])
+        self.assertTrue(alignment["detail_available"])
+        self.assertTrue(alignment["reference_available"])
+        self.assertTrue(alignment["expected_value_matches"])
+        self.assertTrue(alignment["column_pair_matches"])
+        self.assertTrue(alignment["reference_hit_at_1"])
+        self.assertTrue(alignment["grounded_matches"])
 
 
 if __name__ == "__main__":
