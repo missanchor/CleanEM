@@ -550,8 +550,10 @@ def _build_clean_rule_pool(
         "column_relationship": "relationship",
     }
     pool: Dict[str, List[Dict[str, Any]]] = {}
+    raw_proposals: Dict[str, List[Dict[str, Any]]] = {}
     for column, rules in clean_rules.items():
         col_pool: List[Dict[str, Any]] = []
+        col_proposals: List[Dict[str, Any]] = []
         for idx, (agent_name, rule_str) in enumerate(rules):
             family = family_map.get(agent_name)
             if not family:
@@ -564,6 +566,7 @@ def _build_clean_rule_pool(
                 rule_str,
                 min_pass_rate=rule_min_pass_rate,
             )
+            col_proposals.append({"agent": agent_name, "family": family, "rule_name": rule_name, "rule_str": rule_str, "validation": dict(validation)})
             if rule_func is None:
                 _log_rule_rejection(column, rule_name, rule_str, validation)
                 continue
@@ -578,9 +581,10 @@ def _build_clean_rule_pool(
                     "validation": dict(validation),
                 }
             )
+        raw_proposals[column] = col_proposals
         if col_pool:
             pool[column] = col_pool
-    return pool
+    return pool, raw_proposals
 
 
 def _dataframe_fingerprint(df: pd.DataFrame) -> str:
@@ -4266,12 +4270,15 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         column_semantics = factory.infer_column_semantics(metadata)
         for column, semantics in column_semantics.items():
             metadata[column]["semantics"] = asdict(semantics)
-        rule_pool = _build_clean_rule_pool(
+        rule_pool, raw_rule_proposals = _build_clean_rule_pool(
             df,
             metadata,
             factory,
             rule_min_pass_rate=args.rule_min_pass_rate,
         )
+        raw_rule_path = os.path.join(args.output_dir, f"{dataset_name}_raw_rule_proposals.json")
+        _write_json_atomic(raw_rule_path, {"version": 1, "dataframe_fingerprint": _dataframe_fingerprint(df), "columns": list(df.columns), "proposals": raw_rule_proposals})
+        logger.info(f"Saved raw rule proposals to: {raw_rule_path}")
         if args.rule_pool_cache:
             _save_rule_pool_cache(
                 args.rule_pool_cache,
