@@ -81,7 +81,7 @@ class BaseAgent:
             return ""
         return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
 
-    def _call_llm(self, prompt: str, max_tokens: int = LLM_MAX_TOKENS, system_prompt: str = None, temperature: float = 0.1) -> str:
+    def _call_llm(self, prompt: str, max_tokens: int = LLM_MAX_TOKENS, system_prompt: str = None, temperature: float = 0.1, extra_body: Dict[str, Any] = None) -> str:
         """Call the LLM with a prompt."""
         try:
             system_msg = system_prompt if system_prompt else self._get_system_prompt()
@@ -94,7 +94,8 @@ class BaseAgent:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=temperature,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                extra_body=extra_body,
             )
             raw_content = response.choices[0].message.content or ""
             cleaned = self._strip_think_tags(raw_content).strip()
@@ -1863,6 +1864,58 @@ lambda value, row=None: <expression>
         return rules
 
 
+class TableRelationshipAgent(BaseAgent):
+    """Propose semantic cross-row functional dependencies for one table."""
+
+    def _get_system_prompt(self) -> str:
+        return (
+            "You are a data quality expert. Select only semantically meaningful "
+            "cross-row functional dependencies from the supplied candidate summaries. "
+            "Do not write Python, lambda functions, SQL, or explanations outside JSON."
+        )
+
+    def infer_cross_row_fd_candidates(
+        self,
+        table_summary: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+        prompt = "\n".join([
+            "A candidate X -> Y means rows sharing X should normally share Y.",
+            "Select only relationships that are meaningful in the table domain, not merely correlated.",
+            "Choose the entity-to-attribute direction. Do not treat a time, measurement, or other reusable attribute as an identifier merely because it is correlated with a record identifier.",
+            "For determinant_granularity, use instance only when X identifies one concrete record, event, or occurrence. Use recurring_entity when X identifies a reusable entity, service, product, customer, template, or other entity that can occur in multiple instances. Use unknown when the table semantics do not establish either.",
+            "For dependent_variability, use invariant only when Y is a stable attribute of X. Use instance_varying when Y can normally vary across occurrences of the same X. Use unknown when the semantics do not establish either.",
+            "Operational outcomes, observations, measurements, recorded timestamps, and realized values are normally instance_varying. Do not call them invariant merely because the observed table values are mostly consistent; label them invariant only when the schema establishes that they are a stable property of the reusable entity.",
+            "For example, a reusable service, product, customer, or template can have many instances. Its event outcome or observation requires an occurrence-level key, whereas a stable specification or classification can be invariant.",
+            "An exact functional dependency is unsafe when a recurring_entity determines an instance_varying attribute. Do not propose such a rule; return no rule instead when the granularity is uncertain.",
+            "Return exactly one JSON object with this schema:",
+            '{"rules":[{"rule_id":"fd_short_name","scope":"cross_row","type":"functional_dependency","determinant_columns":["X"],"dependent_column":"Y","determinant_granularity":"instance|recurring_entity|unknown","dependent_variability":"invariant|instance_varying|unknown","claim":"Rows with the same X normally share Y"}]}',
+            "Use only candidate column names supplied below. Return an empty rules array when none is justified.",
+            "Candidate summaries:",
+            json.dumps(table_summary, ensure_ascii=False),
+        ])
+        response = self._call_llm(
+            prompt,
+            max_tokens=512,
+            temperature=0.0,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        payload: Any = {}
+        try:
+            candidate = response.strip()
+            fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", candidate, re.I)
+            if fenced:
+                candidate = fenced.group(1).strip()
+            object_match = re.search(r"\{[\s\S]*\}", candidate)
+            if object_match:
+                candidate = object_match.group(0)
+            payload = json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        rules = payload.get("rules") if isinstance(payload, dict) else []
+        if not isinstance(rules, list):
+            rules = []
+        return [dict(rule) for rule in rules if isinstance(rule, dict)], self.get_last_prompt_info()
+
 class CleanRuleReflectionAgent(BaseAgent):
     def _get_system_prompt(self) -> str:
         return """You are a data quality expert specializing in refining CLEAN validation rules.
@@ -2470,6 +2523,14 @@ Be PRECISE and CONTRACT-ONLY - minimize creative interpretation to avoid new con
 
 class AgentFactory:
     """Factory to create appropriate agents based on column type."""
+    def infer_table_relationship_candidates(
+        self,
+        table_summary: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+        """Make one table-level LLM call for cross-row FD proposals."""
+        agent = TableRelationshipAgent(self.base_url, self.model)
+        return agent.infer_cross_row_fd_candidates(table_summary)
+
 
     def __init__(self, base_url: str = "http://localhost:8000/v1", model: str = None, max_workers: int = 1):
         """Initialize factory with base URL and model."""

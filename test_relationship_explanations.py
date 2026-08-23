@@ -225,13 +225,173 @@ class RelationshipExplanationTests(unittest.TestCase):
             "identifier_semantic_agreement",
         )
 
-    def test_temporal_identifier_low_support_disagreement(self):
+    def test_llm_relationship_validation_rejects_invalid_candidates(self):
+        df = pd.DataFrame({
+            "flight": ["A", "A", "A"],
+            "act_dep_time": ["09:00", "09:00", "09:10"],
+        })
+        summary = {
+            "candidates": [{
+                "determinant_column": "flight",
+                "dependent_column": "act_dep_time",
+                "median_dominant_ratio": 0.9,
+            }],
+        }
+        accepted, reports = main._validate_llm_relationship_rule_candidates(
+            df,
+            [
+                {
+                    "scope": "cross_row",
+                    "type": "functional_dependency",
+                    "determinant_columns": ["flight"],
+                    "dependent_column": "flight",
+                    "determinant_granularity": "instance",
+                    "dependent_variability": "invariant",
+                },
+                {
+                    "scope": "cross_row",
+                    "type": "conditional_dependency",
+                    "determinant_columns": ["flight"],
+                    "dependent_column": "act_dep_time",
+                },
+                {
+                    "rule_id": "fd_flight_dep",
+                    "scope": "cross_row",
+                    "type": "functional_dependency",
+                    "determinant_columns": ["flight"],
+                    "dependent_column": "act_dep_time",
+                    "determinant_granularity": "instance",
+                    "dependent_variability": "invariant",
+                    "claim": "A flight normally has one actual departure time.",
+                },
+            ],
+            summary,
+        )
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(reports[0]["reason"], "same_determinant_and_dependent")
+        self.assertEqual(reports[1]["reason"], "unsupported_type")
+        self.assertTrue(reports[2]["accepted"])
+
+    def test_llm_relationship_validation_rejects_instance_varying_dependent(
+        self,
+    ):
+        df = pd.DataFrame({
+            "service": ["A", "A", "A"],
+            "observed_time": ["09:00", "09:00", "09:10"],
+        })
+        summary = {
+            "candidates": [{
+                "determinant_column": "service",
+                "dependent_column": "observed_time",
+                "median_dominant_ratio": 0.9,
+            }],
+        }
+        accepted, reports = main._validate_llm_relationship_rule_candidates(
+            df,
+            [{
+                "scope": "cross_row",
+                "type": "functional_dependency",
+                "determinant_columns": ["service"],
+                "dependent_column": "observed_time",
+                "determinant_granularity": "recurring_entity",
+                "dependent_variability": "instance_varying",
+            }],
+            summary,
+        )
+        self.assertEqual(accepted, [])
+        self.assertEqual(
+            reports[0]["reason"],
+            "instance_varying_dependent_requires_instance_key",
+        )
+
+    def test_llm_relationship_validation_accepts_recurring_entity_invariant(self):
+        df = pd.DataFrame({
+            "product": ["A", "A", "B"],
+            "product_family": ["standard", "standard", "premium"],
+        })
+        summary = {
+            "candidates": [{
+                "determinant_column": "product",
+                "dependent_column": "product_family",
+                "median_dominant_ratio": 1.0,
+            }],
+        }
+        accepted, reports = main._validate_llm_relationship_rule_candidates(
+            df,
+            [{
+                "scope": "cross_row",
+                "type": "functional_dependency",
+                "determinant_columns": ["product"],
+                "dependent_column": "product_family",
+                "determinant_granularity": "recurring_entity",
+                "dependent_variability": "invariant",
+            }],
+            summary,
+        )
+        self.assertEqual(len(accepted), 1)
+        self.assertTrue(reports[0]["accepted"])
+        self.assertEqual(
+            accepted[0]["validation"]["determinant_granularity"],
+            "recurring_entity",
+        )
+
+    def test_llm_fd_allows_low_support_soft_disagreement(self):
         df = pd.DataFrame(
             {
                 "flight": ["A", "A", "A", "A", "B", "B", "B", "B"],
-                "act_arr_time": [
-                    "9:00 a.m.", "9:00 a.m.", "9:10 a.m.", "9:20 a.m.",
-                    "10:00 a.m.", "10:00 a.m.", "10:00 a.m.", "10:00 a.m.",
+                "act_dep_time": [
+                    "09:00", "09:00", "09:10", "09:20",
+                    "10:00", "10:00", "10:00", "10:00",
+                ],
+            }
+        )
+        relationship_rule = {
+            "rule_id": "fd_flight_act_dep_time",
+            "scope": "cross_row",
+            "type": "functional_dependency",
+            "determinant_column": "flight",
+            "dependent_column": "act_dep_time",
+            "claim": "Rows with the same flight normally share actual departure time.",
+            "proposal_source": "llm",
+            "validation": {"candidate_statistics": {"predictiveness": 0.4}},
+        }
+        observations = {}
+        main._add_contextual_consensus_evidence(
+            df,
+            {
+                "flight": {"semantics": {"archetype": "identifier"}},
+                "act_dep_time": {
+                    "semantics": {"archetype": "temporal_measure"},
+                },
+            },
+            observations,
+            validated_relationship_rules=[relationship_rule],
+        )
+        evidence = next(
+            item
+            for item in observations["2::act_dep_time"]
+            if item.source_id == "llm_fd_disagreement"
+        )
+        self.assertFalse(evidence.hard)
+        self.assertEqual(
+            evidence.reason_code,
+            "llm_validated_functional_dependency",
+        )
+        self.assertEqual(
+            evidence.metadata["relationship_rule_id"],
+            "fd_flight_act_dep_time",
+        )
+        self.assertEqual(evidence.metadata["proposal_source"], "llm")
+        self.assertEqual(evidence.metadata["expected_value"], "09:00")
+        self.assertEqual(evidence.metadata["reference_rows"], [0, 1])
+
+    def test_llm_fd_abstains_when_group_mode_is_tied(self):
+        df = pd.DataFrame(
+            {
+                "flight": ["A", "A", "A", "A", "B", "B", "B", "B"],
+                "act_dep_time": [
+                    "09:00", "09:00", "09:10", "09:10",
+                    "10:00", "10:00", "10:00", "10:00",
                 ],
             }
         )
@@ -240,22 +400,23 @@ class RelationshipExplanationTests(unittest.TestCase):
             df,
             {
                 "flight": {"semantics": {"archetype": "identifier"}},
-                "act_arr_time": {
+                "act_dep_time": {
                     "semantics": {"archetype": "temporal_measure"},
                 },
             },
             observations,
+            validated_relationship_rules=[{
+                "rule_id": "fd_flight_act_dep_time",
+                "scope": "cross_row",
+                "type": "functional_dependency",
+                "determinant_column": "flight",
+                "dependent_column": "act_dep_time",
+                "claim": "Same flight should share actual departure time.",
+                "proposal_source": "llm",
+            }],
         )
-        evidence = next(
-            item
-            for item in observations["2::act_arr_time"]
-            if item.source_id == "contextual_disagreement"
-        )
-        self.assertEqual(
-            evidence.metadata["validation_status"],
-            "temporal_identifier_low_support",
-        )
-        self.assertTrue(evidence.hard)
+        self.assertNotIn("2::act_dep_time", observations)
+        self.assertNotIn("3::act_dep_time", observations)
 
     def test_profile_relationship_keeps_columns_and_rule(self):
 

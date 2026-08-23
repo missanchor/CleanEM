@@ -116,8 +116,9 @@ CONTEXT_MIN_EXPECTED_PROBABILITY = 0.80
 CONTEXT_MIN_PREDICTIVENESS = 0.20
 CONTEXT_IDENTIFIER_CLEAN_MIN_GROUP_SUPPORT = 3
 CONTEXT_IDENTIFIER_CLEAN_MIN_PREDICTIVENESS = 0.20
-CONTEXT_TEMPORAL_IDENTIFIER_MIN_EXPECTED_PROBABILITY = 0.50
-CONTEXT_TEMPORAL_IDENTIFIER_MAX_OBSERVED_SUPPORT = 5
+LLM_FD_MIN_GROUP_SUPPORT = 3
+LLM_FD_MIN_EXPECTED_SUPPORT = 2
+LLM_FD_MIN_EXPECTED_PROBABILITY = 0.50
 
 
 @dataclass
@@ -387,6 +388,19 @@ def parse_args() -> argparse.Namespace:
             "Load it when present; otherwise generate, validate, and save it."
         )
     )
+    parser.add_argument(
+        "--relationship_rule_cache",
+        default=None,
+        help=(
+            "Optional JSON cache for LLM-proposed and data-validated table-level "
+            "relationship rules. Load it when present; otherwise generate and save it."
+        ),
+    )
+    parser.add_argument(
+        "--disable_llm_relationship_rules",
+        action="store_true",
+        help="Disable table-level LLM functional-dependency evidence for ablation runs.",
+    )
     return parser.parse_args()
 
 
@@ -594,6 +608,40 @@ def _dataframe_fingerprint(df: pd.DataFrame) -> str:
     digest.update(schema.encode("utf-8"))
     digest.update(hashed)
     return digest.hexdigest()
+
+
+def _save_relationship_rule_cache(
+    path: str,
+    df: pd.DataFrame,
+    payload: Dict[str, Any],
+) -> None:
+    _write_json_atomic(path, {
+        "version": 1,
+        "dataframe_fingerprint": _dataframe_fingerprint(df),
+        "columns": list(df.columns),
+        **payload,
+    })
+
+
+def _load_relationship_rule_cache(
+    path: str,
+    df: pd.DataFrame,
+) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("version") != 1:
+        raise ValueError(
+            f"Unsupported relationship-rule cache version: {payload.get('version')}"
+        )
+    if payload.get("columns") != list(df.columns):
+        raise ValueError("Relationship-rule cache columns do not match the dataset")
+    if payload.get("dataframe_fingerprint") != _dataframe_fingerprint(df):
+        raise ValueError("Relationship-rule cache fingerprint does not match the dataset")
+    rules = payload.get("validated_rules") or []
+    if not isinstance(rules, list) or any(not isinstance(rule, dict) for rule in rules):
+        raise ValueError("Relationship-rule cache contains invalid validated rules")
+    return payload
+
 
 
 def _write_json_atomic(path: str, payload: Dict[str, Any]) -> None:
@@ -2570,6 +2618,229 @@ def _ensure_structural_missing_query_coverage(
         "inserted": inserted,
         "replaced": replaced,
     }
+def _build_table_relationship_summary(
+    df: pd.DataFrame,
+    metadata: Dict[str, Dict[str, Any]],
+    max_candidates: int = 24,
+) -> Dict[str, Any]:
+    """Summarize statistically viable FD pairs without exposing the full table."""
+    signatures = {
+        column: [_normalize_signature(value) for value in df[column].tolist()]
+        for column in df.columns
+    }
+    representatives = {
+        column: {
+            signature: value
+            for signature, value in zip(signatures[column], df[column].tolist())
+        }
+        for column in df.columns
+    }
+    determinant_archetypes = {"identifier", "closed_enum"}
+    dependent_archetypes = {"identifier", "closed_enum", "temporal_measure"}
+    columns = []
+    for column in df.columns:
+        semantics = metadata.get(column, {}).get("semantics") or {}
+        columns.append({
+            "name": column,
+            "archetype": str(semantics.get("archetype") or "unknown"),
+        })
+
+    candidates: List[Dict[str, Any]] = []
+    for determinant_column in df.columns:
+        determinant_semantics = metadata.get(determinant_column, {}).get("semantics") or {}
+        if determinant_semantics.get("archetype") not in determinant_archetypes:
+            continue
+        determinant_signatures = signatures[determinant_column]
+        for dependent_column in df.columns:
+            if dependent_column == determinant_column:
+                continue
+            dependent_semantics = metadata.get(dependent_column, {}).get("semantics") or {}
+            if dependent_semantics.get("archetype") not in dependent_archetypes:
+                continue
+            dependent_signatures = signatures[dependent_column]
+            grouped_counts: Dict[str, Counter] = defaultdict(Counter)
+            grouped_rows: Dict[str, Dict[str, List[int]]] = defaultdict(
+                lambda: defaultdict(list)
+            )
+            for row_idx, (determinant_sig, dependent_sig) in enumerate(
+                zip(determinant_signatures, dependent_signatures)
+            ):
+                if determinant_sig in {"<na>", "<empty>"} or dependent_sig in {"<na>", "<empty>"}:
+                    continue
+                grouped_counts[determinant_sig][dependent_sig] += 1
+                grouped_rows[determinant_sig][dependent_sig].append(row_idx)
+
+            eligible_groups = []
+            for determinant_sig, counts in grouped_counts.items():
+                group_total = int(sum(counts.values()))
+                if group_total < LLM_FD_MIN_GROUP_SUPPORT:
+                    continue
+                expected_sig, expected_count = counts.most_common(1)[0]
+                eligible_groups.append((
+                    determinant_sig,
+                    group_total,
+                    int(expected_count),
+                    float(expected_count / group_total),
+                    expected_sig,
+                ))
+            if not eligible_groups:
+                continue
+
+            predictiveness = _context_predictiveness(
+                dependent_signatures,
+                determinant_signatures,
+            )
+            examples = []
+            for determinant_sig, group_total, expected_count, expected_probability, expected_sig in sorted(
+                eligible_groups,
+                key=lambda item: (-item[1], -item[3], item[0]),
+            )[:2]:
+                examples.append({
+                    "determinant_value": str(
+                        representatives[determinant_column].get(
+                            determinant_sig, determinant_sig
+                        )
+                    ),
+                    "group_size": group_total,
+                    "dominant_dependent_value": str(
+                        representatives[dependent_column].get(expected_sig, expected_sig)
+                    ),
+                    "dominant_count": expected_count,
+                    "dominant_ratio": round(expected_probability, 4),
+                })
+            candidates.append({
+                "determinant_column": determinant_column,
+                "dependent_column": dependent_column,
+                "predictiveness": round(float(predictiveness), 4),
+                "repeated_group_count": len(eligible_groups),
+                "median_group_size": float(np.median([group[1] for group in eligible_groups])),
+                "max_group_size": max(group[1] for group in eligible_groups),
+                "median_dominant_ratio": round(
+                    float(np.median([group[3] for group in eligible_groups])), 4
+                ),
+                "examples": examples,
+            })
+
+    candidates.sort(
+        key=lambda item: (
+            -item["predictiveness"],
+            -item["max_group_size"],
+            item["dependent_column"],
+        )
+    )
+    # Preserve directional coverage: a highly predictive reverse relation must
+    # not crowd out the semantically meaningful direction before LLM review.
+    by_determinant: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for candidate in candidates:
+        by_determinant[candidate["determinant_column"]].append(candidate)
+    selected_candidates: List[Dict[str, Any]] = []
+    rank = 0
+    while len(selected_candidates) < max_candidates:
+        added = False
+        for determinant_column in sorted(by_determinant):
+            items = by_determinant[determinant_column]
+            if rank < len(items) and len(selected_candidates) < max_candidates:
+                selected_candidates.append(items[rank])
+                added = True
+        if not added:
+            break
+        rank += 1
+    return {
+        "row_count": int(len(df)),
+        "columns": columns,
+        "candidates": selected_candidates,
+    }
+
+
+def _validate_llm_relationship_rule_candidates(
+    df: pd.DataFrame,
+    raw_rules: List[Dict[str, Any]],
+    table_summary: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Validate the limited FD schema and bind every accepted proposal to data."""
+    candidate_by_pair = {
+        (str(item.get("determinant_column")), str(item.get("dependent_column"))): item
+        for item in table_summary.get("candidates") or []
+        if isinstance(item, dict)
+    }
+    accepted: List[Dict[str, Any]] = []
+    reports: List[Dict[str, Any]] = []
+    seen_rule_ids: Set[str] = set()
+    available_columns = set(df.columns)
+
+    for raw_rule in raw_rules:
+        report = {"proposal": dict(raw_rule), "accepted": False, "reason": ""}
+        determinant_columns = raw_rule.get("determinant_columns")
+        dependent_column = raw_rule.get("dependent_column")
+        determinant_granularity = raw_rule.get("determinant_granularity")
+        dependent_variability = raw_rule.get("dependent_variability")
+        if raw_rule.get("scope") != "cross_row":
+            report["reason"] = "unsupported_scope"
+        elif raw_rule.get("type") != "functional_dependency":
+            report["reason"] = "unsupported_type"
+        elif not isinstance(determinant_columns, list) or len(determinant_columns) != 1:
+            report["reason"] = "requires_one_determinant_column"
+        elif not isinstance(determinant_columns[0], str) or not isinstance(dependent_column, str):
+            report["reason"] = "invalid_column_name"
+        elif determinant_granularity not in {"instance", "recurring_entity", "unknown"}:
+            report["reason"] = "invalid_determinant_granularity"
+        elif dependent_variability not in {"invariant", "instance_varying", "unknown"}:
+            report["reason"] = "invalid_dependent_variability"
+        elif determinant_granularity == "unknown" or dependent_variability == "unknown":
+            report["reason"] = "ambiguous_semantic_granularity"
+        elif (
+            determinant_granularity == "recurring_entity"
+            and dependent_variability == "instance_varying"
+        ):
+            report["reason"] = "instance_varying_dependent_requires_instance_key"
+        else:
+            determinant_column = determinant_columns[0]
+            if determinant_column not in available_columns or dependent_column not in available_columns:
+                report["reason"] = "unknown_column"
+            elif determinant_column == dependent_column:
+                report["reason"] = "same_determinant_and_dependent"
+            elif (determinant_column, dependent_column) not in candidate_by_pair:
+                report["reason"] = "not_a_statistically_viable_candidate"
+            else:
+                rule_id = str(raw_rule.get("rule_id") or "").strip()
+                if not rule_id:
+                    rule_id = f"fd_{determinant_column}_{dependent_column}"
+                if rule_id in seen_rule_ids:
+                    report["reason"] = "duplicate_rule_id"
+                else:
+                    seen_rule_ids.add(rule_id)
+                    validation = {
+                        "schema": "cross_row_functional_dependency_v2",
+                        "candidate_statistics": candidate_by_pair[
+                            (determinant_column, dependent_column)
+                        ],
+                        "determinant_granularity": determinant_granularity,
+                        "dependent_variability": dependent_variability,
+                    }
+                    accepted_rule = {
+                        "rule_id": rule_id,
+                        "scope": "cross_row",
+                        "type": "functional_dependency",
+                        "determinant_column": determinant_column,
+                        "dependent_column": dependent_column,
+                        "determinant_granularity": determinant_granularity,
+                        "dependent_variability": dependent_variability,
+                        "claim": str(raw_rule.get("claim") or (
+                            f"Rows with the same '{determinant_column}' normally share "
+                            f"'{dependent_column}'"
+                        )),
+                        "proposal_source": "llm",
+                        "validation": validation,
+                    }
+                    accepted.append(accepted_rule)
+                    report.update({
+                        "accepted": True,
+                        "reason": "accepted",
+                        "validated_rule": accepted_rule,
+                    })
+        reports.append(report)
+    return accepted, reports
+
 
 
 def _entropy_from_counts(counts: Counter) -> float:
@@ -2618,6 +2889,7 @@ def _add_contextual_consensus_evidence(
     df: pd.DataFrame,
     metadata: Dict[str, Dict[str, Any]],
     cell_observations: Dict[str, List[EvidenceObservation]],
+    validated_relationship_rules: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Add generic row-context evidence learned from conditional concentration.
 
@@ -2630,6 +2902,16 @@ def _add_contextual_consensus_evidence(
     n_rows = len(df)
     if n_rows <= 1 or len(df.columns) <= 1:
         return
+
+    llm_rules_by_pair = {
+        (
+            str(rule.get("determinant_column")),
+            str(rule.get("dependent_column")),
+        ): rule
+        for rule in (validated_relationship_rules or [])
+        if rule.get("scope") == "cross_row"
+        and rule.get("type") == "functional_dependency"
+    }
 
     signatures_by_column = {
         column: [_normalize_signature(value) for value in df[column].tolist()]
@@ -2735,30 +3017,21 @@ def _add_contextual_consensus_evidence(
                     and predictiveness
                     >= CONTEXT_IDENTIFIER_CLEAN_MIN_PREDICTIVENESS
                 )
-                context_archetype = str(
-                    (
-                        metadata.get(context_column, {}).get("semantics") or {}
-                    ).get("archetype")
-                    or ""
+                llm_rule = llm_rules_by_pair.get(
+                    (context_column, target_column)
                 )
-                normalized_target_name = target_column.strip().lower()
-                temporal_identifier_disagreement_is_reliable = bool(
-                    target_archetype == "temporal_measure"
-                    and context_archetype == "identifier"
-                    and "act" in normalized_target_name
-                    and (
-                        "arr" in normalized_target_name
-                        or "arrival" in normalized_target_name
-                    )
-                    and group_total >= CONTEXT_MIN_GROUP_SUPPORT
-                    and support <= CONTEXT_TEMPORAL_IDENTIFIER_MAX_OBSERVED_SUPPORT
-                    and expected_probability
-                    >= CONTEXT_TEMPORAL_IDENTIFIER_MIN_EXPECTED_PROBABILITY
+                llm_low_support_disagreement_is_reliable = bool(
+                    llm_rule
+                    and target_sig != expected_sig
+                    and group_total >= LLM_FD_MIN_GROUP_SUPPORT
+                    and expected_count >= LLM_FD_MIN_EXPECTED_SUPPORT
+                    and expected_count > support
+                    and expected_probability >= LLM_FD_MIN_EXPECTED_PROBABILITY
                     and predictiveness >= CONTEXT_MIN_PREDICTIVENESS
                 )
                 disagreement_is_reliable = bool(
                     relation_is_reliable
-                    or temporal_identifier_disagreement_is_reliable
+                    or llm_low_support_disagreement_is_reliable
                 )
                 agreement_is_reliable = bool(
                     relation_is_reliable or identifier_agreement_is_reliable
@@ -2801,24 +3074,44 @@ def _add_contextual_consensus_evidence(
                         if relation_is_reliable
                         else "identifier_semantic_agreement"
                         if identifier_agreement_is_reliable
-                        else "temporal_identifier_low_support"
+                        else "llm_validated_functional_dependency"
                     ),
                     "agreement_reliability": (
                         "strict_relation"
                         if relation_is_reliable
                         else "identifier_semantic"
                         if identifier_agreement_is_reliable
-                        else "temporal_identifier_low_support"
+                        else "llm_validated_low_support"
                     ),
-                    "minimum_group_support": CONTEXT_MIN_GROUP_SUPPORT,
+                    "minimum_group_support": (
+                        CONTEXT_MIN_GROUP_SUPPORT
+                        if relation_is_reliable
+                        else LLM_FD_MIN_GROUP_SUPPORT
+                    ),
                     "minimum_expected_probability": (
                         CONTEXT_MIN_EXPECTED_PROBABILITY
+                        if relation_is_reliable
+                        else LLM_FD_MIN_EXPECTED_PROBABILITY
                     ),
                     "reference_rows": reference_rows,
                     "rule_violated": bool(target_sig != expected_sig),
                     "rule_text": (
-                        f"Rows with the same '{context_column}' value should "
+                        llm_rule.get("claim")
+                        if llm_rule
+                        else f"Rows with the same '{context_column}' value should "
                         f"normally share the dominant '{target_column}' value"
+                    ),
+                    "proposal_source": (
+                        llm_rule.get("proposal_source") if llm_rule else "data"
+                    ),
+                    "relationship_rule_id": (
+                        llm_rule.get("rule_id") if llm_rule else None
+                    ),
+                    "relationship_claim": (
+                        llm_rule.get("claim") if llm_rule else None
+                    ),
+                    "relationship_validation": (
+                        llm_rule.get("validation") if llm_rule else None
                     ),
                 }
 
@@ -2839,18 +3132,25 @@ def _add_contextual_consensus_evidence(
                 _record_observation(cell_observations, EvidenceObservation(
                     target_scope="cell",
                     target_key=cell_key,
-                    source_id="contextual_disagreement",
-                    family="contextual",
+                    source_id=(
+                        "llm_fd_disagreement"
+                        if best_disagreement_metadata.get("validation_status")
+                        == "llm_validated_functional_dependency"
+                        else "contextual_disagreement"
+                    ),
+                    family=(
+                        "relationship"
+                        if best_disagreement_metadata.get("validation_status")
+                        == "llm_validated_functional_dependency"
+                        else "contextual"
+                    ),
                     polarity="dirty",
                     strength=best_disagreement,
-                    hard=bool(
-                        best_disagreement_metadata.get("validation_status")
-                        == "temporal_identifier_low_support"
-                    ),
+                    hard=False,
                     reason_code=(
-                        "temporal_identifier_low_support"
+                        "llm_validated_functional_dependency"
                         if best_disagreement_metadata.get("validation_status")
-                        == "temporal_identifier_low_support"
+                        == "llm_validated_functional_dependency"
                         else "conditional_value_disagreement"
                     ),
                     metadata=best_disagreement_metadata or {
@@ -2973,6 +3273,7 @@ def _extract_evidence(
     value_registry: Dict[str, ValueRecord],
     cell_registry: Dict[str, CellRecord],
     repair_candidates: Optional[Dict[str, List[RepairCandidate]]] = None,
+    validated_relationship_rules: Optional[List[Dict[str, Any]]] = None,
     enable_canonicalization_evidence: bool = True,
     enable_evidence_gating: bool = True,
     defer_evidence_gating: bool = False,
@@ -3543,7 +3844,12 @@ def _extract_evidence(
     else:
         cleanem_logger.info("canonicalization_evidence: disabled")
 
-    _add_contextual_consensus_evidence(df, metadata, cell_observations)
+    _add_contextual_consensus_evidence(
+        df,
+        metadata,
+        cell_observations,
+        validated_relationship_rules=validated_relationship_rules,
+    )
 
     if enable_evidence_gating:
         gating_summary = _apply_evidence_gates(
@@ -4018,12 +4324,7 @@ def _build_explanation_traces(
         positive.sort(key=lambda item: item.posterior_contribution, reverse=True)
         negative.sort(key=lambda item: item.posterior_contribution)
 
-        cell_hard_label = hard_labels["cell"].get(cell_key)
-        force_temporal_identifier_dirty = bool(
-            cell_hard_label
-            and "temporal_identifier_low_support" in cell_hard_label.reasons
-        )
-        is_suspicious = posterior >= cell_threshold or force_temporal_identifier_dirty
+        is_suspicious = posterior >= cell_threshold
         if is_suspicious:
             primary = positive[0] if positive else None
             supporting = positive[1:4] if primary else []
@@ -4331,6 +4632,94 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         + ", ".join(f"{family}={count}" for family, count in family_counts.items())
     )
 
+    relationship_rules: List[Dict[str, Any]] = []
+    if args.disable_llm_relationship_rules:
+        logger.info("LLM relationship rules: disabled")
+    else:
+        cache_hit = bool(
+            args.relationship_rule_cache
+            and os.path.exists(args.relationship_rule_cache)
+        )
+        if cache_hit:
+            relationship_payload = _load_relationship_rule_cache(
+                args.relationship_rule_cache,
+                df,
+            )
+            logger.info(
+                "Loaded LLM relationship rules from: "
+                f"{args.relationship_rule_cache}"
+            )
+        else:
+            relationship_summary = _build_table_relationship_summary(df, metadata)
+            raw_relationship_rules: List[Dict[str, Any]] = []
+            prompt_info: Dict[str, str] = {}
+            if relationship_summary["candidates"]:
+                raw_relationship_rules, prompt_info = (
+                    factory.infer_table_relationship_candidates(relationship_summary)
+                )
+            relationship_rules, validation_reports = (
+                _validate_llm_relationship_rule_candidates(
+                    df,
+                    raw_relationship_rules,
+                    relationship_summary,
+                )
+            )
+            relationship_payload = {
+                "table_summary": relationship_summary,
+                "prompt_info": prompt_info,
+                "raw_proposals": raw_relationship_rules,
+                "validation_reports": validation_reports,
+                "validated_rules": relationship_rules,
+            }
+            if args.relationship_rule_cache:
+                _save_relationship_rule_cache(
+                    args.relationship_rule_cache,
+                    df,
+                    relationship_payload,
+                )
+                logger.info(
+                    "Saved LLM relationship rules to: "
+                    f"{args.relationship_rule_cache}"
+                )
+
+        relationship_rules = list(
+            relationship_payload.get("validated_rules") or []
+        )
+        raw_relationship_path = os.path.join(
+            args.output_dir,
+            f"{dataset_name}_raw_relationship_proposals.json",
+        )
+        validated_relationship_path = os.path.join(
+            args.output_dir,
+            f"{dataset_name}_validated_relationship_rules.json",
+        )
+        _write_json_atomic(raw_relationship_path, {
+            "version": 1,
+            "dataframe_fingerprint": _dataframe_fingerprint(df),
+            "columns": list(df.columns),
+            "table_summary": relationship_payload.get("table_summary") or {},
+            "prompt_info": relationship_payload.get("prompt_info") or {},
+            "raw_proposals": relationship_payload.get("raw_proposals") or [],
+        })
+        _write_json_atomic(validated_relationship_path, {
+            "version": 1,
+            "dataframe_fingerprint": _dataframe_fingerprint(df),
+            "columns": list(df.columns),
+            "validation_reports": relationship_payload.get("validation_reports") or [],
+            "validated_rules": relationship_rules,
+        })
+        logger.info(
+            "LLM relationship rules: "
+            f"accepted={len(relationship_rules)}, "
+            f"proposed={len(relationship_payload.get('raw_proposals') or [])}"
+        )
+        for rule in relationship_rules:
+            logger.info(
+                "  - Validated FD: "
+                f"{rule['determinant_column']} -> {rule['dependent_column']} "
+                f"({rule['rule_id']})"
+            )
+
     logger.info("[3/4] Running active-learning calibrated evidence inference")
     value_registry = _build_value_registry(df, metadata)
     cell_registry = _build_cell_registry(df, metadata, value_registry)
@@ -4406,6 +4795,7 @@ def run_clean_em_mode(args: argparse.Namespace) -> None:
         value_registry,
         cell_registry,
         repair_candidates=repair_candidates,
+        validated_relationship_rules=relationship_rules,
         enable_canonicalization_evidence=not args.disable_canonicalization_evidence,
         enable_evidence_gating=False,
         defer_evidence_gating=not args.disable_evidence_gating,
